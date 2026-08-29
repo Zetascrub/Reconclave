@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build
+      - run: cmake --build build --parallel
+      - run: ctest --test-dir build --output-on-failure
+      - name: Parse JSON protocol artifacts
+        run: python3 -m json.tool protocol/schemas/envelope.schema.json >/dev/null && for f in protocol/schemas/*.json protocol/test-vectors/*.json; do python3 -m json.tool "$f" >/dev/null; done
+      - name: Validate complete protocol vectors
+        run: python3 tools/protocol-debugger/validate_vectors.py protocol/test-vectors/*.json
+      - name: Test desktop node protocol handling
+        run: python3 -m unittest tools/desktop-node/test_reconclave_node.py
+
+  cardputer-firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install platformio
+      - run: pio run --project-dir devices/cardputer-adv

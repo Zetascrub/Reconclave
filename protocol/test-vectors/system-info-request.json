@@ -1,0 +1,14 @@
+{
+  "proto": "reconclave/1",
+  "type": "request",
+  "message_id": "msg-adv-0042",
+  "source_node": "rc-adv-01",
+  "destination_node": "rc-p4-01",
+  "timestamp_ms": 1787688001000,
+  "sequence": 42,
+  "payload": {
+    "request_id": "req-0042",
+    "capability": "system.info",
+    "arguments": {}
+  }
+}

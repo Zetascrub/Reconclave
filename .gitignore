@@ -1,0 +1,10 @@
+build/
+**/build/
+**/.pio/
+**/managed_components/
+**/sdkconfig
+**/sdkconfig.old
+/.cache/
+/.venv*/
+__pycache__/
+*.pyc

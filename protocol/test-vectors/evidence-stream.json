@@ -1,0 +1,16 @@
+{
+  "proto": "reconclave/1",
+  "type": "stream",
+  "message_id": "msg-p4-0003",
+  "source_node": "rc-p4-01",
+  "destination_node": "rc-adv-01",
+  "timestamp_ms": 1787688001020,
+  "sequence": 3,
+  "payload": {
+    "stream_id": "evidence-scan-1842",
+    "chunk_index": 0,
+    "final": true,
+    "encoding": "base64",
+    "data": "eyJzdGF0dXMiOiJjb21wbGV0ZSJ9"
+  }
+}

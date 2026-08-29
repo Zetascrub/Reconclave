@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reconclave.dev/schemas/reconclave-1-envelope.json",
+  "title": "Reconclave Protocol v1 envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["proto", "type", "message_id", "source_node", "timestamp_ms", "sequence", "payload"],
+  "properties": {
+    "proto": { "const": "reconclave/1" },
+    "type": { "enum": ["announce", "request", "response", "event", "stream"] },
+    "message_id": { "$ref": "#/$defs/identifier" },
+    "source_node": { "$ref": "#/$defs/identifier" },
+    "destination_node": { "$ref": "#/$defs/identifier" },
+    "timestamp_ms": { "type": "integer", "minimum": 1 },
+    "sequence": { "type": "integer", "minimum": 1 },
+    "payload": { "type": "object" }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9_.-]+$"
+    },
+    "capability": {
+      "type": "string",
+      "maxLength": 96,
+      "pattern": "^[a-z0-9_-]+(\\.[a-z0-9_-]+)+$"
+    }
+  }
+}

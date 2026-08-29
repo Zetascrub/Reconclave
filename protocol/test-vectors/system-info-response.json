@@ -1,0 +1,19 @@
+{
+  "proto": "reconclave/1",
+  "type": "response",
+  "message_id": "msg-p4-0002",
+  "source_node": "rc-p4-01",
+  "destination_node": "rc-adv-01",
+  "timestamp_ms": 1787688001015,
+  "sequence": 2,
+  "payload": {
+    "request_id": "req-0042",
+    "status": "ok",
+    "result": {
+      "device_type": "poe-p4",
+      "firmware": "0.1.0",
+      "uptime_ms": 48120,
+      "free_memory_bytes": 287104
+    }
+  }
+}

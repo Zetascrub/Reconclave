@@ -1,0 +1,16 @@
+{
+  "proto": "reconclave/1",
+  "type": "announce",
+  "message_id": "msg-p4-0001",
+  "source_node": "rc-p4-01",
+  "timestamp_ms": 1787688000000,
+  "sequence": 1,
+  "payload": {
+    "device_id": "rc-p4-01",
+    "device_type": "poe-p4",
+    "firmware": "0.1.0",
+    "roles": ["node"],
+    "capabilities": ["system.info", "net.discovery.scan", "net.tcp.connect"],
+    "status": "ready"
+  }
+}

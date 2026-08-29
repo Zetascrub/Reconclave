@@ -1,0 +1,237 @@
+# Reconclave interface style guide
+
+Status: living standard
+Applies to: Cardputer ADV, K230, and future embedded coordinators/nodes
+
+Reconclave should feel like a calm field instrument: dark, legible, deliberate,
+and useful under poor lighting. Device size may change, but navigation,
+information priority, terminology, and colour meaning must remain consistent.
+
+## 1. Product principles
+
+1. Lead with the operator's task, current state, and next useful action.
+2. Keep settings in the contextual `Tab` menu, not duplicated in the working view.
+3. Put technical identifiers and protocol facts on detail screens.
+4. Use dense lists only where comparison matters: nodes, observations, hosts,
+   services, and evidence.
+5. Long operations must remain responsive and show state and progress.
+6. Passive observation, active assessment, and destructive actions must be
+   visually and procedurally distinct.
+7. Never claim that an observation is a finding without supporting evidence.
+
+## 2. Navigation contract
+
+These controls mean the same thing everywhere outside text entry:
+
+| Control | Meaning |
+| --- | --- |
+| Up / Down | Move through a vertical list or scroll content |
+| Left / Right | Browse cards or change a selected setting value |
+| Enter | Open, apply, or perform the primary action |
+| Tab | Open or close the current area's contextual menu |
+| Q / Escape / Backspace | Return to the immediate parent |
+| R | Start or refresh the primary bounded operation when shown |
+| `; , . /` | Physical aliases for Up / Left / Down / Right |
+
+Rules:
+
+- Left is never Back.
+- Back restores the parent's previous relevant selection.
+- Tab never performs an action directly.
+- Text-entry screens keep punctuation keys as punctuation.
+- A running operation may continue after leaving only when intentional and its
+  state remains visible on return.
+
+## 3. Information hierarchy
+
+Use this hierarchy unless a hardware constraint requires otherwise:
+
+1. Mission home
+2. Category or roster
+3. Working/results view
+4. Item detail or management view
+5. Contextual Tab menu
+6. Confirmation for disruptive or destructive actions
+
+Examples: Reconclave → Nodes → Node management; Scout → Hosts → Host →
+Services; Evidence → Files → Details → Preview.
+
+## 4. Cardputer layout grid
+
+The Cardputer canvas is 240 × 135 pixels. All screens reserve three regions:
+
+| Region | Bounds | Purpose |
+| --- | --- | --- |
+| Header | y 0–23 | Screen title plus `NET` and `KEY` indicators |
+| Content | y 24–117 | State, results, cards, lists, and progress |
+| Footer | y 118–134 | Control hints plus the fixed Tab badge |
+
+Mandatory safe areas:
+
+- Content left/right inset: 7 px minimum.
+- Header title: x 7, maximum 26 fixed-width characters.
+- Header indicators begin at x 176; titles never enter that area.
+- Footer hint: x 6, maximum 31 fixed-width characters.
+- Tab badge: x 207–235; footer text never enters that area.
+- No content baseline may be below y 108.
+- Progress and result rows never share a vertical band.
+
+Do not rely on drawing order to hide an overlap. Allocate separate geometry.
+
+## 5. Typography and copy limits
+
+Use the built-in fixed-width font at size 1 unless one focal value genuinely
+benefits from size 2.
+
+| Element | Maximum |
+| --- | --- |
+| Header title | 26 characters |
+| Footer hint | 31 characters before the Tab badge |
+| Full content line | 37 characters at x 8 |
+| Context-menu label | 35 characters |
+| Mission title at size 2 | 13 characters |
+| Shared list label | 18–20 characters |
+
+Use sentence case for guidance and uppercase only for compact state labels.
+Prefer `3 hosts` to `Hosts discovered: 3`. Keep exact IDs, ports, versions, and
+error codes on detail screens. Ellipsis denotes work in progress, not ordinary
+truncation.
+
+## 6. Colour system
+
+| Role | RGB | Use |
+| --- | --- | --- |
+| Canvas | `5, 10, 16` | Main background |
+| Chrome | `9, 28, 39` | Header and footer |
+| Surface | `11, 30, 40` | Cards and panels |
+| Selected surface | `22, 66, 72` | Current row, chip, or control |
+| Border | `35, 118, 112` | Active card and progress outline |
+| Accent | `80, 230, 190` | Ready, selected, trusted, primary state |
+| Primary text | white | Main information |
+| Secondary text | `150, 170, 175` | Guidance and metadata |
+| Muted text | `130, 155, 160` | Unavailable or low-priority state |
+| Attention | `255, 190, 70` | Running, unpaired, degraded, or caution |
+| Danger | theme magenta/red | Failure, destructive, or disruptive action |
+
+Never use pale text on a bright surface. Colour reinforces meaning but is
+never the only way state is communicated.
+
+## 7. Standard components
+
+### Header
+
+- Title on the left; `NET`/`OFF` and `KEY`/`---` on the right.
+- One-pixel divider at y 23.
+- Titles are clipped, never wrapped.
+
+### Footer
+
+- Show only controls that work on the current screen.
+- Order hints as navigation, primary action, Back.
+- Keep the Tab badge visible outside provisioning/text entry.
+- Do not write `Tab: menu`; the fixed badge already communicates it.
+
+### Lists
+
+- Up/Down wraps unless scrolling content would make wrapping unsafe.
+- Use one selected surface and one `>` marker.
+- Preserve selection when returning from details.
+- Show four to six rows depending on secondary metadata.
+
+### Mission cards
+
+- Show one card at a time on Cardputer.
+- Left/Right and Up/Down may browse; Enter opens.
+- Include a page indicator and one plain-language description.
+
+### Status and progress
+
+- Lead with `READY`, `SCANNING`, `SAVED`, `OFFLINE`, or `FAILED`.
+- Put the status sentence, progress bar, and results in separate rows.
+- Result geometry remains stable while an operation runs.
+
+### Contextual Tab menu
+
+- Tab owns area-specific settings and secondary actions.
+- Settings appear before actions.
+- Left/Right changes values; Enter executes actions.
+- Tab, Q, Escape, or Backspace closes and restores the underlying selection.
+- Never duplicate a Tab setting as an editable control in the working view.
+- A result may report its actual executor as evidence metadata, but must not
+  resemble another settings control.
+
+### Empty, loading, and error states
+
+- Empty explains what is absent and the next action.
+- Loading provides a stable state and measurable progress when possible.
+- Error states explain what failed in plain language.
+- Old success state must not remain coloured as ready after a failure.
+
+## 8. Reconclave-specific patterns
+
+### Node roster
+
+- The local coordinator/node is first and labelled `THIS CARD`.
+- Remote announcements are keyed by device ID and expire when stale.
+- Enter opens node management; Tab contains roster-wide discovery and pairing.
+- Node capabilities appear only on that node's management/context view.
+
+### Scout
+
+- The main screen shows state, host count, progress, and hosts only.
+- Executor and service-scan scope live exclusively in Tab.
+- Enter opens the selected host; service results are its child.
+- Evidence records the actual executor and observation vantage.
+
+### Observe
+
+- Discovery lists contain observed facts only.
+- Detail screens expose identifiers and radio metadata.
+- Rescan, filters, capture settings, and export belong in Tab.
+
+### Evidence
+
+- Preserve the distinction between observation, evidence, and finding.
+- Binary files may have details without preview.
+- Refresh/remount belongs in Tab; Enter opens details or preview.
+
+## 9. Active-operation safety
+
+- Passive discovery may start with one explicit primary action.
+- Active checks are bounded by default.
+- Disruptive actions require a confirmation naming target, effect, and stop
+  condition.
+- Destructive actions use danger colour only on final confirmation.
+- Never place a disruptive action beside ordinary navigation without a guard.
+- Network activity is for systems the operator owns or is authorised to assess.
+
+## 10. K230 adaptation
+
+K230 expands this language rather than inventing another one:
+
+- Preserve mission names, hierarchy, semantic colours, and context meaning.
+- Use touch targets of at least 44 logical pixels.
+- A side rail may replace footer hints, but Back and context remain distinct.
+- Wider layouts may show roster and detail side by side while retaining the
+  same parent/child model.
+- Touch, keyboard, and hardware-button focus produce equivalent actions.
+
+## 11. Review checklist
+
+Before merging or flashing a UI change, verify:
+
+- [ ] Header title ends before x 176.
+- [ ] Footer hint ends before x 207.
+- [ ] Content stays outside header and footer regions.
+- [ ] Every string is clipped or bounded at its component limit.
+- [ ] Progress, status, and results occupy separate rows.
+- [ ] Direction, Enter, Tab, and Back follow the navigation contract.
+- [ ] Back restores the correct parent selection.
+- [ ] Tab settings are not duplicated in the working view.
+- [ ] Empty, running, completed, and failed states are legible.
+- [ ] Long-running work remains non-blocking.
+- [ ] Passive, active, and destructive operations are distinguishable.
+- [ ] The screen remains readable at the lowest supported brightness.
+
+When a screen cannot satisfy this checklist, redesign its information hierarchy
+instead of shrinking text or permitting overlap.

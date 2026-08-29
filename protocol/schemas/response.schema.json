@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reconclave.dev/schemas/reconclave-1-response.json",
+  "title": "Reconclave v1 capability response payload",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["request_id", "status"],
+  "properties": {
+    "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$" },
+    "status": { "enum": ["accepted", "ok", "rejected", "error"] },
+    "job_id": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$" },
+    "result": { "type": "object" },
+    "auth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nonce", "tag"],
+      "properties": {
+        "nonce": { "type": "string", "pattern": "^[a-f0-9]{16}$" },
+        "tag": { "type": "string", "pattern": "^[a-f0-9]{32}$" }
+      }
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "string", "pattern": "^[A-Z0-9_]{1,64}$" },
+        "message": { "type": "string", "minLength": 1, "maxLength": 256 }
+      }
+    }
+  },
+  "allOf": [
+    { "if": { "properties": { "status": { "const": "accepted" } } }, "then": { "required": ["job_id"] } },
+    { "if": { "properties": { "status": { "enum": ["rejected", "error"] } } }, "then": { "required": ["error"] } }
+  ]
+}

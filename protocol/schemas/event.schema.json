@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reconclave.dev/schemas/reconclave-1-event.json",
+  "title": "Reconclave v1 job event payload",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["job_id", "kind", "data"],
+  "properties": {
+    "job_id": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$" },
+    "kind": { "enum": ["progress", "evidence", "complete", "failed", "cancelled"] },
+    "progress_percent": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "data": { "type": "object" }
+  }
+}

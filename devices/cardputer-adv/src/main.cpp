@@ -1,0 +1,3521 @@
+#include <Arduino.h>
+#include <ArduinoJson.h>
+#include <ESPmDNS.h>
+#include <HTTPClient.h>
+#include <M5Cardputer.h>
+#include <NimBLEDevice.h>
+#include <Preferences.h>
+#include <SD.h>
+#include <SPI.h>
+#include <WebServer.h>
+#include <WiFi.h>
+#include <esp_system.h>
+#include <mbedtls/md.h>
+#include <algorithm>
+#include <string>
+#include <vector>
+
+#include <reconclave/node_registry.h>
+#include "network_host_scan_service.h"
+#include "network_port_scan_service.h"
+
+namespace {
+
+constexpr char kFirmware[] = "0.1.0";
+constexpr char kProtocol[] = "reconclave/1";
+constexpr char kService[] = "reconclave";
+constexpr char kTransport[] = "tcp";
+constexpr char kAnnouncePath[] = "/reconclave/v1/announce";
+constexpr char kMessagePath[] = "/reconclave/v1/message";
+constexpr uint16_t kServerPort = 8766;
+constexpr uint16_t kP4FallbackPort = 8765;
+constexpr unsigned long kConnectTimeoutMs = 15000;
+constexpr unsigned long kNodeExpiryMs = 45000;
+constexpr int kMaxResponseBytes = 4096;
+constexpr int kGroveRxPin = 2;
+constexpr int kGroveTxPin = 1;
+constexpr int kSdCsPin = 12;
+constexpr int kSdMosiPin = 14;
+constexpr int kSdClockPin = 40;
+constexpr int kSdMisoPin = 39;
+constexpr int kSdCompatibilityPin = 5;
+constexpr uint32_t kSdFrequency = 4000000;
+constexpr size_t kPeerKeyBytes = 32;
+constexpr size_t kTagBytes = 16;
+
+enum class ScreenState {
+  ProvisionSsid,
+  ProvisionPassword,
+  Connecting,
+  Home,
+  Reconclave,
+  NodeDetail,
+  NodeCapabilities,
+  Scout,
+  HostDetail,
+  PortResults,
+  Observe,
+  WifiResults,
+  WifiChannels,
+  WifiDetail,
+  BleResults,
+  BleDetail,
+  Evidence,
+  EvidenceDetail,
+  EvidencePreview,
+  FieldKit,
+  NetworkDashboard,
+  System,
+  Settings,
+  SettingsConnectivity,
+  SettingsDisplay,
+  SettingsBoot,
+  SettingsStorage,
+  SettingsDevice,
+  SettingsTrust,
+  ConfirmForgetTrust,
+  ProvisionEvidenceKey,
+  ContextMenu,
+};
+
+enum class PortProfile { Web, Common, Extended };
+enum class ScoutExecution : uint8_t { Auto, Single, Distributed, Consensus };
+enum class DistributionStyle : uint8_t { Equal, Weighted };
+enum class UiTheme : uint8_t { Field, NightCity, Amber };
+enum class NavigationStyle : uint8_t { Cards, List };
+enum class IdleStyle : uint8_t { Off, Radar, Nodes };
+enum class BootSequence : uint8_t {
+  CipherRain, SignalTrace, NodeBreach, PacketStorm, HexTunnel, RootAccess
+};
+enum class BootSpeed : uint8_t { Slow, Normal, Fast };
+
+struct WifiObservation {
+  String ssid;
+  String bssid;
+  int32_t rssi{0};
+  int32_t channel{0};
+  wifi_auth_mode_t auth{WIFI_AUTH_OPEN};
+};
+
+struct EvidenceFile {
+  String name;
+  uint64_t size{0};
+};
+
+struct BleObservation {
+  String address;
+  String name;
+  String manufacturer;
+  String services;
+  int rssi{0};
+  uint8_t addressType{0};
+  uint8_t advertisementType{0};
+  uint8_t serviceCount{0};
+  size_t payloadLength{0};
+  bool connectable{false};
+};
+
+struct RemoteNode {
+  String deviceId;
+  String deviceType;
+  String firmware;
+  String ip;
+  uint16_t port{0};
+  bool coordinator{false};
+  bool systemInfo{false};
+  bool netDiscovery{false};
+  bool jobStatus{false};
+  bool evidenceCollector{false};
+  std::vector<String> capabilities;
+  unsigned long lastSeenMs{0};
+  String detail{"Press ENTER for system.info"};
+};
+
+struct RemoteScoutJob {
+  String nodeId;
+  uint8_t firstHost{1};
+  uint8_t lastHost{254};
+  uint16_t checked{0};
+  uint16_t total{0};
+  bool running{false};
+  bool failed{false};
+  String error;
+  std::vector<String> hosts;
+  uint16_t runCount{0};
+};
+
+Preferences preferences;
+WebServer server(kServerPort);
+reconclave::NodeRegistry registry;
+ScreenState screen = ScreenState::Connecting;
+RemoteNode p4;
+std::vector<RemoteNode> remoteNodes;
+String selectedNodeId;
+size_t nodeSelection{0};
+String wifiSsid;
+String wifiPassword;
+String input;
+String notice;
+String deviceId;
+unsigned long connectStartedMs;
+unsigned long messageSequence;
+bool mdnsReady;
+bool serverReady;
+size_t selection;
+std::vector<WifiObservation> wifiObservations;
+std::vector<BleObservation> bleObservations;
+std::vector<EvidenceFile> evidenceFiles;
+std::vector<String> discoveredHosts;
+std::vector<String> localScoutHosts;
+std::vector<String> previewLines;
+size_t previewLine;
+bool previewTruncated;
+bool sdAvailable;
+String fieldStatus;
+bool wifiRestorePending;
+bool systemOpenedFromSettings{false};
+uint8_t displayBrightness{160};
+UiTheme uiTheme{UiTheme::Field};
+NavigationStyle navigationStyle{NavigationStyle::Cards};
+IdleStyle idleStyle{IdleStyle::Radar};
+uint16_t screenTimeoutSeconds{60};
+bool bootAnimationEnabled{true};
+bool searchNodesOnBoot{false};
+BootSequence bootSequence{BootSequence::CipherRain};
+BootSpeed bootSpeed{BootSpeed::Normal};
+bool idleActive{false};
+unsigned long lastInputMs{0};
+unsigned long lastIdleFrameMs{0};
+uint16_t idlePhase{0};
+String scoutStatus{"Ready; choose a live scan provider"};
+uint16_t scoutChecked;
+uint16_t scoutTotal;
+bool scoutRunning;
+unsigned long lastScoutPollMs;
+unsigned long lastScoutUiMs;
+String scoutTargetId{"auto"};
+String scoutRemoteNodeId;
+ScoutExecution scoutExecution{ScoutExecution::Auto};
+DistributionStyle distributionStyle{DistributionStyle::Weighted};
+std::vector<RemoteScoutJob> remoteScoutJobs;
+uint8_t localScoutFirstHost{1};
+uint8_t localScoutLastHost{254};
+bool localScoutAssigned{false};
+bool scoutEvidenceSent{false};
+uint16_t scoutIntervalMinutes{0};
+unsigned long localScoutNextRunMs{0};
+uint16_t scoutRunCount{0};
+// Deterministic change detection: the host set as of the previous completed run,
+// compared against each new run. Empty/unloaded means "no baseline yet" - the first
+// run only seeds it rather than reporting every host as new.
+std::vector<String> scoutBaseline;
+bool scoutBaselineLoaded{false};
+uint16_t scoutLastAppeared{0};
+uint16_t scoutLastVanished{0};
+// Set when a known Evidence Collector was skipped because no evidence key is
+// configured. Surfaced on the Scout status line rather than `notice`, which is only
+// ever rendered on the Wi-Fi connecting screen and would otherwise be silently lost.
+bool scoutEvidenceKeyMissing{false};
+std::vector<String> disabledCapabilities;
+PortProfile portProfile{PortProfile::Common};
+ScreenState contextOrigin{ScreenState::Home};
+size_t contextOriginSelection{0};
+String scoutExecutor{"none"};
+LocalHostScanService localHostScan;
+NetworkPortScanService portScan;
+String selectedHost;
+size_t scoutSelection{0};
+std::vector<uint16_t> openPorts;
+String portStatus{"Ready for service check"};
+bool portRunning{false};
+static constexpr uint16_t kCommonPorts[] = {
+    20, 21, 22, 23, 25, 53, 80, 110, 143, 443, 445, 3389, 8080};
+static constexpr uint16_t kWebPorts[] = {80, 443, 8000, 8080, 8443, 8888};
+static constexpr uint16_t kExtendedPorts[] = {
+    20, 21, 22, 23, 25, 53, 67, 68, 69, 80, 110, 111, 123, 135, 137, 138,
+    139, 143, 161, 389, 443, 445, 465, 587, 636, 993, 995, 1433, 1883,
+    3306, 3389, 5432, 5900, 6379, 8000, 8080, 8443, 8888, 9100};
+
+const char* portProfileLabel();
+bool writeEvidenceRecord(JsonVariantConst evidence, String& errorMessage);
+void distributeScoutEvidence(const std::vector<String>& hosts, const String& observer);
+void detectAndRecordChanges(const std::vector<String>& hosts, const String& observer);
+void loadScoutBaseline();
+void saveScoutBaseline();
+HardwareSerial groveSerial(2);
+uint8_t peerKey[kPeerKeyBytes];
+bool peerKeyValid;
+uint8_t pendingPeerKey[kPeerKeyBytes];
+bool pairingPending;
+String trustedP4Id;
+uint8_t evidenceKey[kPeerKeyBytes];
+bool evidenceKeyValid;
+// Nonces this Cardputer has itself accepted on storage.evidence.write, so a captured
+// request can't be replayed against it. Small and bounded; no persistence needed.
+std::vector<String> recentEvidenceNonces;
+constexpr size_t kRecentNonceCount = 16;
+String groveP4Id;
+String groveBootNonce;
+bool groveP4Paired;
+unsigned long lastGroveHeartbeatMs;
+String pairingStatus{"P: pair over Grove"};
+char groveLine[256];
+size_t groveLineLength;
+
+uint32_t crc32(const char* data, size_t length) {
+  uint32_t crc = 0xffffffffU;
+  for (size_t index = 0; index < length; ++index) {
+    crc ^= static_cast<uint8_t>(data[index]);
+    for (int bit = 0; bit < 8; ++bit) {
+      crc = (crc >> 1) ^ (0xedb88320U & static_cast<uint32_t>(-
+          static_cast<int32_t>(crc & 1U)));
+    }
+  }
+  return ~crc;
+}
+
+void hexEncode(char* destination, const uint8_t* source, size_t length) {
+  static const char digits[] = "0123456789abcdef";
+  for (size_t i = 0; i < length; ++i) {
+    destination[i * 2] = digits[source[i] >> 4];
+    destination[i * 2 + 1] = digits[source[i] & 0x0f];
+  }
+  destination[length * 2] = '\0';
+}
+
+int hexNibble(char value) {
+  if (value >= '0' && value <= '9') return value - '0';
+  if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+  if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+  return -1;
+}
+
+bool hexDecode(uint8_t* destination, size_t length, const char* source) {
+  if (source == nullptr || strlen(source) != length * 2) return false;
+  for (size_t i = 0; i < length; ++i) {
+    const int high = hexNibble(source[i * 2]);
+    const int low = hexNibble(source[i * 2 + 1]);
+    if (high < 0 || low < 0) return false;
+    destination[i] = static_cast<uint8_t>((high << 4) | low);
+  }
+  return true;
+}
+
+bool constantTimeEqual(const uint8_t* left, const uint8_t* right, size_t length) {
+  uint8_t difference = 0;
+  for (size_t i = 0; i < length; ++i) difference |= left[i] ^ right[i];
+  return difference == 0;
+}
+
+bool sha256Digest(const String& input, uint8_t output[32]) {
+  const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  return info != nullptr && mbedtls_md(info, reinterpret_cast<const uint8_t*>(input.c_str()),
+      input.length(), output) == 0;
+}
+
+bool computeTagWithKey(const uint8_t* key, size_t keyLength, const String& message,
+                       uint8_t output[kTagBytes]) {
+  uint8_t full[32];
+  const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (info == nullptr || mbedtls_md_hmac(info, key, keyLength,
+      reinterpret_cast<const uint8_t*>(message.c_str()), message.length(), full) != 0) return false;
+  memcpy(output, full, kTagBytes);
+  return true;
+}
+
+bool computeTag(const String& message, uint8_t output[kTagBytes]) {
+  if (!peerKeyValid) return false;
+  return computeTagWithKey(peerKey, sizeof(peerKey), message, output);
+}
+
+bool computeEvidenceTag(const String& message, uint8_t output[kTagBytes]) {
+  if (!evidenceKeyValid) return false;
+  return computeTagWithKey(evidenceKey, sizeof(evidenceKey), message, output);
+}
+
+bool evidenceNonceFresh(const String& nonce) {
+  if (std::find(recentEvidenceNonces.begin(), recentEvidenceNonces.end(), nonce) !=
+      recentEvidenceNonces.end()) {
+    return false;
+  }
+  recentEvidenceNonces.push_back(nonce);
+  if (recentEvidenceNonces.size() > kRecentNonceCount) {
+    recentEvidenceNonces.erase(recentEvidenceNonces.begin());
+  }
+  return true;
+}
+
+uint16_t colour(uint8_t red, uint8_t green, uint8_t blue) {
+  // Remap the shared semantic palette so every screen inherits the theme.
+  if (uiTheme == UiTheme::NightCity) {
+    if (red == 5 && green == 10 && blue == 16) return M5Cardputer.Display.color565(5, 5, 12);
+    if (red == 9 && green == 28 && blue == 39) return M5Cardputer.Display.color565(18, 12, 30);
+    if (red == 11 && green == 30 && blue == 40) return M5Cardputer.Display.color565(22, 15, 35);
+    if (red == 22 && green == 66 && blue == 72) return M5Cardputer.Display.color565(55, 24, 70);
+    if (red == 80 && green == 230 && blue == 190) return M5Cardputer.Display.color565(255, 222, 70);
+    if (red == 255 && green == 190 && blue == 70) return M5Cardputer.Display.color565(255, 80, 180);
+    if (green > 60 && blue >= 70) return M5Cardputer.Display.color565(45, 155, 190);
+  } else if (uiTheme == UiTheme::Amber) {
+    if (red == 5 && green == 10 && blue == 16) return M5Cardputer.Display.color565(12, 8, 3);
+    if (red == 9 && green == 28 && blue == 39) return M5Cardputer.Display.color565(34, 22, 7);
+    if (red == 11 && green == 30 && blue == 40) return M5Cardputer.Display.color565(39, 26, 8);
+    if (red == 22 && green == 66 && blue == 72) return M5Cardputer.Display.color565(72, 46, 9);
+    if (red == 80 && green == 230 && blue == 190) return M5Cardputer.Display.color565(255, 184, 55);
+    if (red == 255 && green == 190 && blue == 70) return M5Cardputer.Display.color565(255, 112, 40);
+    if (green > 60 && blue >= 70) return M5Cardputer.Display.color565(160, 105, 35);
+  }
+  return M5Cardputer.Display.color565(red, green, blue);
+}
+
+void header(const char* title) {
+  auto& display = M5Cardputer.Display;
+  display.setTextWrap(false);
+  display.fillScreen(colour(5, 10, 16));
+  display.fillRect(0, 0, display.width(), 23, colour(9, 28, 39));
+  display.drawFastHLine(0, 23, display.width(), colour(30, 105, 105));
+  display.setTextColor(colour(80, 230, 190));
+  display.setTextSize(1);
+  display.setCursor(7, 8);
+  display.print(String(title).substring(0, 26));
+  display.setTextColor(WiFi.status() == WL_CONNECTED ? colour(80, 230, 190)
+                                                     : colour(255, 190, 70));
+  display.setCursor(176, 8);
+  display.print(WiFi.status() == WL_CONNECTED ? "NET" : "OFF");
+  display.setTextColor(peerKeyValid ? colour(80, 230, 190) : colour(130, 155, 160));
+  display.setCursor(207, 8);
+  display.print(peerKeyValid ? "KEY" : "---");
+}
+
+void footer(const char* text) {
+  auto& display = M5Cardputer.Display;
+  display.fillRect(0, 119, display.width(), 16, colour(9, 28, 39));
+  display.drawFastHLine(0, 118, display.width(), colour(24, 64, 70));
+  display.setTextColor(colour(150, 170, 175));
+  display.setCursor(6, 123);
+  display.print(String(text).substring(0, 31));
+  display.fillRoundRect(207, 121, 29, 11, 3, colour(22, 66, 72));
+  display.setTextColor(colour(80, 230, 190));
+  display.setCursor(211, 123);
+  display.print("TAB");
+}
+
+void drawMenu(const char* title, const char* const* items, size_t count,
+              const char* help = "Enter: open   Q/Esc: back") {
+  header(title);
+  auto& display = M5Cardputer.Display;
+  if (count == 0) return;
+  if (selection >= count) selection = count - 1;
+  const size_t first = selection >= 5 ? selection - 4 : 0;
+  for (size_t row = 0; row < 6 && first + row < count; ++row) {
+    const size_t index = first + row;
+    const int y = 27 + static_cast<int>(row) * 15;
+    if (index == selection) {
+      display.fillRoundRect(4, y - 2, 232, 14, 3, colour(22, 66, 72));
+      display.setTextColor(colour(80, 230, 190));
+      display.setCursor(7, y);
+      display.print('>');
+    } else {
+      display.setTextColor(TFT_WHITE);
+      display.setCursor(7, y);
+      display.print(' ');
+    }
+    display.print(items[index]);
+  }
+  footer(help);
+}
+
+void drawProvision(const char* label, bool secret) {
+  header("RECONCLAVE SETUP");
+  auto& display = M5Cardputer.Display;
+  display.setTextColor(TFT_WHITE);
+  display.setCursor(8, 36);
+  display.printf("Enter Wi-Fi %s:", label);
+  display.drawRect(7, 51, 226, 28, colour(50, 110, 120));
+  display.setCursor(12, 61);
+  const size_t visibleStart = input.length() > 35 ? input.length() - 35 : 0;
+  if (secret) {
+    for (size_t i = visibleStart; i < input.length(); ++i) display.print('*');
+  } else {
+    display.print(input.substring(visibleStart));
+  }
+  display.setTextColor(colour(150, 170, 175));
+  display.setCursor(8, 91);
+  display.print("ENTER save   ESC cancel");
+  display.setCursor(8, 106);
+  display.print("Credentials stay in device NVS");
+}
+
+void drawConnecting() {
+  header("RECONCLAVE");
+  auto& display = M5Cardputer.Display;
+  display.setTextColor(TFT_WHITE);
+  display.setCursor(8, 38);
+  display.print(("Connecting to " + wifiSsid).substring(0, 37));
+  display.setCursor(8, 56);
+  display.printf("Wi-Fi: %s", WiFi.status() == WL_CONNECTED ? "connected" : "waiting...");
+  display.setTextColor(colour(150, 170, 175));
+  display.setCursor(8, 103);
+  display.print("W: change Wi-Fi");
+  if (!notice.isEmpty()) {
+    display.setTextColor(colour(255, 190, 70));
+    display.setCursor(8, 78);
+    display.print(notice.substring(0, 37));
+  }
+  footer("W: change Wi-Fi");
+}
+
+void drawDashboard() {
+  header("RECONCLAVE / NODES");
+  auto& display = M5Cardputer.Display;
+  const size_t count = remoteNodes.size() + 1;
+  if (selection >= count) selection = count - 1;
+  const size_t first = selection >= 4 ? selection - 3 : 0;
+  for (size_t row = 0; row < 4 && first + row < count; ++row) {
+    const size_t index = first + row;
+    const bool local = index == 0;
+    const RemoteNode* node = local ? nullptr : &remoteNodes[index - 1];
+    const int y = 29 + static_cast<int>(row) * 22;
+    if (index == selection) display.fillRoundRect(4, y - 3, 232, 20, 4, colour(22, 66, 72));
+    display.setTextColor(index == selection ? colour(80, 230, 190) : TFT_WHITE);
+    display.setCursor(8, y);
+    display.print(index == selection ? '>' : ' ');
+    display.setCursor(18, y);
+    display.print(local ? "THIS CARDPUTER" : node->deviceType.substring(0, 17));
+    display.setCursor(150, y);
+    display.print(String(local ? "COORDINATOR" : node->ip).substring(0, 14));
+    display.setTextColor(colour(130, 155, 160));
+    display.setCursor(18, y + 10);
+    const String shownId = local ? deviceId : node->deviceId;
+    display.print(shownId.length() > 32 ? shownId.substring(shownId.length() - 32) : shownId);
+  }
+  footer("UP/DOWN: nodes  Enter: manage  Q:back");
+}
+
+RemoteNode* selectedRemoteNode() {
+  if (selectedNodeId.isEmpty() || selectedNodeId == deviceId) return nullptr;
+  for (auto& node : remoteNodes) if (node.deviceId == selectedNodeId) return &node;
+  return nullptr;
+}
+
+String capabilityPolicyKey(const String& nodeId, const String& capability) {
+  return nodeId + "|" + capability;
+}
+
+bool capabilityEnabled(const String& nodeId, const String& capability) {
+  const String key = capabilityPolicyKey(nodeId, capability);
+  return std::find(disabledCapabilities.begin(), disabledCapabilities.end(), key) ==
+      disabledCapabilities.end();
+}
+
+void saveCapabilityPolicy() {
+  String encoded;
+  for (const auto& key : disabledCapabilities) {
+    if (!encoded.isEmpty()) encoded += '\n';
+    encoded += key;
+  }
+  preferences.putString("cap_off", encoded);
+}
+
+void toggleCapability(const String& nodeId, const String& capability) {
+  const String key = capabilityPolicyKey(nodeId, capability);
+  auto existing = std::find(disabledCapabilities.begin(), disabledCapabilities.end(), key);
+  if (existing == disabledCapabilities.end()) disabledCapabilities.push_back(key);
+  else disabledCapabilities.erase(existing);
+  saveCapabilityPolicy();
+}
+
+void drawNodeDetail() {
+  header("RECONCLAVE / NODE");
+  auto& display = M5Cardputer.Display;
+  const bool local = selectedNodeId == deviceId;
+  RemoteNode* node = selectedRemoteNode();
+  display.setTextColor(colour(80, 230, 190));
+  display.setCursor(8, 31);
+  display.print(String(local ? "THIS CARDPUTER" :
+      (node ? node->deviceType.c_str() : "NODE UNAVAILABLE")).substring(0, 37));
+  display.setTextColor(TFT_WHITE);
+  display.setCursor(8, 49);
+  display.print((local ? deviceId : selectedNodeId).substring(0, 37));
+  display.setCursor(8, 67);
+  display.print((String("Address: ") + (local ? WiFi.localIP().toString() :
+      (node ? node->ip : "offline"))).substring(0, 37));
+  display.setCursor(8, 84);
+  display.print((String("Firmware: ") + (local ? kFirmware :
+      (node ? node->firmware : "unknown"))).substring(0, 37));
+  display.setTextColor(colour(150, 170, 175));
+  display.setCursor(8, 101);
+  display.print(local ? "Roles: coordinator + node" :
+      (node && node->deviceId == p4.deviceId ? pairingStatus.substring(0, 35) : "Discovered Reconclave node"));
+  footer("Enter: capabilities   Q/Esc: nodes");
+}
+
+void drawNodeCapabilities() {
+  header("NODE / CAPABILITIES");
+  static const char* const localCapabilities[] = {
+      "system.info", "coordination.nodes", "coordination.jobs", "input.keyboard",
+      "radio.wifi.scan", "radio.ble.scan", "storage.file.read", "storage.evidence.write",
+      "net.discovery.scan"};
+  RemoteNode* node = selectedRemoteNode();
+  const bool local = selectedNodeId == deviceId;
+  const size_t count = local ? sizeof(localCapabilities) / sizeof(localCapabilities[0]) :
+      (node ? node->capabilities.size() : 0);
+  auto& display = M5Cardputer.Display;
+  if (count == 0) {
+    display.setTextColor(colour(150, 170, 175));
+    display.setCursor(8, 42);
+    display.print("No capabilities advertised");
+    footer("Q/Esc: node management");
+    return;
+  }
+  if (selection >= count) selection = count - 1;
+  const size_t first = selection >= 6 ? selection - 5 : 0;
+  for (size_t row = 0; row < 6 && first + row < count; ++row) {
+    const size_t index = first + row;
+    const int y = 28 + static_cast<int>(row) * 15;
+    if (index == selection) display.fillRoundRect(4, y - 2, 232, 14, 3, colour(22, 66, 72));
+    display.setTextColor(index == selection ? colour(80, 230, 190) : TFT_WHITE);
+    display.setCursor(8, y);
+    display.print(index == selection ? "> " : "  ");
+    const String capability = local ? String(localCapabilities[index]) : node->capabilities[index];
+    const bool enabled = capabilityEnabled(selectedNodeId, capability);
+    display.print(enabled ? "[ON] " : "[--] ");
+    display.print(capability.substring(0, 29));
+  }
+  footer("Enter: enable/disable   Q/Esc: node");
+}
+
+void drawScout() {
+  header("SCOUT / NETWORK DISCOVERY");
+  auto& display = M5Cardputer.Display;
+  const bool scoutFailed = scoutStatus.indexOf("failed") >= 0 ||
+      scoutStatus.indexOf("required") >= 0 || scoutStatus.indexOf("unavailable") >= 0 ||
+      scoutStatus.indexOf("rejected") >= 0 || scoutStatus.startsWith("Untrusted") ||
+      scoutStatus.startsWith("No host") || scoutStatus.indexOf("Unable") >= 0;
+  const bool scoutSaved = scoutStatus.startsWith("Saved");
+  display.setTextColor(scoutRunning ? colour(255, 190, 70) :
+      (scoutFailed ? TFT_MAGENTA : colour(80, 230, 190)));
+  display.setCursor(8, 30);
+  display.printf("%s", scoutRunning ? "SCANNING" :
+      (scoutFailed ? "FAILED" : (scoutSaved ? "SAVED" : "READY")));
+  display.setTextColor(colour(150, 170, 175));
+  display.setCursor(72, 30);
+  display.printf("%u host%s", static_cast<unsigned>(discoveredHosts.size()),
+                 discoveredHosts.size() == 1 ? "" : "s");
+  display.setTextColor(scoutFailed ? TFT_MAGENTA :
+      (scoutRunning ? colour(255, 190, 70) : TFT_WHITE));
+  display.setCursor(8, 44);
+  display.print(scoutStatus.substring(0, 37));
+  if (scoutRunning && scoutTotal > 0) {
+    display.drawRoundRect(7, 58, 226, 8, 3, colour(35, 118, 112));
+    const int width = static_cast<int>((218UL * scoutChecked) / scoutTotal);
+    display.fillRoundRect(11, 61, width, 2, 1, colour(80, 230, 190));
+  }
+  if (discoveredHosts.empty()) {
+    display.setTextColor(colour(150, 170, 175));
+    display.setCursor(8, 78);
+    display.print("No responsive hosts recorded");
+  } else {
+    if (selection >= discoveredHosts.size()) selection = discoveredHosts.size() - 1;
+    const size_t first = selection >= 3 ? selection - 2 : 0;
+    for (size_t row = 0; row < 3 && first + row < discoveredHosts.size(); ++row) {
+      const size_t index = first + row;
+      if (index == selection)
+        display.fillRoundRect(4, 70 + static_cast<int>(row) * 14, 232, 13, 3,
+                              colour(22, 66, 72));
+      display.setTextColor(index == selection ? colour(80, 230, 190) : TFT_WHITE);
+      display.setCursor(8, 73 + static_cast<int>(row) * 14);
+      if (scoutExecution == ScoutExecution::Consensus) {
+        size_t seen = std::find(localScoutHosts.begin(), localScoutHosts.end(),
+                                discoveredHosts[index]) != localScoutHosts.end() ? 1 : 0;
+        for (const auto& job : remoteScoutJobs) {
+          if (std::find(job.hosts.begin(), job.hosts.end(), discoveredHosts[index]) != job.hosts.end())
+            ++seen;
+        }
+        const size_t providers = remoteScoutJobs.size() + (localScoutAssigned ? 1 : 0);
+        display.printf("%c %u/%u  %s", index == selection ? '>' : ' ',
+                       static_cast<unsigned>(seen), static_cast<unsigned>(providers),
+                       discoveredHosts[index].c_str());
+      } else {
+        display.printf("%c HOST  %s", index == selection ? '>' : ' ',
+                       discoveredHosts[index].c_str());
+      }
+    }
+  }
+  footer(scoutRunning ? "Scan active   Q: leave" :
+                         "Enter: host   R: scan   Q: back");
+}
+
+void drawHostDetail() {
+  header("SCOUT / HOST");
+  auto& display = M5Cardputer.Display;
+  display.fillRoundRect(7, 31, 226, 74, 7, colour(11, 30, 40));
+  display.drawRoundRect(7, 31, 226, 74, 7, colour(35, 118, 112));
+  display.setTextColor(colour(80, 230, 190));
+  display.setCursor(16, 42);
+  display.print("RESPONSIVE HOST");
+  display.setTextColor(TFT_WHITE);
+  display.setTextSize(2);
+  display.setCursor(16, 58);
+  display.print(selectedHost);
+  display.setTextSize(1);
+  display.setTextColor(colour(150, 170, 175));
+  display.setCursor(16, 84);
+  display.print("Enter checks configured TCP services");
+  footer("Enter: service scan   Q/Esc: back");
+}
+
+void drawPortResults() {
+  header("SCOUT / SERVICES");
+  auto& display = M5Cardputer.Display;
+  display.setTextColor(colour(150, 170, 175));
+  display.setCursor(8, 29);
+  display.print(selectedHost.substring(0, 37));
+  display.setTextColor(portRunning ? colour(255, 190, 70) : colour(80, 230, 190));
+  display.setCursor(8, 42);
+  display.print(portStatus.substring(0, 37));
+  if (portRunning && portScan.total() > 0) {
+    display.drawRoundRect(7, 55, 226, 8, 3, colour(35, 118, 112));
+    const int width = static_cast<int>((218UL * portScan.checked()) / portScan.total());
+    display.fillRoundRect(11, 58, width, 2, 1, colour(80, 230, 190));
+  }
+  if (openPorts.empty()) {
+    display.setTextColor(colour(150, 170, 175));
+    display.setCursor(8, 75);
+    display.print(portRunning ? "Checking services..." : "No open ports in selected scope");
+  } else {
+    if (selection >= openPorts.size()) selection = openPorts.size() - 1;
+    const size_t first = selection >= 2 ? selection - 1 : 0;
+    for (size_t row = 0; row < 3 && first + row < openPorts.size(); ++row) {
+      const size_t index = first + row;
+      if (index == selection)
+        display.fillRoundRect(4, 67 + static_cast<int>(row) * 14, 232, 13, 3,
+                              colour(22, 66, 72));
+      display.setTextColor(index == selection ? colour(80, 230, 190) : TFT_WHITE);
+      display.setCursor(8, 70 + static_cast<int>(row) * 14);
+      display.printf("%c TCP %-5u  open", index == selection ? '>' : ' ', openPorts[index]);
+    }
+  }
+  footer(portRunning ? "Checking...   Q: stop/back" : "Q/Esc: host");
+}
+
+void drawHome() {
+  struct MissionCard { const char* index; const char* title; const char* detail; };
+  static constexpr MissionCard cards[] = {
+      {"01", "RECONCLAVE", "Trusted nodes and coordination"},
+      {"02", "OBSERVE", "Wi-Fi and BLE signal survey"},
+      {"03", "SCOUT", "Network discovery and checks"},
+      {"04", "EVIDENCE", "Review observations on microSD"},
+      {"05", "FIELD KIT", "Diagnostics and device tools"},
+      {"06", "SETTINGS", "Connectivity and deck controls"},
+  };
+  if (navigationStyle == NavigationStyle::List) {
+    static const char* const items[] = {
+        "Reconclave", "Observe", "Scout", "Evidence", "Field Kit", "Settings"};
+    drawMenu("RECONCLAVE / MISSIONS", items, 6, "UP/DOWN: choose   Enter: open");
+    return;
+  }
+  if (selection >= sizeof(cards) / sizeof(cards[0])) selection = 0;
+  header("RECONCLAVE / MISSIONS");
+  auto& display = M5Cardputer.Display;
+  const auto& card = cards[selection];
+  display.fillRoundRect(7, 31, 226, 76, 7, colour(11, 30, 40));
+  display.drawRoundRect(7, 31, 226, 76, 7, colour(35, 118, 112));
+  display.fillRoundRect(16, 42, 35, 35, 5, colour(23, 76, 78));
+  display.setTextColor(colour(80, 230, 190));
+  display.setTextSize(2);
+  display.setCursor(21, 52);
+  display.print(card.index);
+  display.setTextSize(1);
+  display.setCursor(61, 43);
+  display.print("MISSION");
+  display.setTextColor(TFT_WHITE);
+  display.setTextSize(2);
+  display.setCursor(61, 56);
+  display.print(card.title);
+  display.setTextSize(1);
+  display.setTextColor(colour(150, 170, 175));
+  display.setCursor(16, 87);
+  display.print(card.detail);
+  for (size_t index = 0; index < sizeof(cards) / sizeof(cards[0]); ++index) {
+    const int x = 91 + static_cast<int>(index) * 10;
+    display.fillCircle(x, 112, index == selection ? 3 : 1,
+                       index == selection ? colour(80, 230, 190) : colour(55, 83, 87));
+  }
+  footer("ARROWS: choose   Enter: open");
+}
+
+void drawObserve() {
+  static const char* const items[] = {
+      "Wi-Fi discovery", "Channel analyser", "BLE discovery"};
+  drawMenu("OBSERVE SIGNALS", items, sizeof(items) / sizeof(items[0]));
+  auto& display = M5Cardputer.Display;
+  display.setTextColor(colour(130, 155, 160));
+  display.setCursor(8, 78);
+  display.print("GPS / Mesh / War drive: planned");
+}
+
+void drawWifiChannels() {
+  header("OBSERVE / WI-FI CHANNELS");
+  auto& display = M5Cardputer.Display;
+  if (wifiObservations.empty()) {
+    display.setTextColor(colour(255, 190, 70));
+    display.setCursor(8, 39);
+    display.print("No Wi-Fi observations available");
+    display.setTextColor(colour(150, 170, 175));
+    display.setCursor(8, 57);
+    display.print("Use Tab to run a Wi-Fi scan");
+    footer("Q/Esc: Observe");
+    return;
+  }
+  int counts[14]{};
+  int scores[14]{};
+  for (const auto& ap : wifiObservations) {
+    if (ap.channel < 1 || ap.channel > 13) continue;
+    ++counts[ap.channel];
+    scores[ap.channel] += std::max(1, 100 + static_cast<int>(ap.rssi));
+  }
+  const int choices[] = {1, 6, 11};
+  int recommended = choices[0];
+  for (int channel : choices)
+    if (scores[channel] < scores[recommended]) recommended = channel;
+  display.setTextColor(colour(80, 230, 190));
+  display.setCursor(8, 29);
+  display.printf("RECOMMENDED  CHANNEL %d", recommended);
+  for (size_t row = 0; row < 3; ++row) {
+    const int channel = choices[row];
+    const int y = 49 + static_cast<int>(row) * 21;
+    display.setTextColor(channel == recommended ? colour(80, 230, 190) : TFT_WHITE);
+    display.setCursor(8, y);
+    display.printf("CH %-2d  %2d AP%s", channel, counts[channel], counts[channel] == 1 ? " " : "s");
+    display.drawRoundRect(92, y - 2, 137, 9, 3, colour(35, 118, 112));
+    const int width = std::min(129, scores[channel] * 2);
+    if (width > 0) display.fillRoundRect(96, y + 1, width, 3, 1,
+                                         channel == recommended ? colour(80, 230, 190) : colour(255, 190, 70));
+  }
+  footer("Q/Esc: Observe");
+}
+
+const char* authName(wifi_auth_mode_t auth) {
+  return auth == WIFI_AUTH_OPEN ? "open" : "secured";
+}
+
+void drawWifiResults() {
+  header("WI-FI DISCOVERY");
+  auto& display = M5Cardputer.Display;
+  if (wifiObservations.empty()) {
+    display.setTextColor(colour(255, 190, 70));
+    display.setCursor(8, 39);
+    display.print((fieldStatus.isEmpty() ? String("Use Tab to run a scan") : fieldStatus).substring(0, 37));
+  } else {
+    if (selection >= wifiObservations.size()) selection = wifiObservations.size() - 1;
+    const size_t first = selection >= 4 ? selection - 3 : 0;
+    for (size_t row = 0; row < 5 && first + row < wifiObservations.size(); ++row) {
+      const size_t index = first + row;
+      const auto& ap = wifiObservations[index];
+      const int y = 28 + static_cast<int>(row) * 17;
+      if (index == selection)
+        display.fillRoundRect(3, y - 2, 234, 16, 3, colour(22, 66, 72));
+      display.setTextColor(index == selection ? colour(80, 230, 190) : TFT_WHITE);
+      display.setCursor(5, y);
+      display.printf("%c%-18s %4ld", index == selection ? '>' : ' ',
+                     ap.ssid.substring(0, 18).c_str(), static_cast<long>(ap.rssi));
+      display.setTextColor(colour(130, 155, 160));
+      display.setCursor(15, y + 9);
+      display.printf("ch%ld %s", static_cast<long>(ap.channel), authName(ap.auth));
+    }
+  }
+  footer(fieldStatus.startsWith("Saved") || fieldStatus.indexOf("save") >= 0 ||
+                 fieldStatus.indexOf("export") >= 0
+             ? fieldStatus.c_str() : "Enter: detail   Q/Esc: back");
+}
+
+void drawWifiDetail() {
+  if (wifiObservations.empty() || selection >= wifiObservations.size()) {
+    screen = ScreenState::WifiResults;
+    drawWifiResults();
+    return;
+  }
+  const auto& ap = wifiObservations[selection];
+  header("WI-FI OBSERVATION");
+  auto& display = M5Cardputer.Display;
+  display.setTextColor(TFT_WHITE);
+  display.setCursor(8, 31);
+  display.print(ap.ssid.substring(0, 36));
+  display.setCursor(8, 48);
+  display.printf("BSSID: %s", ap.bssid.c_str());
+  display.setCursor(8, 65);
+  display.printf("Channel: %ld", static_cast<long>(ap.channel));
+  display.setCursor(8, 82);
+  display.printf("Signal: %ld dBm", static_cast<long>(ap.rssi));
+  display.setCursor(8, 99);
+  display.printf("Security: %s", authName(ap.auth));
+  footer(fieldStatus.startsWith("Saved") || fieldStatus.indexOf("save") >= 0 ||
+                 fieldStatus.indexOf("export") >= 0
+             ? fieldStatus.c_str() : "Q/Esc: results");
+}
+
+void drawBleResults() {
+  header("BLE DISCOVERY");
+  auto& display = M5Cardputer.Display;
+  if (bleObservations.empty()) {
+    display.setTextColor(colour(255, 190, 70));
+    display.setCursor(8, 39);
+    display.print((fieldStatus.isEmpty() ? String("Use Tab to run a scan") : fieldStatus).substring(0, 37));
+  } else {
+    if (selection >= bleObservations.size()) selection = bleObservations.size() - 1;
+    const size_t first = selection >= 4 ? selection - 3 : 0;
+    for (size_t row = 0; row < 5 && first + row < bleObservations.size(); ++row) {
+      const size_t index = first + row;
+      const auto& device = bleObservations[index];
+      const int y = 28 + static_cast<int>(row) * 17;
+      if (index == selection)
+        display.fillRoundRect(3, y - 2, 234, 16, 3, colour(22, 66, 72));
+      display.setTextColor(index == selection ? colour(80, 230, 190) : TFT_WHITE);
+      display.setCursor(5, y);
+      display.printf("%c%-20s %4d", index == selection ? '>' : ' ',
+                     device.name.substring(0, 20).c_str(), device.rssi);
+      display.setTextColor(colour(130, 155, 160));
+      display.setCursor(15, y + 9);
+      display.printf("%s %s", device.address.c_str(),
+                     device.connectable ? "connectable" : "broadcast");
+    }
+  }
+  footer(fieldStatus.startsWith("Saved") || fieldStatus.indexOf("save") >= 0 ||
+                 fieldStatus.indexOf("export") >= 0
+             ? fieldStatus.c_str() : "Enter: detail   Q/Esc: back");
+}
+
+void drawBleDetail() {
+  if (bleObservations.empty() || selection >= bleObservations.size()) {
+    screen = ScreenState::BleResults;
+    drawBleResults();
+    return;
+  }
+  const auto& device = bleObservations[selection];
+  header("BLE OBSERVATION");
+  auto& display = M5Cardputer.Display;
+  display.setTextColor(TFT_WHITE);
+  display.setCursor(8, 31);
+  display.print(device.name.substring(0, 36));
+  display.setCursor(8, 49);
+  display.printf("Address: %s", device.address.c_str());
+  display.setCursor(8, 64);
+  display.printf("Signal: %d dBm  %s", device.rssi,
+                 device.connectable ? "connectable" : "broadcast");
+  display.setCursor(8, 79);
+  display.printf("Address type: %u  Adv type: %u", device.addressType,
+                 device.advertisementType);
+  display.setCursor(8, 94);
+  display.print((String("Services: ") + String(device.serviceCount) + " " +
+      (device.services.isEmpty() ? "none" : device.services)).substring(0, 37));
+  display.setCursor(8, 107);
+  display.print((device.manufacturer.isEmpty() ? String("Manufacturer: unknown") :
+      device.manufacturer + "  " + String(device.payloadLength) + "B").substring(0, 37));
+  footer(fieldStatus.startsWith("Saved") || fieldStatus.indexOf("save") >= 0 ||
+                 fieldStatus.indexOf("export") >= 0
+             ? fieldStatus.c_str() : "Q/Esc: results");
+}
+
+void drawFieldKit() {
+  static const char* const items[] = {"Network dashboard", "System diagnostics"};
+  drawMenu("FIELD KIT", items, sizeof(items) / sizeof(items[0]));
+}
+
+void drawNetworkDashboard() {
+  header("FIELD KIT / NETWORK");
+  auto& display = M5Cardputer.Display;
+  if (WiFi.status() != WL_CONNECTED) {
+    display.setTextColor(colour(255, 190, 70));
+    display.setCursor(8, 38);
+    display.print("Wi-Fi is not connected");
+    display.setTextColor(colour(150, 170, 175));
+    display.setCursor(8, 56);
+    display.print("Configure connectivity in Settings");
+    footer("Q/Esc: Field Kit");
+    return;
+  }
+  display.setTextColor(TFT_WHITE);
+  display.setCursor(8, 29);
+  display.print((String("SSID: ") + WiFi.SSID() + "  " + String(WiFi.RSSI()) + " dBm").substring(0, 37));
+  display.setCursor(8, 45);
+  display.print("IP:   " + WiFi.localIP().toString());
+  display.setCursor(8, 61);
+  display.print("GW:   " + WiFi.gatewayIP().toString());
+  display.setCursor(8, 77);
+  display.print("Mask: " + WiFi.subnetMask().toString());
+  display.setCursor(8, 93);
+  display.print("DNS:  " + WiFi.dnsIP().toString());
+  display.setCursor(8, 107);
+  display.print("MAC:  " + WiFi.macAddress());
+  footer("Q/Esc: Field Kit");
+}
+
+void drawEvidence() {
+  header("EVIDENCE");
+  auto& display = M5Cardputer.Display;
+  if (!sdAvailable) {
+    display.setTextColor(colour(255, 190, 70));
+    display.setCursor(8, 38);
+    display.print("microSD unavailable");
+    display.setCursor(8, 55);
+    display.print("Insert card, then use Tab to refresh");
+  } else if (evidenceFiles.empty()) {
+    display.setTextColor(colour(150, 170, 175));
+    display.setCursor(8, 38);
+    display.print("No Reconclave evidence yet");
+  } else {
+    if (selection >= evidenceFiles.size()) selection = evidenceFiles.size() - 1;
+    const size_t first = selection >= 5 ? selection - 4 : 0;
+    for (size_t row = 0; row < 6 && first + row < evidenceFiles.size(); ++row) {
+      const size_t index = first + row;
+      const int y = 28 + static_cast<int>(row) * 15;
+      if (index == selection)
+        display.fillRoundRect(3, y - 2, 234, 14, 3, colour(22, 66, 72));
+      display.setTextColor(index == selection ? colour(80, 230, 190) : TFT_WHITE);
+      display.setCursor(6, y);
+      display.printf("%c %-27s %luK", index == selection ? '>' : ' ',
+                     evidenceFiles[index].name.substring(0, 27).c_str(),
+                     static_cast<unsigned long>(evidenceFiles[index].size / 1024));
+    }
+  }
+  footer(!evidenceFiles.empty() ? "Enter: details   Q/Esc: back" : "Q/Esc: back");
+}
+
+String selectedEvidencePath() {
+  if (evidenceFiles.empty() || selection >= evidenceFiles.size()) return "";
+  String name = evidenceFiles[selection].name;
+  return name.startsWith("/") ? name : "/reconclave/evidence/" + name;
+}
+
+bool evidencePreviewable(const String& name) {
+  String lower = name;
+  lower.toLowerCase();
+  return lower.endsWith(".txt") || lower.endsWith(".csv") ||
+      lower.endsWith(".log") || lower.endsWith(".json") ||
+      lower.endsWith(".jsonl") || lower.endsWith(".md");
+}
+
+void drawEvidenceDetail() {
+  if (evidenceFiles.empty() || selection >= evidenceFiles.size()) {
+    screen = ScreenState::Evidence;
+    drawEvidence();
+    return;
+  }
+  header("EVIDENCE DETAILS");
+  auto& display = M5Cardputer.Display;
+  const auto& entry = evidenceFiles[selection];
+  display.setTextColor(TFT_WHITE);
+  display.setCursor(8, 34);
+  display.print(entry.name.substring(0, 36));
+  display.setCursor(8, 55);
+  display.printf("Size: %llu bytes", static_cast<unsigned long long>(entry.size));
+  display.setCursor(8, 76);
+  display.printf("Preview: %s", evidencePreviewable(entry.name) ? "available" : "binary/unsupported");
+  display.setTextColor(colour(150, 170, 175));
+  display.setCursor(8, 96);
+  display.print("Facts remain separate from findings");
+  footer(evidencePreviewable(entry.name) ? "Enter: preview   Q: back" : "Q: back");
+}
+
+void drawEvidencePreview() {
+  header("EVIDENCE PREVIEW");
+  auto& display = M5Cardputer.Display;
+  if (previewLines.empty()) {
+    display.setTextColor(colour(150, 170, 175));
+    display.setCursor(8, 39);
+    display.print("(empty or unreadable file)");
+  } else {
+    for (size_t row = 0; row < 5 && previewLine + row < previewLines.size(); ++row) {
+      display.setTextColor(TFT_WHITE);
+      display.setCursor(4, 27 + static_cast<int>(row) * 15);
+      display.print(previewLines[previewLine + row].substring(0, 39));
+    }
+    display.setTextColor(colour(150, 170, 175));
+    display.setCursor(178, 105);
+    display.printf("%u/%u%s", static_cast<unsigned>(previewLine + 1),
+                   static_cast<unsigned>(previewLines.size()), previewTruncated ? "+" : "");
+  }
+  footer("UP/DOWN: scroll   Q/Esc: details");
+}
+
+void drawSystem() {
+  header("SYSTEM DIAGNOSTICS");
+  auto& display = M5Cardputer.Display;
+  display.setTextColor(TFT_WHITE);
+  display.setCursor(8, 30);
+  display.printf("Firmware: %s", kFirmware);
+  display.setCursor(8, 45);
+  display.printf("Node: %s", deviceId.substring(deviceId.length() - 12).c_str());
+  display.setCursor(8, 60);
+  display.printf("Heap: %lu KiB", static_cast<unsigned long>(ESP.getFreeHeap() / 1024));
+  display.setCursor(8, 75);
+  display.printf("Uptime: %lu s", static_cast<unsigned long>(millis() / 1000));
+  display.setCursor(8, 90);
+  display.printf("Wi-Fi: %s", WiFi.status() == WL_CONNECTED
+                                 ? WiFi.localIP().toString().c_str() : "offline");
+  display.setCursor(8, 105);
+  display.printf("SD: %s   Trust: %s", sdAvailable ? "ready" : "missing",
+                 peerKeyValid ? "paired" : "none");
+  footer("Q/Esc: back");
+}
+
+void drawSettings() {
+  static const char* const items[] = {
+      "Connectivity", "Display & interface", "Storage & evidence",
+      "Device information", "Trust & pairing"};
+  drawMenu("SETTINGS", items, sizeof(items) / sizeof(items[0]));
+}
+
+void drawSettingsConnectivity() {
+  header("SETTINGS / CONNECTIVITY");
+  auto& display = M5Cardputer.Display;
+  display.setTextColor(colour(80, 230, 190));
+  display.setCursor(8, 31);
+  display.print(WiFi.status() == WL_CONNECTED ? "CONNECTED" : "OFFLINE");
+  display.setTextColor(TFT_WHITE);
+  display.setCursor(8, 49);
+  display.print((String("Network: ") + (wifiSsid.isEmpty() ? "not configured" : wifiSsid)).substring(0, 37));
+  display.setCursor(8, 66);
+  display.print(String("Address: ") + (WiFi.status() == WL_CONNECTED ?
+      WiFi.localIP().toString() : "none"));
+  display.setTextColor(colour(150, 170, 175));
+  display.setCursor(8, 88);
+  display.print("Enter to change Wi-Fi credentials");
+  footer("Enter: configure   Q/Esc: Settings");
+}
+
+void drawSettingsDisplay() {
+  header("SETTINGS / DISPLAY");
+  auto& display = M5Cardputer.Display;
+  if (selection >= 7) selection = 0;
+  const char* theme = uiTheme == UiTheme::Field ? "FIELD" :
+      (uiTheme == UiTheme::NightCity ? "NIGHT CITY" : "AMBER");
+  const char* navigation = navigationStyle == NavigationStyle::Cards ? "CARDS" : "LIST";
+  String timeout = screenTimeoutSeconds == 0 ? "OFF" : String(screenTimeoutSeconds) + "S";
+  const char* idle = idleStyle == IdleStyle::Off ? "OFF" :
+      (idleStyle == IdleStyle::Radar ? "RADAR" : "NODES");
+  const String values[] = {theme, navigation, String(displayBrightness), timeout,
+                           idle, "OPEN", searchNodesOnBoot ? "ON" : "OFF"};
+  static const char* const labels[] = {
+      "Theme", "Navigation", "Brightness", "Screen timeout", "Idle animation",
+      "Boot screen", "Search nodes boot"};
+  const size_t first = selection >= 6 ? 1 : 0;
+  for (size_t row = 0; row < 6; ++row) {
+    const size_t index = first + row;
+    const int y = 28 + static_cast<int>(row) * 15;
+    if (index == selection) display.fillRoundRect(4, y - 2, 232, 14, 3, colour(22, 66, 72));
+    display.setTextColor(index == selection ? colour(80, 230, 190) : TFT_WHITE);
+    display.setCursor(8, y);
+    display.printf("%c %-16s", index == selection ? '>' : ' ', labels[index]);
+    display.setTextColor(index == selection ? colour(80, 230, 190) : colour(150, 170, 175));
+    display.setCursor(158, y);
+    display.print(values[index].substring(0, 12));
+  }
+  footer("ARROWS: change   Enter: open");
+}
+
+const char* bootSequenceLabel() {
+  switch (bootSequence) {
+    case BootSequence::CipherRain: return "CIPHER RAIN";
+    case BootSequence::SignalTrace: return "SIGNAL TRACE";
+    case BootSequence::NodeBreach: return "NODE BREACH";
+    case BootSequence::PacketStorm: return "PACKET STORM";
+    case BootSequence::HexTunnel: return "HEX TUNNEL";
+    default: return "ROOT ACCESS";
+  }
+}
+
+const char* bootSpeedLabel() {
+  return bootSpeed == BootSpeed::Slow ? "SLOW" :
+      (bootSpeed == BootSpeed::Normal ? "NORMAL" : "FAST");
+}
+
+void drawSettingsBoot() {
+  header("SETTINGS / BOOT SCREEN");
+  if (selection >= 4) selection = 0;
+  const String values[] = {bootAnimationEnabled ? "ON" : "OFF", bootSequenceLabel(),
+                           bootSpeedLabel(), "RUN"};
+  static const char* const labels[] = {"Animation", "Sequence", "Speed", "Preview"};
+  auto& display = M5Cardputer.Display;
+  for (size_t row = 0; row < 4; ++row) {
+    const int y = 31 + static_cast<int>(row) * 19;
+    if (row == selection) display.fillRoundRect(4, y - 3, 232, 16, 3, colour(22, 66, 72));
+    display.setTextColor(row == selection ? colour(80, 230, 190) : TFT_WHITE);
+    display.setCursor(8, y);
+    display.printf("%c %-12s", row == selection ? '>' : ' ', labels[row]);
+    display.setCursor(126, y);
+    display.print(values[row].substring(0, 17));
+  }
+  footer("ARROWS: change   Q/Esc: back");
+}
+
+void drawIdle() {
+  auto& display = M5Cardputer.Display;
+  if (idleStyle == IdleStyle::Off) {
+    display.setBrightness(0);
+    return;
+  }
+  display.fillScreen(colour(5, 10, 16));
+  display.setTextSize(1);
+  display.setTextColor(colour(80, 230, 190));
+  display.setCursor(82, 8);
+  display.print("RECONCLAVE");
+  if (idleStyle == IdleStyle::Radar) {
+    const int cx = 120, cy = 75;
+    display.drawCircle(cx, cy, 42, colour(35, 118, 112));
+    display.drawCircle(cx, cy, 26, colour(24, 64, 70));
+    display.drawFastHLine(75, cy, 90, colour(24, 64, 70));
+    display.drawFastVLine(cx, 30, 90, colour(24, 64, 70));
+    const float angle = static_cast<float>(idlePhase % 360) * 0.0174533f;
+    display.drawLine(cx, cy, cx + static_cast<int>(40 * cosf(angle)),
+                     cy + static_cast<int>(40 * sinf(angle)), colour(80, 230, 190));
+  } else {
+    const int drift = static_cast<int>((idlePhase / 8) % 9) - 4;
+    display.drawLine(58, 83, 120, 47 + drift, colour(35, 118, 112));
+    display.drawLine(120, 47 + drift, 183, 85, colour(35, 118, 112));
+    display.drawLine(58, 83, 183, 85, colour(24, 64, 70));
+    display.fillCircle(58, 83, 6, colour(80, 230, 190));
+    display.fillCircle(120, 47 + drift, 7, colour(80, 230, 190));
+    display.fillCircle(183, 85, 6, colour(80, 230, 190));
+    display.setTextColor(colour(150, 170, 175));
+    display.setCursor(86, 108);
+    display.print("NODES STANDING BY");
+  }
+}
+
+void drawBootAnimation() {
+  if (!bootAnimationEnabled) return;
+  auto& display = M5Cardputer.Display;
+  M5Canvas canvas(&display);
+  canvas.setColorDepth(16);
+  if (canvas.createSprite(display.width(), display.height()) == nullptr) return;
+  const unsigned long duration = bootSpeed == BootSpeed::Slow ? 7500UL :
+      (bootSpeed == BootSpeed::Fast ? 2500UL : 5000UL);
+  const unsigned long started = millis();
+  uint16_t frame = 0;
+  while (millis() - started < duration) {
+    canvas.fillSprite(colour(5, 10, 16));
+    if (bootSequence == BootSequence::CipherRain) {
+      for (int column = 0; column < 20; ++column) {
+        const int head = (frame * (column % 3 + 2) * 2 + column * 19) % 170 - 18;
+        for (int trail = 4; trail >= 0; --trail) {
+          const int y = head - trail * 11;
+          if (y < 0 || y >= 135) continue;
+          canvas.setTextColor(trail == 0 ? colour(80, 230, 190) :
+              (trail < 3 ? colour(35, 118, 112) : colour(24, 64, 70)));
+          canvas.setCursor(column * 12 + (column & 1) * 2, y);
+          canvas.printf("%X", (frame + column * 7 - trail * 3) & 0xF);
+        }
+      }
+      canvas.setTextColor(colour(150, 170, 175));
+      canvas.setCursor(7, 121);
+      canvas.print("DECRYPTING FIELD STATE...");
+    } else if (bootSequence == BootSequence::SignalTrace) {
+      for (int x = 0; x < 240; x += 20) canvas.drawFastVLine(x, 19, 97, colour(24, 64, 70));
+      for (int y = 19; y < 117; y += 16) canvas.drawFastHLine(0, y, 240, colour(24, 64, 70));
+      for (int x = 0; x < 239; ++x) {
+        const float wave = sinf((x + frame * 4) * 0.075f) * 18.0f +
+            sinf((x - frame * 2) * 0.19f) * 7.0f;
+        const float next = sinf((x + 1 + frame * 4) * 0.075f) * 18.0f +
+            sinf((x + 1 - frame * 2) * 0.19f) * 7.0f;
+        canvas.drawLine(x, 67 + static_cast<int>(wave), x + 1,
+                        67 + static_cast<int>(next), colour(80, 230, 190));
+      }
+      const int sweep = (frame * 3) % 240;
+      canvas.drawFastVLine(sweep, 15, 106, colour(255, 190, 70));
+      canvas.setTextColor(colour(150, 170, 175));
+      canvas.setCursor(7, 121);
+      canvas.printf("SIGNAL LOCK %03u", static_cast<unsigned>((frame * 7) % 1000));
+    } else if (bootSequence == BootSequence::NodeBreach) {
+      const int pulse = (frame * 2) % 54;
+      const int nodes[][2] = {{38, 31}, {199, 27}, {47, 105}, {194, 103}, {120, 67}};
+      for (size_t index = 0; index < 4; ++index) {
+        canvas.drawLine(nodes[index][0], nodes[index][1], 120, 67, colour(35, 118, 112));
+        canvas.fillCircle(nodes[index][0], nodes[index][1], 3, colour(80, 230, 190));
+      }
+      canvas.drawCircle(120, 67, pulse, colour(24, 64, 70));
+      canvas.drawCircle(120, 67, std::max(2, pulse - 1), colour(35, 118, 112));
+      canvas.fillCircle(120, 67, 7, colour(80, 230, 190));
+      canvas.setTextColor(colour(150, 170, 175));
+      canvas.setCursor(72, 119);
+      canvas.printf("TRUST MAP %02u%%", static_cast<unsigned>((millis() - started) * 100 / duration));
+    } else if (bootSequence == BootSequence::PacketStorm) {
+      for (int lane = 0; lane < 7; ++lane) {
+        canvas.drawFastHLine(0, 15 + lane * 17, 240, colour(24, 64, 70));
+        for (int packet = 0; packet < 3; ++packet) {
+          const int direction = lane & 1 ? -1 : 1;
+          int x = (frame * (lane + 2) * 2 + packet * 83 + lane * 29) % 280 - 20;
+          if (direction < 0) x = 220 - x;
+          canvas.fillRoundRect(x, 10 + lane * 17, 20 + (packet & 1) * 8, 10, 2,
+                               packet == 0 ? colour(80, 230, 190) : colour(35, 118, 112));
+        }
+      }
+      canvas.setTextColor(colour(150, 170, 175));
+      canvas.setCursor(7, 124);
+      canvas.printf("ROUTING %04u PACKETS", static_cast<unsigned>(frame * 13));
+    } else if (bootSequence == BootSequence::HexTunnel) {
+      for (int depth = 0; depth < 9; ++depth) {
+        const int phase = (frame + depth * 7) % 63;
+        const int halfWidth = 8 + phase * 2;
+        const int halfHeight = 4 + phase;
+        canvas.drawRect(120 - halfWidth, 67 - halfHeight, halfWidth * 2,
+                        halfHeight * 2, depth < 3 ? colour(80, 230, 190) : colour(35, 118, 112));
+      }
+      canvas.setTextColor(colour(150, 170, 175));
+      canvas.setCursor(7, 7);
+      canvas.printf("0x%04X  MEMORY VECTOR", static_cast<unsigned>(frame * 97));
+      canvas.setCursor(72, 123);
+      canvas.print("ENTERING SECURE CORE");
+    } else {
+      const unsigned progress = static_cast<unsigned>((millis() - started) * 100 / duration);
+      static const char* const commands[] = {
+          "> mount /field", "> verify trust.chain", "> load node.registry",
+          "> start secure shell", "> elevate field.agent"};
+      canvas.setTextSize(1);
+      for (int line = 0; line < 5; ++line) {
+        canvas.setTextColor(line <= static_cast<int>(progress / 20) ?
+            colour(80, 230, 190) : colour(55, 83, 87));
+        canvas.setCursor(11, 14 + line * 18);
+        canvas.print(commands[line]);
+        if (line < static_cast<int>(progress / 20)) {
+          canvas.setCursor(206, 14 + line * 18);
+          canvas.print("OK");
+        }
+      }
+      canvas.drawRoundRect(10, 110, 220, 9, 3, colour(35, 118, 112));
+      canvas.fillRoundRect(14, 113, static_cast<int>(progress * 212 / 100), 3, 1,
+                           colour(80, 230, 190));
+      canvas.setTextColor(colour(150, 170, 175));
+      canvas.setCursor(87, 124);
+      canvas.printf("ACCESS %02u%%", progress);
+    }
+    canvas.pushSprite(0, 0);
+    ++frame;
+    delay(33);
+  }
+
+  // A distinct title card closes the sequence without obscuring the animation.
+  canvas.fillSprite(colour(5, 10, 16));
+  canvas.fillRoundRect(18, 32, 204, 70, 7, colour(9, 28, 39));
+  canvas.drawRoundRect(18, 32, 204, 70, 7, colour(35, 118, 112));
+  canvas.setTextColor(colour(80, 230, 190));
+  canvas.setTextSize(2);
+  canvas.setCursor(48, 51);
+  canvas.print("RECONCLAVE");
+  canvas.setTextSize(1);
+  canvas.setTextColor(colour(150, 170, 175));
+  canvas.setCursor(68, 79);
+  canvas.print("FIELD SYSTEM READY");
+  canvas.pushSprite(0, 0);
+  delay(2000);
+  canvas.deleteSprite();
+}
+
+void drawSettingsStorage() {
+  header("SETTINGS / STORAGE");
+  auto& display = M5Cardputer.Display;
+  display.setTextColor(sdAvailable ? colour(80, 230, 190) : colour(255, 190, 70));
+  display.setCursor(8, 31);
+  display.print(sdAvailable ? "MICROSD READY" : "MICROSD UNAVAILABLE");
+  display.setTextColor(TFT_WHITE);
+  display.setCursor(8, 50);
+  display.printf("Evidence files: %u", static_cast<unsigned>(evidenceFiles.size()));
+  display.setCursor(8, 67);
+  display.printf("Card size: %llu MiB", sdAvailable ?
+      static_cast<unsigned long long>(SD.cardSize() / (1024ULL * 1024ULL)) : 0ULL);
+  display.setTextColor(colour(150, 170, 175));
+  display.setCursor(8, 89);
+  display.print("Enter remounts and refreshes evidence");
+  footer("Enter: refresh   Q/Esc: Settings");
+}
+
+void drawSettingsDevice() {
+  header("SETTINGS / DEVICE");
+  auto& display = M5Cardputer.Display;
+  display.setTextColor(TFT_WHITE);
+  display.setCursor(8, 31);
+  display.printf("Firmware: %s", kFirmware);
+  display.setCursor(8, 49);
+  display.print((String("Node: ") + deviceId).substring(0, 37));
+  display.setCursor(8, 67);
+  display.print("Model: Cardputer ADV");
+  display.setTextColor(colour(150, 170, 175));
+  display.setCursor(8, 89);
+  display.print("Enter opens full diagnostics");
+  footer("Enter: diagnostics   Q/Esc: Settings");
+}
+
+void drawSettingsTrust() {
+  header("SETTINGS / TRUST");
+  auto& display = M5Cardputer.Display;
+  if (selection > 1) selection = 0;
+  static const char* const labels[] = {"P4 pairing (Grove)", "Evidence key"};
+  for (size_t row = 0; row < 2; ++row) {
+    const bool active = row == 0 ? peerKeyValid : evidenceKeyValid;
+    const int y = 32 + static_cast<int>(row) * 26;
+    if (row == selection) display.fillRoundRect(4, y - 3, 232, 22, 4, colour(22, 66, 72));
+    display.setTextColor(row == selection ? colour(80, 230, 190) : TFT_WHITE);
+    display.setCursor(8, y);
+    display.print(row == selection ? '>' : ' ');
+    display.setCursor(18, y);
+    display.print(labels[row]);
+    display.setTextColor(active ? colour(80, 230, 190) : colour(150, 170, 175));
+    display.setCursor(18, y + 12);
+    display.print((row == 0 ? (peerKeyValid ? trustedP4Id : String("not paired; pair over Grove")) :
+        (evidenceKeyValid ? String("configured") : String("not set"))).substring(0, 33));
+  }
+  footer(selection == 0
+      ? (peerKeyValid ? "Enter: forget   Q/Esc: back" : "Pair via Grove   Q/Esc: back")
+      : (evidenceKeyValid ? "Enter: forget key   Q/Esc: back" : "Enter: set key   Q/Esc: back"));
+}
+
+void drawConfirmForgetTrust() {
+  header("CONFIRM / FORGET TRUST");
+  auto& display = M5Cardputer.Display;
+  display.fillRoundRect(7, 31, 226, 75, 7, colour(32, 14, 30));
+  display.drawRoundRect(7, 31, 226, 75, 7, TFT_MAGENTA);
+  display.setTextColor(TFT_MAGENTA);
+  display.setCursor(16, 42);
+  display.print("REMOVE SAVED PAIRING?");
+  display.setTextColor(TFT_WHITE);
+  display.setCursor(16, 61);
+  display.print("Local trust will be erased.");
+  display.setCursor(16, 75);
+  display.print("Reset P4 trust before pairing again.");
+  display.setTextColor(colour(255, 190, 70));
+  display.setCursor(16, 95);
+  display.print("Enter confirms   Q/Esc cancels");
+  footer("Enter: remove   Q/Esc: cancel");
+}
+
+RemoteNode* scoutProvider(const String& id) {
+  for (auto& node : remoteNodes) {
+    if (node.deviceId == id && node.netDiscovery &&
+        capabilityEnabled(node.deviceId, "net.discovery.scan")) return &node;
+  }
+  return nullptr;
+}
+
+String targetLabel() {
+  if (scoutTargetId == "auto") return "AUTO";
+  if (scoutTargetId == "local") return "LOCAL";
+  RemoteNode* node = scoutProvider(scoutTargetId);
+  return node ? node->deviceType.substring(0, 12) : "AUTO";
+}
+
+const char* portProfileLabel() {
+  return portProfile == PortProfile::Web ? "WEB 6" :
+      (portProfile == PortProfile::Common ? "COMMON 13" : "EXTENDED 39");
+}
+
+const char* scoutExecutionLabel() {
+  return scoutExecution == ScoutExecution::Auto ? "AUTO" :
+      (scoutExecution == ScoutExecution::Single ? "SINGLE" :
+       (scoutExecution == ScoutExecution::Distributed ? "DISTRIBUTED" : "CONSENSUS"));
+}
+
+void cycleScoutExecution(bool forward) {
+  int value = static_cast<int>(scoutExecution) + (forward ? 1 : 3);
+  scoutExecution = static_cast<ScoutExecution>(value % 4);
+}
+
+String scoutIntervalLabel() {
+  return scoutIntervalMinutes == 0 ? "OFF" : String(scoutIntervalMinutes) + " MIN";
+}
+
+void cycleScoutInterval(bool forward) {
+  static constexpr uint16_t kPresets[] = {0, 1, 5, 15, 30, 60};
+  static constexpr size_t kCount = sizeof(kPresets) / sizeof(kPresets[0]);
+  size_t index = 0;
+  while (index < kCount && kPresets[index] != scoutIntervalMinutes) ++index;
+  if (index >= kCount) index = 0;
+  index = (index + (forward ? 1 : kCount - 1)) % kCount;
+  scoutIntervalMinutes = kPresets[index];
+}
+
+void selectedPortList(const uint16_t*& ports, size_t& count) {
+  if (portProfile == PortProfile::Web) {
+    ports = kWebPorts;
+    count = sizeof(kWebPorts) / sizeof(kWebPorts[0]);
+  } else if (portProfile == PortProfile::Extended) {
+    ports = kExtendedPorts;
+    count = sizeof(kExtendedPorts) / sizeof(kExtendedPorts[0]);
+  } else {
+    ports = kCommonPorts;
+    count = sizeof(kCommonPorts) / sizeof(kCommonPorts[0]);
+  }
+}
+
+size_t contextItemCount() {
+  if (contextOrigin == ScreenState::Scout) return 6;
+  if (contextOrigin == ScreenState::HostDetail) return 1;
+  if (contextOrigin == ScreenState::PortResults) return 2;
+  if (contextOrigin == ScreenState::WifiResults || contextOrigin == ScreenState::WifiDetail ||
+      contextOrigin == ScreenState::BleResults || contextOrigin == ScreenState::BleDetail ||
+      contextOrigin == ScreenState::Reconclave) return 2;
+  if (contextOrigin == ScreenState::NodeDetail) return 1;
+  return 1;
+}
+
+String contextItemLabel(size_t index) {
+  if (contextOrigin == ScreenState::Scout) {
+    if (index == 0) return String("Execution         ") + scoutExecutionLabel();
+    if (index == 1) return String("Provider          ") + targetLabel();
+    if (index == 2) return String("Distribution      ") +
+        (distributionStyle == DistributionStyle::Equal ? "EQUAL" : "WEIGHTED");
+    if (index == 3) return String("Recurring         ") + scoutIntervalLabel();
+    if (index == 4) return String("Service scope     ") + portProfileLabel();
+    return "Save host evidence";
+  }
+  if (contextOrigin == ScreenState::HostDetail)
+    return String("Service scope     ") + portProfileLabel();
+  if (contextOrigin == ScreenState::PortResults) {
+    if (index == 0) return String("Service scope     ") + portProfileLabel();
+    return "Run service scan again";
+  }
+  if (contextOrigin == ScreenState::WifiResults || contextOrigin == ScreenState::WifiDetail)
+    return index == 0 ? "Run Wi-Fi scan" : "Save Wi-Fi evidence";
+  if (contextOrigin == ScreenState::WifiChannels) return "Run Wi-Fi scan";
+  if (contextOrigin == ScreenState::BleResults || contextOrigin == ScreenState::BleDetail)
+    return index == 0 ? "Run BLE scan" : "Save BLE evidence";
+  if (contextOrigin == ScreenState::Reconclave)
+    return index == 0 ? "Refresh devices" : "Pair over Grove";
+  if (contextOrigin == ScreenState::NodeDetail) {
+    RemoteNode* node = selectedRemoteNode();
+    if (selectedNodeId == deviceId) return "Refresh local status";
+    return node && node->deviceId == p4.deviceId && node->systemInfo
+        ? "Request system information" : "No management actions available";
+  }
+  if (contextOrigin == ScreenState::Evidence) return "Refresh microSD evidence";
+  if (contextOrigin == ScreenState::System) return "Refresh diagnostics";
+  if (contextOrigin == ScreenState::NetworkDashboard) return "Refresh network status";
+  if (contextOrigin == ScreenState::Settings) return "Settings use Enter/Left/Right";
+  if (contextOrigin == ScreenState::SettingsConnectivity ||
+      contextOrigin == ScreenState::SettingsDisplay ||
+      contextOrigin == ScreenState::SettingsBoot ||
+      contextOrigin == ScreenState::SettingsStorage ||
+      contextOrigin == ScreenState::SettingsDevice ||
+      contextOrigin == ScreenState::SettingsTrust ||
+      contextOrigin == ScreenState::ConfirmForgetTrust)
+    return "Settings and actions are shown here";
+  if (contextOrigin == ScreenState::Observe) return "Choose an observation source";
+  return "Navigation: arrows, Enter, Q";
+}
+
+void drawContextMenu() {
+  header("CONTEXT / OPTIONS");
+  auto& display = M5Cardputer.Display;
+  const size_t count = contextItemCount();
+  if (selection >= count) selection = count - 1;
+  for (size_t row = 0; row < count; ++row) {
+    const int y = count > 4 ? 28 + static_cast<int>(row) * 15 : 34 + static_cast<int>(row) * 22;
+    if (row == selection) display.fillRoundRect(5, y - (count > 4 ? 2 : 5), 230,
+                                                 count > 4 ? 14 : 18, 4, colour(22, 66, 72));
+    display.setTextColor(row == selection ? colour(80, 230, 190) : TFT_WHITE);
+    display.setCursor(9, y);
+    display.printf("%c %s", row == selection ? '>' : ' ', contextItemLabel(row).substring(0, 35).c_str());
+  }
+  const bool adjustable = (contextOrigin == ScreenState::Scout && selection < 5) ||
+      contextOrigin == ScreenState::HostDetail ||
+      (contextOrigin == ScreenState::PortResults && selection == 0);
+  RemoteNode* contextNode = contextOrigin == ScreenState::NodeDetail ? selectedRemoteNode() : nullptr;
+  const bool nodeActionAvailable = selectedNodeId == deviceId ||
+      (contextNode && contextNode->deviceId == p4.deviceId && contextNode->systemInfo);
+  const bool informational = contextOrigin == ScreenState::Home ||
+      contextOrigin == ScreenState::Connecting || contextOrigin == ScreenState::Observe ||
+      contextOrigin == ScreenState::Settings || contextOrigin == ScreenState::FieldKit ||
+      contextOrigin == ScreenState::SettingsConnectivity ||
+      contextOrigin == ScreenState::SettingsDisplay ||
+      contextOrigin == ScreenState::SettingsBoot ||
+      contextOrigin == ScreenState::SettingsStorage ||
+      contextOrigin == ScreenState::SettingsDevice ||
+      contextOrigin == ScreenState::SettingsTrust ||
+      contextOrigin == ScreenState::ConfirmForgetTrust ||
+      contextOrigin == ScreenState::NodeCapabilities ||
+      contextOrigin == ScreenState::EvidenceDetail ||
+      contextOrigin == ScreenState::EvidencePreview ||
+      (contextOrigin == ScreenState::NodeDetail && !nodeActionAvailable);
+  if (count <= 4) {
+    display.setTextColor(colour(130, 155, 160));
+    display.setCursor(8, 104);
+    display.print(adjustable ? "Left/Right changes value" :
+        (informational ? "No additional options here" : "Enter runs selected action"));
+  }
+  footer(informational ? "Q/Esc: close" : "Enter: apply   Q/Esc: close");
+}
+
+void draw() {
+  if (idleActive) {
+    drawIdle();
+    return;
+  }
+  if (screen == ScreenState::ProvisionSsid) drawProvision("network name", false);
+  else if (screen == ScreenState::ProvisionPassword) drawProvision("password", true);
+  else if (screen == ScreenState::Connecting) drawConnecting();
+  else if (screen == ScreenState::Home) drawHome();
+  else if (screen == ScreenState::Reconclave) drawDashboard();
+  else if (screen == ScreenState::NodeDetail) drawNodeDetail();
+  else if (screen == ScreenState::NodeCapabilities) drawNodeCapabilities();
+  else if (screen == ScreenState::Scout) drawScout();
+  else if (screen == ScreenState::HostDetail) drawHostDetail();
+  else if (screen == ScreenState::PortResults) drawPortResults();
+  else if (screen == ScreenState::Observe) drawObserve();
+  else if (screen == ScreenState::WifiResults) drawWifiResults();
+  else if (screen == ScreenState::WifiChannels) drawWifiChannels();
+  else if (screen == ScreenState::WifiDetail) drawWifiDetail();
+  else if (screen == ScreenState::BleResults) drawBleResults();
+  else if (screen == ScreenState::BleDetail) drawBleDetail();
+  else if (screen == ScreenState::Evidence) drawEvidence();
+  else if (screen == ScreenState::EvidenceDetail) drawEvidenceDetail();
+  else if (screen == ScreenState::EvidencePreview) drawEvidencePreview();
+  else if (screen == ScreenState::FieldKit) drawFieldKit();
+  else if (screen == ScreenState::NetworkDashboard) drawNetworkDashboard();
+  else if (screen == ScreenState::System) drawSystem();
+  else if (screen == ScreenState::Settings) drawSettings();
+  else if (screen == ScreenState::SettingsConnectivity) drawSettingsConnectivity();
+  else if (screen == ScreenState::SettingsDisplay) drawSettingsDisplay();
+  else if (screen == ScreenState::SettingsBoot) drawSettingsBoot();
+  else if (screen == ScreenState::SettingsStorage) drawSettingsStorage();
+  else if (screen == ScreenState::SettingsDevice) drawSettingsDevice();
+  else if (screen == ScreenState::SettingsTrust) drawSettingsTrust();
+  else if (screen == ScreenState::ConfirmForgetTrust) drawConfirmForgetTrust();
+  else if (screen == ScreenState::ProvisionEvidenceKey) drawProvision("evidence key", true);
+  else drawContextMenu();
+}
+
+String nextMessageId() {
+  return deviceId + "-" + String(++messageSequence);
+}
+
+void addEnvelope(JsonDocument& document, const char* type, const String& destination) {
+  document["proto"] = kProtocol;
+  document["type"] = type;
+  document["message_id"] = nextMessageId();
+  document["source_node"] = deviceId;
+  if (!destination.isEmpty()) document["destination_node"] = destination;
+  document["timestamp_ms"] = static_cast<uint64_t>(millis()) + 1;
+  document["sequence"] = messageSequence;
+}
+
+void fillAnnouncement(JsonDocument& document) {
+  addEnvelope(document, "announce", "");
+  JsonObject payload = document["payload"].to<JsonObject>();
+  payload["device_id"] = deviceId;
+  payload["device_type"] = "cardputer-adv";
+  payload["firmware"] = kFirmware;
+  JsonArray roles = payload["roles"].to<JsonArray>();
+  roles.add("node");
+  roles.add("coordinator");
+  JsonArray capabilities = payload["capabilities"].to<JsonArray>();
+  capabilities.add("system.info");
+  capabilities.add("coordination.nodes");
+  capabilities.add("coordination.jobs");
+  capabilities.add("input.keyboard");
+  capabilities.add("radio.wifi.scan");
+  capabilities.add("radio.ble.scan");
+  capabilities.add("storage.file.read");
+  if (capabilityEnabled(deviceId, "net.discovery.scan")) {
+    capabilities.add("net.discovery.scan");
+  }
+  if (evidenceKeyValid && capabilityEnabled(deviceId, "storage.evidence.write")) {
+    capabilities.add("storage.evidence.write");
+  }
+  payload["status"] = "ready";
+}
+
+void sendServerJson(JsonDocument& document, int status = 200) {
+  String output;
+  serializeJson(document, output);
+  server.send(status, "application/json", output);
+}
+
+void handleAnnounce() {
+  JsonDocument document;
+  fillAnnouncement(document);
+  sendServerJson(document);
+}
+
+void addErrorPayload(JsonDocument& response, const String& requestId,
+                     const char* code, const char* message, const char* status = "rejected") {
+  JsonObject payload = response["payload"].to<JsonObject>();
+  payload["request_id"] = requestId;
+  payload["status"] = status;
+  JsonObject error = payload["error"].to<JsonObject>();
+  error["code"] = code;
+  error["message"] = message;
+}
+
+bool evidenceRecordValid(JsonVariantConst evidence) {
+  return evidence.is<JsonObjectConst>() && evidence["job_id"].is<const char*>() &&
+      evidence["source_node"].is<const char*>() && evidence["target"].is<const char*>() &&
+      evidence["timestamp_ms"].is<uint64_t>() && evidence["observation"].is<JsonObjectConst>();
+}
+
+// Verifies a signed, fresh request for one of the non-benign evidence-network
+// capabilities. Only the request is authenticated (not the response) and replay
+// protection is a bounded recent-nonce set rather than sequence numbers, since a
+// sender's sequence counter resets to 1 on reboot (see docs/capabilities.md).
+bool evidenceRequestAuthenticated(const String& source, const String& destination,
+                                  const String& requestId, const char* capability,
+                                  JsonVariantConst auth) {
+  if (!evidenceKeyValid) return false;
+  const String nonce = auth["nonce"] | "";
+  const char* tagHex = auth["tag"] | "";
+  if (nonce.isEmpty() || tagHex == nullptr || strlen(tagHex) != kTagBytes * 2) return false;
+  const String canonical = source + "|" + destination + "|" + requestId + "|" + capability + "|" + nonce;
+  uint8_t expectedTag[kTagBytes];
+  uint8_t suppliedTag[kTagBytes];
+  if (!computeEvidenceTag(canonical, expectedTag)) return false;
+  if (!hexDecode(suppliedTag, sizeof(suppliedTag), tagHex)) return false;
+  if (!constantTimeEqual(expectedTag, suppliedTag, sizeof(expectedTag))) return false;
+  return evidenceNonceFresh(nonce);
+}
+
+void handleMessage() {
+  if (server.arg("plain").length() > reconclave::kMaxPayloadBytes) {
+    JsonDocument response;
+    addEnvelope(response, "response", "unknown");
+    addErrorPayload(response, "invalid-request", "INVALID_REQUEST", "Request exceeds size limit");
+    sendServerJson(response);
+    return;
+  }
+  JsonDocument request;
+  const DeserializationError error = deserializeJson(request, server.arg("plain"));
+  const String source = request["source_node"] | "unknown";
+  const String requestId = request["payload"]["request_id"] | "invalid-request";
+  const String capability = request["payload"]["capability"] | "";
+  JsonDocument response;
+  addEnvelope(response, "response", source);
+  if (error || String(request["proto"] | "") != kProtocol ||
+      String(request["type"] | "") != "request" ||
+      String(request["destination_node"] | "") != deviceId) {
+    addErrorPayload(response, requestId, "INVALID_REQUEST", "Malformed or misdirected request");
+  } else if (capability == "storage.evidence.write") {
+    if (!evidenceKeyValid || !capabilityEnabled(deviceId, "storage.evidence.write")) {
+      addErrorPayload(response, requestId, "CAPABILITY_UNAVAILABLE", "Capability is not available");
+    } else if (!evidenceRequestAuthenticated(source, deviceId, requestId, "storage.evidence.write",
+                                             request["payload"]["auth"])) {
+      addErrorPayload(response, requestId, "UNAUTHENTICATED", "request is not signed or was replayed");
+    } else if (!evidenceRecordValid(request["payload"]["arguments"]["evidence"])) {
+      addErrorPayload(response, requestId, "INVALID_REQUEST", "evidence record missing a required field");
+    } else {
+      String storeError;
+      if (writeEvidenceRecord(request["payload"]["arguments"]["evidence"], storeError)) {
+        JsonObject payload = response["payload"].to<JsonObject>();
+        payload["request_id"] = requestId;
+        payload["status"] = "ok";
+        payload["result"].to<JsonObject>()["stored"] = true;
+      } else {
+        addErrorPayload(response, requestId, "STORAGE_UNAVAILABLE", storeError.c_str(), "error");
+      }
+    }
+  } else if (capability != "system.info") {
+    addErrorPayload(response, requestId, "CAPABILITY_UNAVAILABLE", "Capability is not available");
+  } else {
+    JsonObject payload = response["payload"].to<JsonObject>();
+    payload["request_id"] = requestId;
+    payload["status"] = "ok";
+    JsonObject result = payload["result"].to<JsonObject>();
+    result["device_type"] = "cardputer-adv";
+    result["firmware"] = kFirmware;
+    result["uptime_ms"] = millis();
+    result["free_memory_bytes"] = ESP.getFreeHeap();
+    result["ip"] = WiFi.localIP().toString();
+  }
+  sendServerJson(response);
+}
+
+void startNodeServices() {
+  if (!mdnsReady) {
+    mdnsReady = MDNS.begin(("reconclave-adv-" + deviceId.substring(deviceId.length() - 6)).c_str());
+    if (mdnsReady) {
+      MDNS.addService(kService, kTransport, kServerPort);
+      MDNS.addServiceTxt(kService, kTransport, "proto", kProtocol);
+      MDNS.addServiceTxt(kService, kTransport, "roles", "node,coordinator");
+      MDNS.addServiceTxt(kService, kTransport, "device", "cardputer-adv");
+      MDNS.addServiceTxt(kService, kTransport, "path", kAnnouncePath);
+    }
+  }
+  if (!serverReady) {
+    server.on(kAnnouncePath, HTTP_GET, handleAnnounce);
+    server.on(kMessagePath, HTTP_POST, handleMessage);
+    server.onNotFound([] { server.send(404, "application/json", "{\"error\":\"not_found\"}"); });
+    server.begin();
+    serverReady = true;
+  }
+}
+
+bool fetchAnnouncement(const IPAddress& address, uint16_t port) {
+  WiFiClient client;
+  HTTPClient http;
+  const String url = "http://" + address.toString() + ":" + String(port) + kAnnouncePath;
+  http.setTimeout(2500);
+  if (!http.begin(client, url)) return false;
+  const int code = http.GET();
+  if (code != HTTP_CODE_OK || http.getSize() > kMaxResponseBytes) {
+    http.end();
+    return false;
+  }
+  JsonDocument document;
+  const DeserializationError parseError = deserializeJson(document, http.getStream());
+  http.end();
+  if (parseError || String(document["proto"] | "") != kProtocol ||
+      String(document["type"] | "") != "announce") return false;
+  JsonObject payload = document["payload"];
+  const String discoveredId = payload["device_id"] | "";
+  const String source = document["source_node"] | "";
+  const String discoveredType = payload["device_type"] | "unknown";
+  if (discoveredId.isEmpty() || discoveredId != source || discoveredId == deviceId) return false;
+
+  reconclave::NodeAnnouncement announcement;
+  announcement.device_id = discoveredId.c_str();
+  announcement.device_type = discoveredType.c_str();
+  announcement.firmware = String(payload["firmware"] | "").c_str();
+  announcement.roles.clear();
+  RemoteNode node;
+  node.deviceId = discoveredId;
+  node.deviceType = discoveredType;
+  node.firmware = announcement.firmware.c_str();
+  node.ip = address.toString();
+  node.port = port;
+  node.lastSeenMs = millis();
+  for (JsonVariant role : payload["roles"].as<JsonArray>()) {
+    const char* value = role.as<const char*>();
+    announcement.roles.emplace_back(value);
+    if (strcmp(value, "coordinator") == 0) node.coordinator = true;
+  }
+  for (JsonVariant capability : payload["capabilities"].as<JsonArray>()) {
+    const char* value = capability.as<const char*>();
+    announcement.capabilities.emplace_back(value);
+    node.capabilities.push_back(value);
+    if (strcmp(value, "system.info") == 0) node.systemInfo = true;
+    else if (strcmp(value, "net.discovery.scan") == 0) node.netDiscovery = true;
+    else if (strcmp(value, "coordination.job.status") == 0) node.jobStatus = true;
+    else if (strcmp(value, "storage.evidence.write") == 0) node.evidenceCollector = true;
+  }
+  announcement.status = String(payload["status"] | "").c_str();
+  if (!registry.observe(announcement, static_cast<uint64_t>(millis()) + 1)) return false;
+  bool updated = false;
+  for (auto& known : remoteNodes) {
+    if (known.deviceId == discoveredId) {
+      known = node;
+      updated = true;
+      break;
+    }
+  }
+  if (!updated && remoteNodes.size() < reconclave::kMaxDiscoveredNodes) remoteNodes.push_back(node);
+  if (discoveredType == "poe-p4") {
+    p4 = node;
+    const bool remotePaired = payload["security"]["paired"] | false;
+    groveBootNonce = String(payload["security"]["boot_nonce"] | "");
+    if (peerKeyValid && trustedP4Id == discoveredId && remotePaired &&
+        groveBootNonce.length() == 32) pairingStatus = "trusted / secure-ready";
+    else if (remotePaired) pairingStatus = "P4 paired to another peer";
+    else pairingStatus = "P: pair over Grove";
+  }
+  return true;
+}
+
+void processGroveLine() {
+  char* checksumSeparator = strrchr(groveLine, ',');
+  if (checksumSeparator == nullptr) return;
+  char* checksumEnd = nullptr;
+  const uint32_t received = strtoul(checksumSeparator + 1, &checksumEnd, 16);
+  if (checksumEnd == checksumSeparator + 1 || *checksumEnd != '\0' ||
+      received != crc32(groveLine, checksumSeparator - groveLine)) return;
+  *checksumSeparator = '\0';
+  if (strncmp(groveLine, "RC1,H,", 6) == 0) {
+    char* id = groveLine + 6;
+    char* paired = strchr(id, ',');
+    if (paired == nullptr) return;
+    *paired++ = '\0';
+    char* bootNonce = strchr(paired, ',');
+    if (bootNonce == nullptr) return;
+    *bootNonce++ = '\0';
+    groveP4Id = id;
+    groveP4Paired = atoi(paired) != 0;
+    groveBootNonce = bootNonce;
+    lastGroveHeartbeatMs = millis();
+    pairingStatus = peerKeyValid && trustedP4Id == groveP4Id
+        ? "Grove: trusted peer" : "Grove connected; P to pair";
+    if (screen == ScreenState::Reconclave) draw();
+  } else if (strncmp(groveLine, "RC1,Q,", 6) == 0 && pairingPending) {
+    char* id = groveLine + 6;
+    char* fingerprint = strchr(id, ',');
+    if (fingerprint == nullptr) return;
+    *fingerprint++ = '\0';
+    char* accepted = strchr(fingerprint, ',');
+    if (accepted == nullptr) return;
+    *accepted++ = '\0';
+    char expectedFingerprint[9];
+    hexEncode(expectedFingerprint, pendingPeerKey, 4);
+    if (atoi(accepted) == 1 && strcmp(fingerprint, expectedFingerprint) == 0 &&
+        groveP4Id == id) {
+      memcpy(peerKey, pendingPeerKey, sizeof(peerKey));
+      peerKeyValid = true;
+      trustedP4Id = id;
+      preferences.putBytes("peer_key", peerKey, sizeof(peerKey));
+      preferences.putString("peer_p4", trustedP4Id);
+      pairingStatus = "Paired " + String(fingerprint);
+      notice = "Trust saved to NVS";
+    } else {
+      pairingStatus = "Pairing rejected";
+    }
+    memset(pendingPeerKey, 0, sizeof(pendingPeerKey));
+    pairingPending = false;
+    draw();
+  }
+}
+
+void updateGrove() {
+  while (groveSerial.available()) {
+    const char value = static_cast<char>(groveSerial.read());
+    if (value == '\n') {
+      groveLine[groveLineLength] = '\0';
+      processGroveLine();
+      groveLineLength = 0;
+    } else if (value != '\r' && groveLineLength + 1 < sizeof(groveLine)) {
+      groveLine[groveLineLength++] = value;
+    } else if (groveLineLength + 1 >= sizeof(groveLine)) {
+      groveLineLength = 0;
+    }
+  }
+}
+
+void beginGrovePairing() {
+  if (millis() - lastGroveHeartbeatMs > 3000 || groveP4Id.isEmpty()) {
+    pairingStatus = "No Grove P4 detected";
+    draw();
+    return;
+  }
+  if (groveP4Paired && (!peerKeyValid || trustedP4Id != groveP4Id)) {
+    pairingStatus = "P4 already paired; reset required";
+    draw();
+    return;
+  }
+  if (peerKeyValid && trustedP4Id == groveP4Id) {
+    memcpy(pendingPeerKey, peerKey, sizeof(peerKey));
+  } else {
+    esp_fill_random(pendingPeerKey, sizeof(pendingPeerKey));
+  }
+  char keyHex[kPeerKeyBytes * 2 + 1];
+  hexEncode(keyHex, pendingPeerKey, sizeof(pendingPeerKey));
+  const String payload = "RC1,P," + deviceId + "," + groveP4Id + "," + keyHex;
+  char frame[256];
+  snprintf(frame, sizeof(frame), "%s,%08lx\n", payload.c_str(),
+           static_cast<unsigned long>(crc32(payload.c_str(), payload.length())));
+  groveSerial.print(frame);
+  pairingPending = true;
+  pairingStatus = "Pairing...";
+  draw();
+}
+
+void discover() {
+  notice = "Discovering _reconclave._tcp";
+  draw();
+  size_t found = 0;
+  const int count = MDNS.queryService(kService, kTransport);
+  for (int index = 0; index < count; ++index) {
+    if (String(MDNS.txt(index, "proto")) != kProtocol) continue;
+    const IPAddress address = MDNS.IP(index);
+    const uint16_t port = MDNS.port(index);
+    if (address != INADDR_NONE && address != WiFi.localIP() && port != 0 &&
+        fetchAnnouncement(address, port)) ++found;
+  }
+  if (found == 0) {
+    const IPAddress fallback = MDNS.queryHost("reconclave-poe-p4", 1500);
+    if (fallback != INADDR_NONE && fetchAnnouncement(fallback, kP4FallbackPort)) ++found;
+  }
+  notice = found ? String(found) + " node(s) discovered" : "No remote nodes found";
+  draw();
+}
+
+void requestSystemInfo() {
+  if (p4.deviceId.isEmpty() || !p4.systemInfo) {
+    notice = "No system.info provider";
+    draw();
+    return;
+  }
+  if (!peerKeyValid || trustedP4Id != p4.deviceId || groveBootNonce.length() != 32) {
+    notice = "Secure pairing required";
+    draw();
+    return;
+  }
+  JsonDocument request;
+  addEnvelope(request, "request", p4.deviceId);
+  JsonObject payload = request["payload"].to<JsonObject>();
+  const String requestId = "info-" + String(messageSequence);
+  payload["request_id"] = requestId;
+  payload["capability"] = "system.info";
+  payload["arguments"].to<JsonObject>();
+  uint64_t nonce = 0;
+  esp_fill_random(&nonce, sizeof(nonce));
+  if (nonce == 0) nonce = 1;
+  char nonceHex[17];
+  snprintf(nonceHex, sizeof(nonceHex), "%016llx",
+           static_cast<unsigned long long>(nonce));
+  const String canonical = deviceId + "|" + p4.deviceId + "|" + requestId +
+      "|system.info|" + groveBootNonce + "|" + nonceHex;
+  uint8_t requestTag[kTagBytes];
+  if (!computeTag(canonical, requestTag)) {
+    notice = "Could not authenticate request";
+    draw();
+    return;
+  }
+  char requestTagHex[kTagBytes * 2 + 1];
+  hexEncode(requestTagHex, requestTag, sizeof(requestTag));
+  JsonObject auth = payload["auth"].to<JsonObject>();
+  auth["nonce"] = nonceHex;
+  auth["tag"] = requestTagHex;
+  String body;
+  serializeJson(request, body);
+
+  WiFiClient client;
+  HTTPClient http;
+  const String url = "http://" + p4.ip + ":" + String(p4.port) + kMessagePath;
+  http.setTimeout(3000);
+  if (!http.begin(client, url)) {
+    notice = "Could not start request";
+    draw();
+    return;
+  }
+  http.addHeader("Content-Type", "application/json");
+  const int code = http.POST(body);
+  JsonDocument response;
+  const DeserializationError parseError = code == HTTP_CODE_OK
+      ? deserializeJson(response, http.getStream())
+      : DeserializationError::EmptyInput;
+  http.end();
+  if (code != HTTP_CODE_OK || parseError ||
+      String(response["payload"]["request_id"] | "") != requestId) {
+    notice = "system.info failed";
+  } else {
+    const String status = response["payload"]["status"] | "";
+    const String responseNonce = response["payload"]["auth"]["nonce"] | "";
+    const String responseTagHex = response["payload"]["auth"]["tag"] | "";
+    const String responseCanonical = p4.deviceId + "|" + deviceId + "|" +
+        requestId + "|" + status + "|" + groveBootNonce + "|" + responseNonce;
+    uint8_t expectedTag[kTagBytes];
+    uint8_t suppliedTag[kTagBytes];
+    const bool authenticated = responseNonce == nonceHex &&
+        computeTag(responseCanonical, expectedTag) &&
+        hexDecode(suppliedTag, sizeof(suppliedTag), responseTagHex.c_str()) &&
+        constantTimeEqual(expectedTag, suppliedTag, sizeof(expectedTag));
+    if (!authenticated) {
+      notice = "Untrusted response rejected";
+    } else if (status == "ok") {
+    const uint32_t heap = response["payload"]["result"]["free_memory_bytes"] | 0;
+    const uint64_t uptime = response["payload"]["result"]["uptime_ms"] | 0;
+    p4.detail = "Heap " + String(heap / 1024) + "K  Up " + String(uptime / 1000) + "s";
+    notice = "Secure system.info received";
+    p4.lastSeenMs = millis();
+    } else {
+      notice = String(response["payload"]["error"]["code"] | "Request rejected");
+    }
+  }
+  draw();
+}
+
+void requestScoutUpdate(RemoteScoutJob& job, bool start) {
+  const char* capability = start ? "net.discovery.scan" : "coordination.job.status";
+  RemoteNode* provider = scoutProvider(job.nodeId);
+  if (provider == nullptr || (start ? !provider->netDiscovery : !provider->jobStatus)) {
+    scoutStatus = "Scout provider unavailable";
+    job.running = false;
+    job.failed = true;
+    job.error = scoutStatus;
+    return;
+  }
+  const bool secureP4 = provider->deviceId == p4.deviceId;
+  if (secureP4 && (!peerKeyValid || trustedP4Id != p4.deviceId || groveBootNonce.length() != 32)) {
+    scoutStatus = "Provider trust required";
+    job.running = false;
+    job.failed = true;
+    job.error = scoutStatus;
+    return;
+  }
+  JsonDocument request;
+  addEnvelope(request, "request", provider->deviceId);
+  JsonObject payload = request["payload"].to<JsonObject>();
+  const String requestId = String(start ? "scan-" : "job-") + String(messageSequence);
+  payload["request_id"] = requestId;
+  payload["capability"] = capability;
+  JsonObject arguments = payload["arguments"].to<JsonObject>();
+  if (start) {
+    const IPAddress local = WiFi.localIP();
+    arguments["network"] = String(local[0]) + "." + String(local[1]) + "." +
+        String(local[2]) + ".0/24";
+    arguments["start_ip"] = String(local[0]) + "." + String(local[1]) + "." +
+        String(local[2]) + "." + String(job.firstHost);
+    arguments["end_ip"] = String(local[0]) + "." + String(local[1]) + "." +
+        String(local[2]) + "." + String(job.lastHost);
+    if (scoutIntervalMinutes > 0) {
+      JsonObject schedule = arguments["schedule"].to<JsonObject>();
+      schedule["interval_ms"] = static_cast<uint32_t>(scoutIntervalMinutes) * 60000UL;
+      schedule["after_completion"] = true;
+    }
+  }
+  char nonceHex[17] = {};
+  if (secureP4) {
+    uint64_t nonce = 0;
+    esp_fill_random(&nonce, sizeof(nonce));
+    if (nonce == 0) nonce = 1;
+    snprintf(nonceHex, sizeof(nonceHex), "%016llx", static_cast<unsigned long long>(nonce));
+    const String canonical = deviceId + "|" + provider->deviceId + "|" + requestId + "|" +
+        capability + "|" + groveBootNonce + "|" + nonceHex;
+    uint8_t requestTag[kTagBytes];
+    if (!computeTag(canonical, requestTag)) return;
+    char requestTagHex[kTagBytes * 2 + 1];
+    hexEncode(requestTagHex, requestTag, sizeof(requestTag));
+    JsonObject auth = payload["auth"].to<JsonObject>();
+    auth["nonce"] = nonceHex;
+    auth["tag"] = requestTagHex;
+  }
+  String body;
+  serializeJson(request, body);
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(1500);
+  const String url = "http://" + provider->ip + ":" + String(provider->port) + kMessagePath;
+  if (!http.begin(client, url)) return;
+  http.addHeader("Content-Type", "application/json");
+  const int code = http.POST(body);
+  JsonDocument response;
+  const DeserializationError parseError = code == HTTP_CODE_OK
+      ? deserializeJson(response, http.getStream()) : DeserializationError::EmptyInput;
+  http.end();
+  if (code != HTTP_CODE_OK || parseError) {
+    scoutStatus = "Remote scout request failed";
+    job.running = false;
+    job.failed = true;
+    job.error = scoutStatus;
+    return;
+  }
+  const String status = response["payload"]["status"] | "";
+  bool authenticated = !secureP4;
+  if (secureP4) {
+    const String responseNonce = response["payload"]["auth"]["nonce"] | "";
+    const String responseTagHex = response["payload"]["auth"]["tag"] | "";
+    const String responseCanonical = provider->deviceId + "|" + deviceId + "|" +
+        requestId + "|" + status + "|" + groveBootNonce + "|" + responseNonce;
+    uint8_t expectedTag[kTagBytes];
+    uint8_t suppliedTag[kTagBytes];
+    authenticated = responseNonce == nonceHex && computeTag(responseCanonical, expectedTag) &&
+        hexDecode(suppliedTag, sizeof(suppliedTag), responseTagHex.c_str()) &&
+        constantTimeEqual(expectedTag, suppliedTag, sizeof(expectedTag));
+  }
+  if (!authenticated || status != "ok") {
+    scoutStatus = authenticated ? "Provider rejected scout job" : "Untrusted job response";
+    job.running = false;
+    job.failed = true;
+    job.error = scoutStatus;
+    return;
+  }
+  JsonObject result = response["payload"]["result"];
+  job.checked = result["checked"] | 0;
+  job.total = result["total"] | 0;
+  const String jobStatus = result["job_status"] | "unknown";
+  job.hosts.clear();
+  for (JsonVariant host : result["hosts"].as<JsonArray>()) {
+    job.hosts.push_back(String(host.as<const char*>()));
+  }
+  job.running = jobStatus == "running";
+  job.failed = jobStatus != "running" && jobStatus != "complete";
+  if (job.failed) {
+    const String jobError = result["error"] | "";
+    job.error = jobError.isEmpty() ? "Remote discovery " + jobStatus : jobError;
+  }
+  // A recurring provider reports the same job_id across every pass and increments
+  // run_count each time one finishes; ship that pass's results as soon as we see it,
+  // rather than waiting for the job to stop (it may run for hours).
+  const uint16_t runCount = result["run_count"] | 0;
+  if (runCount > job.runCount) {
+    job.runCount = runCount;
+    distributeScoutEvidence(job.hosts, job.nodeId);
+  }
+}
+
+// Idempotent per docs/capabilities.md: safe to call even if the provider's job
+// already finished or was never recurring.
+// Attaches a fresh signed auth block for one of the evidence-network capabilities.
+// Requires evidenceKeyValid (set on Settings > Trust); no-ops otherwise, so a receiver
+// that also has no key configured simply won't have advertised the capability, and one
+// that does will correctly reject the resulting unsigned request.
+void attachEvidenceAuth(JsonObject payload, const String& destination, const String& requestId,
+                        const char* capability) {
+  if (!evidenceKeyValid) return;
+  uint8_t nonce[8];
+  esp_fill_random(nonce, sizeof(nonce));
+  char nonceHex[17];
+  hexEncode(nonceHex, nonce, sizeof(nonce));
+  const String canonical = deviceId + "|" + destination + "|" + requestId + "|" + capability + "|" + nonceHex;
+  uint8_t tag[kTagBytes];
+  if (!computeEvidenceTag(canonical, tag)) return;
+  char tagHex[kTagBytes * 2 + 1];
+  hexEncode(tagHex, tag, sizeof(tag));
+  JsonObject auth = payload["auth"].to<JsonObject>();
+  auth["nonce"] = nonceHex;
+  auth["tag"] = tagHex;
+}
+
+void requestScoutCancel(const RemoteScoutJob& job) {
+  if (!evidenceKeyValid) return;
+  RemoteNode* provider = scoutProvider(job.nodeId);
+  if (provider == nullptr) return;
+  JsonDocument request;
+  addEnvelope(request, "request", provider->deviceId);
+  JsonObject payload = request["payload"].to<JsonObject>();
+  const String requestId = String("cancel-") + String(messageSequence);
+  payload["request_id"] = requestId;
+  payload["capability"] = "coordination.job.cancel";
+  payload["arguments"].to<JsonObject>();
+  attachEvidenceAuth(payload, provider->deviceId, requestId, "coordination.job.cancel");
+  String body;
+  serializeJson(request, body);
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(1500);
+  const String url = "http://" + provider->ip + ":" + String(provider->port) + kMessagePath;
+  if (!http.begin(client, url)) return;
+  http.addHeader("Content-Type", "application/json");
+  http.POST(body);
+  http.end();
+}
+
+uint8_t scoutProviderWeight(const RemoteNode* node) {
+  if (node == nullptr) return 1;
+  if (node->deviceType == "desktop-node") return 4;
+  if (node->deviceType == "poe-p4") return 2;
+  return 1;
+}
+
+bool scoutProviderUsable(const RemoteNode& node) {
+  if (!node.netDiscovery || !capabilityEnabled(node.deviceId, "net.discovery.scan")) return false;
+  if (node.deviceId != p4.deviceId) return true;
+  return peerKeyValid && trustedP4Id == p4.deviceId && groveBootNonce.length() == 32;
+}
+
+// Pushes one evidence record to a known Evidence Collector node. Collectors only ever
+// advertise storage.evidence.write once they have an evidence key configured, and this
+// call requires one too (see attachEvidenceAuth) to sign the request.
+void sendEvidenceToNode(const RemoteNode& node, JsonVariantConst evidence) {
+  if (!evidenceKeyValid) return;
+  JsonDocument request;
+  addEnvelope(request, "request", node.deviceId);
+  JsonObject payload = request["payload"].to<JsonObject>();
+  const String requestId = String("evidence-") + String(messageSequence);
+  payload["request_id"] = requestId;
+  payload["capability"] = "storage.evidence.write";
+  payload["arguments"].to<JsonObject>()["evidence"].set(evidence);
+  attachEvidenceAuth(payload, node.deviceId, requestId, "storage.evidence.write");
+  String body;
+  serializeJson(request, body);
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(1500);
+  const String url = "http://" + node.ip + ":" + String(node.port) + kMessagePath;
+  if (!http.begin(client, url)) return;
+  http.addHeader("Content-Type", "application/json");
+  http.POST(body);
+  http.end();
+}
+
+// Distributes a copy of a Scout run's results to every enabled Evidence Collector,
+// including this Cardputer itself when it is one. For a one-shot job this covers the
+// whole result set once at completion; for a recurring job, callers invoke this once
+// per run with that run's own hosts, so each pass is shipped as it finishes.
+void distributeScoutEvidence(const std::vector<String>& hosts, const String& observer) {
+  if (hosts.empty()) return;
+  const String jobId = "scout-" + String(millis());
+  for (const String& host : hosts) {
+    JsonDocument evidenceDoc;
+    JsonObject evidence = evidenceDoc.to<JsonObject>();
+    evidence["job_id"] = jobId;
+    evidence["source_node"] = observer;
+    evidence["target"] = host;
+    evidence["timestamp_ms"] = static_cast<uint64_t>(millis()) + 1;
+    evidence["method"] = "net.discovery.scan";
+    evidence["observation"].to<JsonObject>()["responsive"] = true;
+    if (capabilityEnabled(deviceId, "storage.evidence.write")) {
+      String storeError;
+      writeEvidenceRecord(evidence, storeError);
+    }
+    for (const auto& node : remoteNodes) {
+      if (node.evidenceCollector && capabilityEnabled(node.deviceId, "storage.evidence.write")) {
+        if (evidenceKeyValid) sendEvidenceToNode(node, evidence);
+        else scoutEvidenceKeyMissing = true;
+      }
+    }
+  }
+}
+
+// Deterministic (non-AI) change detection over a completed run's host set, compared
+// to the previous completed run. Scoped to jobs with one clean "run finished" edge:
+// any one-shot Scout job, or a local-only recurring one - see docs/capabilities.md for
+// why multi-provider recurring isn't covered yet. Appeared/vanished hosts are recorded
+// as evidence (not just shown on screen) since the point of an unattended recurring
+// scan is that nobody may be watching when the change happens.
+void detectAndRecordChanges(const std::vector<String>& hosts, const String& observer) {
+  if (!scoutBaselineLoaded) {
+    loadScoutBaseline();
+    scoutBaselineLoaded = true;
+  }
+  scoutLastAppeared = 0;
+  scoutLastVanished = 0;
+  if (scoutBaseline.empty()) {
+    scoutBaseline = hosts;
+    saveScoutBaseline();
+    return;
+  }
+  std::vector<String> appeared;
+  std::vector<String> vanished;
+  for (const String& host : hosts) {
+    if (std::find(scoutBaseline.begin(), scoutBaseline.end(), host) == scoutBaseline.end()) {
+      appeared.push_back(host);
+    }
+  }
+  for (const String& host : scoutBaseline) {
+    if (std::find(hosts.begin(), hosts.end(), host) == hosts.end()) vanished.push_back(host);
+  }
+  const String jobId = "change-" + String(millis());
+  const auto emit = [&](const String& host, const char* change) {
+    JsonDocument evidenceDoc;
+    JsonObject evidence = evidenceDoc.to<JsonObject>();
+    evidence["job_id"] = jobId;
+    evidence["source_node"] = observer;
+    evidence["target"] = host;
+    evidence["timestamp_ms"] = static_cast<uint64_t>(millis()) + 1;
+    evidence["method"] = "coordination.change.detect";
+    evidence["observation"].to<JsonObject>()["change"] = change;
+    if (capabilityEnabled(deviceId, "storage.evidence.write")) {
+      String storeError;
+      writeEvidenceRecord(evidence, storeError);
+    }
+    for (const auto& node : remoteNodes) {
+      if (node.evidenceCollector && capabilityEnabled(node.deviceId, "storage.evidence.write")) {
+        if (evidenceKeyValid) sendEvidenceToNode(node, evidence);
+        else scoutEvidenceKeyMissing = true;
+      }
+    }
+  };
+  for (const String& host : appeared) emit(host, "appeared");
+  for (const String& host : vanished) emit(host, "vanished");
+  scoutLastAppeared = appeared.size();
+  scoutLastVanished = vanished.size();
+  scoutBaseline = hosts;
+  saveScoutBaseline();
+}
+
+void mergeScoutProgress() {
+  uint32_t checked = localScoutAssigned ? localHostScan.checked() : 0;
+  uint32_t total = localScoutAssigned ? localHostScan.total() : 0;
+  bool running = localScoutAssigned && localHostScan.active();
+  size_t failures = 0;
+  for (const auto& job : remoteScoutJobs) {
+    checked += job.checked;
+    total += job.total ? job.total : job.lastHost - job.firstHost + 1;
+    running = running || job.running;
+    if (job.failed) ++failures;
+    for (const auto& host : job.hosts) {
+      if (std::find(discoveredHosts.begin(), discoveredHosts.end(), host) == discoveredHosts.end())
+        discoveredHosts.push_back(host);
+    }
+  }
+  std::sort(discoveredHosts.begin(), discoveredHosts.end(), [](const String& left, const String& right) {
+    IPAddress a, b;
+    a.fromString(left); b.fromString(right);
+    return static_cast<uint32_t>(a) < static_cast<uint32_t>(b);
+  });
+  scoutChecked = checked;
+  scoutTotal = total;
+  scoutRunning = running;
+  if (!running && !scoutEvidenceSent && scoutIntervalMinutes == 0 &&
+      (localScoutAssigned || !remoteScoutJobs.empty())) {
+    // Recurring jobs ship each run's evidence as it finishes (see requestScoutUpdate
+    // and the local reschedule in loop()); this path is only for one-shot jobs.
+    const String observer = scoutRemoteNodeId.isEmpty() ? deviceId : scoutRemoteNodeId;
+    distributeScoutEvidence(discoveredHosts, observer);
+    detectAndRecordChanges(discoveredHosts, observer);
+    scoutEvidenceSent = true;
+  }
+  String statusSuffix;
+  if (scoutLastAppeared > 0 || scoutLastVanished > 0) {
+    statusSuffix = " (+" + String(scoutLastAppeared) + "/-" + String(scoutLastVanished) + ")";
+  }
+  if (scoutEvidenceKeyMissing) statusSuffix += " NOKEY";
+  if (running) {
+    scoutStatus = String(remoteScoutJobs.size() + (localScoutAssigned ? 1 : 0)) +
+        " providers " + String(checked) + "/" + String(total);
+  } else if (failures > 0) {
+    scoutStatus = String(discoveredHosts.size()) + " found; " + String(failures) + " provider failed";
+  } else {
+    scoutStatus = String(checked) + "/" + String(total) + " | " +
+        String(discoveredHosts.size()) + " found" + statusSuffix;
+  }
+}
+
+void startScoutJob() {
+  discoveredHosts.clear();
+  localScoutHosts.clear();
+  remoteScoutJobs.clear();
+  localScoutAssigned = false;
+  scoutChecked = 0;
+  scoutTotal = 0;
+  scoutEvidenceSent = false;
+  scoutRunCount = 0;
+  localScoutNextRunMs = 0;
+  scoutLastAppeared = 0;
+  scoutLastVanished = 0;
+  scoutEvidenceKeyMissing = false;
+
+  std::vector<RemoteNode*> remotes;
+  for (auto& node : remoteNodes) if (scoutProviderUsable(node)) remotes.push_back(&node);
+  std::sort(remotes.begin(), remotes.end(), [](const RemoteNode* left, const RemoteNode* right) {
+    return scoutProviderWeight(left) > scoutProviderWeight(right);
+  });
+
+  const bool consensus = scoutExecution == ScoutExecution::Consensus;
+  bool distributed = scoutExecution == ScoutExecution::Distributed || consensus ||
+      (scoutExecution == ScoutExecution::Auto && !remotes.empty());
+  if (scoutExecution == ScoutExecution::Single) distributed = false;
+
+  if (!distributed) {
+    RemoteNode* provider = nullptr;
+    if (scoutTargetId != "local" && scoutTargetId != "auto") provider = scoutProvider(scoutTargetId);
+    else if (scoutTargetId == "auto" && !remotes.empty()) provider = remotes.front();
+    if (provider != nullptr && scoutProviderUsable(*provider)) {
+      RemoteScoutJob job;
+      job.nodeId = provider->deviceId;
+      job.firstHost = 1;
+      job.lastHost = 254;
+      remoteScoutJobs.push_back(job);
+      requestScoutUpdate(remoteScoutJobs.back(), true);
+      scoutExecutor = provider->deviceType;
+      scoutRemoteNodeId = provider->deviceId;
+    } else {
+      localScoutFirstHost = 1;
+      localScoutLastHost = 254;
+      localScoutAssigned = capabilityEnabled(deviceId, "net.discovery.scan") &&
+          localHostScan.startRange(1, 254);
+      scoutExecutor = "cardputer";
+      scoutRemoteNodeId = "";
+    }
+  } else {
+    struct Assignment { RemoteNode* node; uint8_t weight; };
+    std::vector<Assignment> assignments;
+    if (capabilityEnabled(deviceId, "net.discovery.scan")) assignments.push_back({nullptr, 1});
+    for (auto* node : remotes) assignments.push_back({node,
+        distributionStyle == DistributionStyle::Weighted ? scoutProviderWeight(node) : uint8_t{1}});
+    if (consensus) {
+      for (const auto& assignment : assignments) {
+        if (assignment.node == nullptr) {
+          localScoutFirstHost = 1;
+          localScoutLastHost = 254;
+          localScoutAssigned = localHostScan.startRange(1, 254);
+        } else {
+          RemoteScoutJob job;
+          job.nodeId = assignment.node->deviceId;
+          job.firstHost = 1;
+          job.lastHost = 254;
+          remoteScoutJobs.push_back(job);
+          requestScoutUpdate(remoteScoutJobs.back(), true);
+        }
+      }
+      scoutExecutor = "consensus";
+      scoutRemoteNodeId = "consensus";
+      mergeScoutProgress();
+      lastScoutPollMs = millis();
+      draw();
+      return;
+    }
+    if (assignments.empty()) {
+      scoutStatus = "No available scan provider";
+      scoutRunning = false;
+      draw();
+      return;
+    }
+    uint16_t totalWeight = 0;
+    for (const auto& assignment : assignments) totalWeight += assignment.weight;
+    uint16_t first = 1;
+    uint16_t remainingWeight = totalWeight;
+    for (size_t index = 0; index < assignments.size(); ++index) {
+      const uint16_t remainingHosts = 255 - first;
+      const uint16_t count = index + 1 == assignments.size() ? remainingHosts :
+          std::max<uint16_t>(1, remainingHosts * assignments[index].weight / remainingWeight);
+      const uint8_t last = static_cast<uint8_t>(first + count - 1);
+      if (assignments[index].node == nullptr) {
+        localScoutFirstHost = first;
+        localScoutLastHost = last;
+        localScoutAssigned = localHostScan.startRange(first, count);
+      } else {
+        RemoteScoutJob job;
+        job.nodeId = assignments[index].node->deviceId;
+        job.firstHost = static_cast<uint8_t>(first);
+        job.lastHost = last;
+        remoteScoutJobs.push_back(job);
+        requestScoutUpdate(remoteScoutJobs.back(), true);
+      }
+      first += count;
+      remainingWeight -= assignments[index].weight;
+    }
+    scoutExecutor = "distributed";
+    scoutRemoteNodeId = "distributed";
+  }
+  mergeScoutProgress();
+  if (!localScoutAssigned && remoteScoutJobs.empty()) {
+    scoutRunning = false;
+    scoutStatus = "No available scan provider";
+  }
+  lastScoutPollMs = millis();
+  draw();
+}
+
+void startConnecting() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
+  connectStartedMs = millis();
+  screen = ScreenState::Connecting;
+  notice = "";
+  draw();
+}
+
+void beginProvisioning() {
+  WiFi.disconnect(true, false);
+  wifiSsid = "";
+  wifiPassword = "";
+  input = "";
+  screen = ScreenState::ProvisionSsid;
+  notice = "";
+  draw();
+}
+
+bool pressedLetter(const Keyboard_Class::KeysState& keys, char wanted) {
+  for (const char value : keys.word) {
+    if (tolower(static_cast<unsigned char>(value)) == wanted) return true;
+  }
+  return false;
+}
+
+void mountEvidence() {
+  evidenceFiles.clear();
+  SD.end();
+  SPI.end();
+  sdAvailable = false;
+  pinMode(kSdCsPin, OUTPUT);
+  digitalWrite(kSdCsPin, HIGH);
+  // EXT SPI shares the bus on Cardputer ADV; its CS must not float low.
+  pinMode(kSdCompatibilityPin, OUTPUT);
+  digitalWrite(kSdCompatibilityPin, HIGH);
+  delay(20);
+  SPI.begin(kSdClockPin, kSdMisoPin, kSdMosiPin, kSdCsPin);
+  sdAvailable = SD.begin(kSdCsPin, SPI, kSdFrequency) &&
+      SD.cardType() != CARD_NONE;
+  if (!sdAvailable) {
+    fieldStatus = "microSD mount failed";
+    return;
+  }
+  SD.mkdir("/reconclave");
+  SD.mkdir("/reconclave/evidence");
+  File directory = SD.open("/reconclave/evidence");
+  if (!directory || !directory.isDirectory()) {
+    fieldStatus = "Evidence directory unavailable";
+    return;
+  }
+  for (File file = directory.openNextFile(); file; file = directory.openNextFile()) {
+    if (!file.isDirectory()) evidenceFiles.push_back({String(file.name()), file.size()});
+    file.close();
+  }
+  directory.close();
+  fieldStatus = String(evidenceFiles.size()) + " evidence files";
+}
+
+String csvField(String value) {
+  value.replace("\"", "\"\"");
+  return "\"" + value + "\"";
+}
+
+bool openEvidenceCsv(const char* kind, File& file, String& path) {
+  if (!sdAvailable) mountEvidence();
+  if (!sdAvailable) return false;
+  path = "/reconclave/evidence/" + String(kind) + "-" + String(millis()) + ".csv";
+  file = SD.open(path, FILE_WRITE);
+  return static_cast<bool>(file);
+}
+
+constexpr char kScoutBaselinePath[] = "/reconclave/evidence/scout-baseline.json";
+
+// Best-effort: a Cardputer reboot without SD just resets change detection to
+// "no baseline yet" for this boot, same as a brand-new install.
+void loadScoutBaseline() {
+  if (!sdAvailable) mountEvidence();
+  if (!sdAvailable || !SD.exists(kScoutBaselinePath)) return;
+  File file = SD.open(kScoutBaselinePath);
+  if (!file) return;
+  JsonDocument document;
+  const DeserializationError error = deserializeJson(document, file);
+  file.close();
+  if (error) return;
+  for (JsonVariant host : document["hosts"].as<JsonArray>()) {
+    scoutBaseline.push_back(String(host.as<const char*>()));
+  }
+}
+
+void saveScoutBaseline() {
+  if (!sdAvailable) mountEvidence();
+  if (!sdAvailable) return;
+  SD.mkdir("/reconclave/evidence");
+  File file = SD.open(kScoutBaselinePath, FILE_WRITE);
+  if (!file) return;
+  JsonDocument document;
+  JsonArray hosts = document["hosts"].to<JsonArray>();
+  for (const String& host : scoutBaseline) hosts.add(host);
+  serializeJson(document, file);
+  file.close();
+}
+
+// Evidence Collector sink: append-only, never overwrites or deduplicates. Records
+// pushed here may originate from any node's job, not just this device's own scans.
+bool writeEvidenceRecord(JsonVariantConst evidence, String& errorMessage) {
+  if (!sdAvailable) mountEvidence();
+  if (!sdAvailable) {
+    errorMessage = "microSD unavailable";
+    return false;
+  }
+  SD.mkdir("/reconclave/evidence");
+  File file = SD.open("/reconclave/evidence/collected.jsonl", FILE_APPEND);
+  if (!file) {
+    errorMessage = "evidence log open failed";
+    return false;
+  }
+  String encoded;
+  serializeJson(evidence, encoded);
+  file.println(encoded);
+  file.close();
+  return true;
+}
+
+void saveWifiEvidence() {
+  if (wifiObservations.empty()) {
+    fieldStatus = "Nothing to save; scan first";
+    draw();
+    return;
+  }
+  File file;
+  String path;
+  if (!openEvidenceCsv("wifi", file, path)) {
+    fieldStatus = "microSD export failed";
+    draw();
+    return;
+  }
+  file.println("ssid,bssid,channel,rssi_dbm,security,observer_node");
+  for (const auto& ap : wifiObservations) {
+    file.printf("%s,%s,%ld,%ld,%s,%s\n", csvField(ap.ssid).c_str(),
+                ap.bssid.c_str(), static_cast<long>(ap.channel),
+                static_cast<long>(ap.rssi), authName(ap.auth), deviceId.c_str());
+  }
+  file.close();
+  fieldStatus = "Saved " + path.substring(path.lastIndexOf('/') + 1);
+  draw();
+}
+
+void saveBleEvidence() {
+  if (bleObservations.empty()) {
+    fieldStatus = "Nothing to save; scan first";
+    draw();
+    return;
+  }
+  File file;
+  String path;
+  if (!openEvidenceCsv("ble", file, path)) {
+    fieldStatus = "microSD export failed";
+    draw();
+    return;
+  }
+  file.println("name,address,address_type,advertisement_type,rssi_dbm,connectable,service_count,services,payload_bytes,manufacturer,observer_node");
+  for (const auto& device : bleObservations) {
+    file.printf("%s,%s,%u,%u,%d,%s,%u,%s,%u,%s,%s\n", csvField(device.name).c_str(),
+                device.address.c_str(), device.addressType, device.advertisementType, device.rssi,
+                device.connectable ? "true" : "false",
+                device.serviceCount, csvField(device.services).c_str(),
+                static_cast<unsigned>(device.payloadLength),
+                csvField(device.manufacturer).c_str(), deviceId.c_str());
+  }
+  file.close();
+  fieldStatus = "Saved " + path.substring(path.lastIndexOf('/') + 1);
+  draw();
+}
+
+void saveScoutEvidence() {
+  if (discoveredHosts.empty()) {
+    scoutStatus = "No host results to save";
+    draw();
+    return;
+  }
+  File file;
+  String path;
+  if (!openEvidenceCsv("p4-hosts", file, path)) {
+    scoutStatus = "microSD export failed";
+    draw();
+    return;
+  }
+  file.println("ip,responsive,observer_node,vantage");
+  const String observer = scoutRemoteNodeId.isEmpty() ? deviceId : scoutRemoteNodeId;
+  for (const String& host : discoveredHosts) {
+    file.printf("%s,true,%s,%s\n", host.c_str(), observer.c_str(),
+                scoutExecutor.c_str());
+  }
+  file.close();
+  scoutStatus = "Saved " + path.substring(path.lastIndexOf('/') + 1);
+  draw();
+}
+
+void scanWifi() {
+  fieldStatus = "Scanning...";
+  draw();
+  wifiObservations.clear();
+  const int count = WiFi.scanNetworks(false, true);
+  if (count < 0) {
+    fieldStatus = "Wi-Fi scan failed";
+  } else {
+    wifiObservations.reserve(count);
+    for (int index = 0; index < count; ++index) {
+      WifiObservation observation;
+      observation.ssid = WiFi.SSID(index).isEmpty() ? "<hidden>" : WiFi.SSID(index);
+      observation.bssid = WiFi.BSSIDstr(index);
+      observation.rssi = WiFi.RSSI(index);
+      observation.channel = WiFi.channel(index);
+      observation.auth = WiFi.encryptionType(index);
+      wifiObservations.push_back(observation);
+    }
+    fieldStatus = String(wifiObservations.size()) + " access points";
+  }
+  WiFi.scanDelete();
+  selection = 0;
+  draw();
+}
+
+void restoreWifiAfterBle() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
+  wifiRestorePending = true;
+}
+
+void scanBle() {
+  fieldStatus = "Scanning for 5 seconds...";
+  bleObservations.clear();
+  drawBleResults();
+
+  WiFi.scanDelete();
+  WiFi.disconnect(false, false);
+  WiFi.mode(WIFI_OFF);
+  delay(150);
+
+  NimBLEDevice::init("");
+  NimBLEScan* scanner = NimBLEDevice::getScan();
+  if (scanner == nullptr) {
+    fieldStatus = "BLE scanner unavailable";
+    NimBLEDevice::deinit(true);
+    restoreWifiAfterBle();
+    drawBleResults();
+    return;
+  }
+  scanner->clearResults();
+  scanner->setActiveScan(true);
+  scanner->setInterval(100);
+  scanner->setWindow(80);
+  NimBLEScanResults results = scanner->getResults(5000, false);
+  for (int index = 0; index < results.getCount(); ++index) {
+    const NimBLEAdvertisedDevice* advertised = results.getDevice(index);
+    if (advertised == nullptr) continue;
+    BleObservation observation;
+    observation.address = advertised->getAddress().toString().c_str();
+    observation.name = advertised->haveName() ? advertised->getName().c_str() : "<unnamed>";
+    observation.rssi = advertised->getRSSI();
+    const uint8_t type = advertised->getAdvType();
+    observation.addressType = advertised->getAddressType();
+    observation.advertisementType = type;
+    observation.connectable = type == 0 || type == 1;
+    observation.payloadLength = advertised->getPayload().size();
+    observation.serviceCount = advertised->getServiceUUIDCount();
+    for (uint8_t service = 0; service < observation.serviceCount && service < 2; ++service) {
+      if (!observation.services.isEmpty()) observation.services += " ";
+      observation.services += advertised->getServiceUUID(service).toString().c_str();
+    }
+    if (advertised->haveManufacturerData()) {
+      const std::string data = advertised->getManufacturerData();
+      if (data.size() >= 2) {
+        const uint16_t company = static_cast<uint8_t>(data[0]) |
+            (static_cast<uint16_t>(static_cast<uint8_t>(data[1])) << 8);
+        char label[16];
+        snprintf(label, sizeof(label), "company %04X", company);
+        observation.manufacturer = label;
+      }
+    }
+    bleObservations.push_back(observation);
+  }
+  std::sort(bleObservations.begin(), bleObservations.end(),
+            [](const BleObservation& left, const BleObservation& right) {
+              return left.rssi > right.rssi;
+            });
+  scanner->clearResults();
+  NimBLEDevice::deinit(true);
+  fieldStatus = bleObservations.empty() ? "No advertisements found" :
+      String(bleObservations.size()) + " BLE devices";
+  restoreWifiAfterBle();
+  selection = 0;
+  drawBleResults();
+}
+
+void loadEvidencePreview() {
+  previewLines.clear();
+  previewLine = 0;
+  previewTruncated = false;
+  File file = SD.open(selectedEvidencePath());
+  if (!file || file.isDirectory()) return;
+  constexpr size_t kMaxLines = 64;
+  constexpr size_t kMaxLineLength = 160;
+  String line;
+  while (file.available() && previewLines.size() < kMaxLines) {
+    const char value = static_cast<char>(file.read());
+    if (value == '\n') {
+      if (line.endsWith("\r")) line.remove(line.length() - 1);
+      previewLines.push_back(line);
+      line = "";
+    } else if (line.length() < kMaxLineLength) {
+      line += value;
+    }
+  }
+  if (!line.isEmpty() && previewLines.size() < kMaxLines) previewLines.push_back(line);
+  previewTruncated = file.available();
+  file.close();
+}
+
+bool backPressed(const Keyboard_Class::KeysState& keys) {
+  return keys.esc || keys.backspace || pressedLetter(keys, 'q');
+}
+
+bool leftPressed(const Keyboard_Class::KeysState& keys) {
+  return keys.left || pressedLetter(keys, ',');
+}
+
+bool rightPressed(const Keyboard_Class::KeysState& keys) {
+  return keys.right || pressedLetter(keys, '/');
+}
+
+void moveSelection(const Keyboard_Class::KeysState& keys, size_t count) {
+  if (count == 0) return;
+  if (keys.up || pressedLetter(keys, 'w') || pressedLetter(keys, 'k') ||
+      pressedLetter(keys, ';')) {
+    selection = selection == 0 ? count - 1 : selection - 1;
+  } else if (keys.down || pressedLetter(keys, 's') || pressedLetter(keys, 'j') ||
+             pressedLetter(keys, '.')) {
+    selection = (selection + 1) % count;
+  }
+}
+
+void openScreen(ScreenState next) {
+  selection = 0;
+  screen = next;
+  draw();
+}
+
+void returnToScreen(ScreenState next) {
+  screen = next;
+  draw();
+}
+
+void returnToMenu(ScreenState next, size_t menuSelection) {
+  selection = menuSelection;
+  screen = next;
+  draw();
+}
+
+void openContextMenu() {
+  contextOrigin = screen;
+  contextOriginSelection = selection;
+  selection = 0;
+  screen = ScreenState::ContextMenu;
+  draw();
+}
+
+void closeContextMenu() {
+  selection = contextOriginSelection;
+  screen = contextOrigin;
+  draw();
+}
+
+void cycleScoutTarget(bool forward) {
+  std::vector<String> available{"auto", "local"};
+  for (const auto& node : remoteNodes) {
+    if (node.netDiscovery && capabilityEnabled(node.deviceId, "net.discovery.scan"))
+      available.push_back(node.deviceId);
+  }
+  size_t current = 0;
+  for (size_t index = 0; index < available.size(); ++index) {
+    if (available[index] == scoutTargetId) current = index;
+  }
+  current = forward ? (current + 1) % available.size() :
+      (current + available.size() - 1) % available.size();
+  scoutTargetId = available[current];
+}
+
+void cyclePortProfile(bool forward) {
+  if (forward)
+    portProfile = portProfile == PortProfile::Web ? PortProfile::Common :
+        (portProfile == PortProfile::Common ? PortProfile::Extended : PortProfile::Web);
+  else
+    portProfile = portProfile == PortProfile::Web ? PortProfile::Extended :
+        (portProfile == PortProfile::Extended ? PortProfile::Common : PortProfile::Web);
+}
+
+bool startSelectedPortScan() {
+  IPAddress address;
+  const uint16_t* ports = nullptr;
+  size_t count = 0;
+  selectedPortList(ports, count);
+  openPorts.clear();
+  portStatus = "Starting...";
+  portRunning = address.fromString(selectedHost) && portScan.start(address, ports, count);
+  if (!portRunning) portStatus = "Unable to start";
+  return portRunning;
+}
+
+void handleContextInput(const Keyboard_Class::KeysState& keys) {
+  const size_t count = contextItemCount();
+  moveSelection(keys, count);
+  if (keys.tab || backPressed(keys)) {
+    closeContextMenu();
+    return;
+  }
+  const bool adjust = leftPressed(keys) || rightPressed(keys) || keys.enter;
+  if (adjust && contextOrigin == ScreenState::Scout && selection == 0) {
+    cycleScoutExecution(!leftPressed(keys));
+  } else if (adjust && contextOrigin == ScreenState::Scout && selection == 1) {
+    cycleScoutTarget(!leftPressed(keys));
+  } else if (adjust && contextOrigin == ScreenState::Scout && selection == 2) {
+    distributionStyle = distributionStyle == DistributionStyle::Equal ?
+        DistributionStyle::Weighted : DistributionStyle::Equal;
+  } else if (adjust && contextOrigin == ScreenState::Scout && selection == 3) {
+    cycleScoutInterval(!leftPressed(keys));
+    if (scoutIntervalMinutes == 0) {
+      // Explicitly stopping recurring: tell every remote provider to stop its
+      // repeating job rather than leaving it running unattended.
+      for (const auto& job : remoteScoutJobs) requestScoutCancel(job);
+    }
+  } else if (adjust && ((contextOrigin == ScreenState::Scout && selection == 4) ||
+                        contextOrigin == ScreenState::HostDetail ||
+                        (contextOrigin == ScreenState::PortResults && selection == 0))) {
+    cyclePortProfile(!leftPressed(keys));
+  } else if (keys.enter) {
+    const ScreenState origin = contextOrigin;
+    const size_t action = selection;
+    closeContextMenu();
+    if (origin == ScreenState::Scout && action == 5) saveScoutEvidence();
+    else if (origin == ScreenState::PortResults) startSelectedPortScan();
+    else if (origin == ScreenState::WifiResults || origin == ScreenState::WifiDetail) {
+      if (action == 0) scanWifi(); else saveWifiEvidence();
+    } else if (origin == ScreenState::WifiChannels) {
+      scanWifi();
+    } else if (origin == ScreenState::BleResults || origin == ScreenState::BleDetail) {
+      if (action == 0) scanBle(); else saveBleEvidence();
+    } else if (origin == ScreenState::Reconclave) {
+      if (action == 0) discover(); else beginGrovePairing();
+    } else if (origin == ScreenState::NodeDetail) {
+      if (selectedNodeId == p4.deviceId) requestSystemInfo();
+      else {
+        notice = selectedNodeId == deviceId ? "Local status refreshed" :
+                                                "Management unavailable";
+        draw();
+      }
+    } else if (origin == ScreenState::Evidence) {
+      if (sdAvailable) SD.end();
+      sdAvailable = false;
+      mountEvidence();
+    }
+    return;
+  }
+  draw();
+}
+
+void goBack() {
+  if (screen == ScreenState::WifiDetail) returnToScreen(ScreenState::WifiResults);
+  else if (screen == ScreenState::BleDetail) returnToScreen(ScreenState::BleResults);
+  else if (screen == ScreenState::WifiResults) returnToMenu(ScreenState::Observe, 0);
+  else if (screen == ScreenState::WifiChannels) returnToMenu(ScreenState::Observe, 1);
+  else if (screen == ScreenState::BleResults) returnToMenu(ScreenState::Observe, 2);
+  else if (screen == ScreenState::EvidencePreview) returnToScreen(ScreenState::EvidenceDetail);
+  else if (screen == ScreenState::EvidenceDetail) returnToScreen(ScreenState::Evidence);
+  else if (screen == ScreenState::PortResults) {
+    if (portRunning) portScan.stop();
+    portRunning = false;
+    returnToScreen(ScreenState::HostDetail);
+  } else if (screen == ScreenState::HostDetail) {
+    selection = scoutSelection;
+    returnToScreen(ScreenState::Scout);
+  }
+  else if (screen == ScreenState::NodeCapabilities) returnToScreen(ScreenState::NodeDetail);
+  else if (screen == ScreenState::NodeDetail) {
+    selection = nodeSelection;
+    returnToScreen(ScreenState::Reconclave);
+  }
+  else if (screen == ScreenState::Reconclave) returnToMenu(ScreenState::Home, 0);
+  else if (screen == ScreenState::Observe) returnToMenu(ScreenState::Home, 1);
+  else if (screen == ScreenState::Scout) returnToMenu(ScreenState::Home, 2);
+  else if (screen == ScreenState::Evidence) returnToMenu(ScreenState::Home, 3);
+  else if (screen == ScreenState::FieldKit) returnToMenu(ScreenState::Home, 4);
+  else if (screen == ScreenState::NetworkDashboard) returnToMenu(ScreenState::FieldKit, 0);
+  else if (screen == ScreenState::System) {
+    if (systemOpenedFromSettings) returnToMenu(ScreenState::SettingsDevice, 0);
+    else returnToMenu(ScreenState::FieldKit, 1);
+  }
+  else if (screen == ScreenState::SettingsConnectivity) returnToMenu(ScreenState::Settings, 0);
+  else if (screen == ScreenState::SettingsDisplay) returnToMenu(ScreenState::Settings, 1);
+  else if (screen == ScreenState::SettingsBoot) returnToMenu(ScreenState::SettingsDisplay, 5);
+  else if (screen == ScreenState::SettingsStorage) returnToMenu(ScreenState::Settings, 2);
+  else if (screen == ScreenState::SettingsDevice) returnToMenu(ScreenState::Settings, 3);
+  else if (screen == ScreenState::SettingsTrust) returnToMenu(ScreenState::Settings, 4);
+  else if (screen == ScreenState::ConfirmForgetTrust) returnToMenu(ScreenState::SettingsTrust, 0);
+  else if (screen == ScreenState::ProvisionEvidenceKey) returnToMenu(ScreenState::SettingsTrust, 1);
+  else if (screen == ScreenState::Settings) returnToMenu(ScreenState::Home, 5);
+  else openScreen(ScreenState::Home);
+}
+
+void handleApplicationInput(const Keyboard_Class::KeysState& keys) {
+  if (screen == ScreenState::ContextMenu) {
+    handleContextInput(keys);
+    return;
+  }
+  if (keys.tab) {
+    openContextMenu();
+    return;
+  }
+  if (screen == ScreenState::Home) {
+    moveSelection(keys, 6);
+    if (navigationStyle == NavigationStyle::Cards && leftPressed(keys)) {
+      selection = selection == 0 ? 5 : selection - 1;
+    } else if (navigationStyle == NavigationStyle::Cards && rightPressed(keys)) {
+      selection = (selection + 1) % 6;
+    }
+    if (keys.enter) {
+      if (selection == 0) {
+        openScreen(ScreenState::Reconclave);
+        discover();
+      }
+      else if (selection == 1) openScreen(ScreenState::Observe);
+      else if (selection == 2) openScreen(ScreenState::Scout);
+      else if (selection == 3) {
+        mountEvidence();
+        openScreen(ScreenState::Evidence);
+      } else if (selection == 4) openScreen(ScreenState::FieldKit);
+      else openScreen(ScreenState::Settings);
+      return;
+    }
+  } else if (screen == ScreenState::Reconclave) {
+    moveSelection(keys, remoteNodes.size() + 1);
+    if (backPressed(keys)) goBack();
+    else if (keys.enter) {
+      nodeSelection = selection;
+      selectedNodeId = selection == 0 ? deviceId : remoteNodes[selection - 1].deviceId;
+      openScreen(ScreenState::NodeDetail);
+    } else draw();
+    return;
+  } else if (screen == ScreenState::NodeDetail) {
+    if (backPressed(keys)) goBack();
+    else if (keys.enter) openScreen(ScreenState::NodeCapabilities);
+    return;
+  } else if (screen == ScreenState::NodeCapabilities) {
+    RemoteNode* node = selectedRemoteNode();
+    static const char* const localCapabilities[] = {
+        "system.info", "coordination.nodes", "coordination.jobs", "input.keyboard",
+        "radio.wifi.scan", "radio.ble.scan", "storage.file.read", "storage.evidence.write",
+        "net.discovery.scan"};
+    const bool local = selectedNodeId == deviceId;
+    const size_t count = local ? sizeof(localCapabilities) / sizeof(localCapabilities[0]) :
+        (node ? node->capabilities.size() : 0);
+    moveSelection(keys, count);
+    if (backPressed(keys)) goBack();
+    else if (keys.enter && count > 0) {
+      const String capability = local ? String(localCapabilities[selection]) : node->capabilities[selection];
+      toggleCapability(selectedNodeId, capability);
+      notice = capabilityEnabled(selectedNodeId, capability) ? "Capability enabled" : "Capability disabled";
+      draw();
+    }
+    else draw();
+    return;
+  } else if (screen == ScreenState::Scout) {
+    moveSelection(keys, discoveredHosts.size());
+    if (backPressed(keys)) goBack();
+    else if (pressedLetter(keys, 'r') && !scoutRunning) {
+      startScoutJob();
+      return;
+    } else if (keys.enter && !scoutRunning && !discoveredHosts.empty()) {
+      scoutSelection = selection;
+      selectedHost = discoveredHosts[selection];
+      openScreen(ScreenState::HostDetail);
+      return;
+    }
+  } else if (screen == ScreenState::HostDetail) {
+    if (backPressed(keys)) goBack();
+    else if (keys.enter) {
+      openPorts.clear();
+      portStatus = "Starting...";
+      startSelectedPortScan();
+      openScreen(ScreenState::PortResults);
+      return;
+    }
+  } else if (screen == ScreenState::PortResults) {
+    moveSelection(keys, openPorts.size());
+    if (backPressed(keys)) goBack();
+  } else if (screen == ScreenState::Observe) {
+    moveSelection(keys, 3);
+    if (backPressed(keys)) goBack();
+    else if (keys.enter && selection == 0) {
+      openScreen(ScreenState::WifiResults);
+      scanWifi();
+      return;
+    } else if (keys.enter && selection == 1) {
+      openScreen(ScreenState::WifiChannels);
+      return;
+    } else if (keys.enter && selection == 2) {
+      openScreen(ScreenState::BleResults);
+      scanBle();
+      return;
+    }
+  } else if (screen == ScreenState::WifiResults) {
+    moveSelection(keys, wifiObservations.size());
+    if (backPressed(keys)) goBack();
+    else if (keys.enter && !wifiObservations.empty()) {
+      screen = ScreenState::WifiDetail;
+      draw();
+      return;
+    }
+  } else if (screen == ScreenState::WifiChannels) {
+    if (backPressed(keys)) goBack();
+  } else if (screen == ScreenState::WifiDetail) {
+    if (backPressed(keys)) goBack();
+  } else if (screen == ScreenState::BleResults) {
+    moveSelection(keys, bleObservations.size());
+    if (backPressed(keys)) goBack();
+    else if (keys.enter && !bleObservations.empty()) {
+      screen = ScreenState::BleDetail;
+      draw();
+      return;
+    }
+  } else if (screen == ScreenState::BleDetail) {
+    if (backPressed(keys)) goBack();
+  } else if (screen == ScreenState::Evidence) {
+    moveSelection(keys, evidenceFiles.size());
+    if (backPressed(keys)) goBack();
+    else if (keys.enter && !evidenceFiles.empty()) {
+      screen = ScreenState::EvidenceDetail;
+      draw();
+      return;
+    }
+  } else if (screen == ScreenState::EvidenceDetail) {
+    if (backPressed(keys)) {
+      goBack();
+      return;
+    } else if (keys.enter && evidencePreviewable(evidenceFiles[selection].name)) {
+      loadEvidencePreview();
+      screen = ScreenState::EvidencePreview;
+      draw();
+      return;
+    }
+  } else if (screen == ScreenState::EvidencePreview) {
+    if (backPressed(keys)) {
+      goBack();
+      return;
+    }
+    if (!previewLines.empty()) {
+      if (keys.up || pressedLetter(keys, 'w') || pressedLetter(keys, 'k') ||
+          pressedLetter(keys, ';')) {
+        if (previewLine > 0) --previewLine;
+      } else if (keys.down || pressedLetter(keys, 's') || pressedLetter(keys, 'j') ||
+                 pressedLetter(keys, '.')) {
+        if (previewLine + 1 < previewLines.size()) ++previewLine;
+      }
+    }
+  } else if (screen == ScreenState::FieldKit) {
+    moveSelection(keys, 2);
+    if (backPressed(keys)) goBack();
+    else if (keys.enter && selection == 0) openScreen(ScreenState::NetworkDashboard);
+    else if (keys.enter && selection == 1) {
+      systemOpenedFromSettings = false;
+      openScreen(ScreenState::System);
+    }
+  } else if (screen == ScreenState::NetworkDashboard) {
+    if (backPressed(keys)) goBack();
+  } else if (screen == ScreenState::System) {
+    if (backPressed(keys)) goBack();
+  } else if (screen == ScreenState::Settings) {
+    moveSelection(keys, 5);
+    if (backPressed(keys)) goBack();
+    else if (keys.enter && selection == 0) openScreen(ScreenState::SettingsConnectivity);
+    else if (keys.enter && selection == 1) openScreen(ScreenState::SettingsDisplay);
+    else if (keys.enter && selection == 2) openScreen(ScreenState::SettingsStorage);
+    else if (keys.enter && selection == 3) openScreen(ScreenState::SettingsDevice);
+    else if (keys.enter && selection == 4) openScreen(ScreenState::SettingsTrust);
+  } else if (screen == ScreenState::SettingsConnectivity) {
+    if (backPressed(keys)) goBack();
+    else if (keys.enter) {
+      beginProvisioning();
+      return;
+    }
+  } else if (screen == ScreenState::SettingsDisplay) {
+    moveSelection(keys, 7);
+    if (backPressed(keys)) goBack();
+    else if (keys.enter && selection == 5) {
+      openScreen(ScreenState::SettingsBoot);
+      return;
+    }
+    else if (leftPressed(keys) || rightPressed(keys)) {
+      const bool forward = rightPressed(keys);
+      if (selection == 0) {
+        int value = static_cast<int>(uiTheme) + (forward ? 1 : 2);
+        uiTheme = static_cast<UiTheme>(value % 3);
+        preferences.putUChar("theme", static_cast<uint8_t>(uiTheme));
+      } else if (selection == 1) {
+        navigationStyle = navigationStyle == NavigationStyle::Cards ?
+            NavigationStyle::List : NavigationStyle::Cards;
+        preferences.putUChar("nav_style", static_cast<uint8_t>(navigationStyle));
+      } else if (selection == 2) {
+        if (forward) displayBrightness = displayBrightness >= 224 ? 224 : displayBrightness + 32;
+        else displayBrightness = displayBrightness <= 64 ? 64 : displayBrightness - 32;
+        M5Cardputer.Display.setBrightness(displayBrightness);
+        preferences.putUChar("brightness", displayBrightness);
+      } else if (selection == 3) {
+        static const uint16_t timeouts[] = {0, 30, 60, 120};
+        size_t index = 0;
+        while (index < 4 && timeouts[index] != screenTimeoutSeconds) ++index;
+        if (index >= 4) index = 0;
+        index = forward ? (index + 1) % 4 : (index + 3) % 4;
+        screenTimeoutSeconds = timeouts[index];
+        preferences.putUShort("timeout_s", screenTimeoutSeconds);
+      } else if (selection == 4) {
+        int value = static_cast<int>(idleStyle) + (forward ? 1 : 2);
+        idleStyle = static_cast<IdleStyle>(value % 3);
+        preferences.putUChar("idle", static_cast<uint8_t>(idleStyle));
+      } else if (selection == 6) {
+        searchNodesOnBoot = !searchNodesOnBoot;
+        preferences.putBool("search_boot", searchNodesOnBoot);
+      }
+      lastInputMs = millis();
+      fieldStatus = "Display settings saved";
+    }
+  } else if (screen == ScreenState::SettingsBoot) {
+    moveSelection(keys, 4);
+    if (backPressed(keys)) goBack();
+    else if (selection == 3 && keys.enter) {
+      const bool enabled = bootAnimationEnabled;
+      bootAnimationEnabled = true;
+      drawBootAnimation();
+      bootAnimationEnabled = enabled;
+      lastInputMs = millis();
+    } else if (leftPressed(keys) || rightPressed(keys) || keys.enter) {
+      const bool forward = !leftPressed(keys);
+      if (selection == 0) {
+        bootAnimationEnabled = !bootAnimationEnabled;
+        preferences.putBool("boot_anim", bootAnimationEnabled);
+      } else if (selection == 1) {
+        int value = static_cast<int>(bootSequence) + (forward ? 1 : 5);
+        bootSequence = static_cast<BootSequence>(value % 6);
+        preferences.putUChar("boot_seq", static_cast<uint8_t>(bootSequence));
+      } else if (selection == 2) {
+        int value = static_cast<int>(bootSpeed) + (forward ? 1 : 2);
+        bootSpeed = static_cast<BootSpeed>(value % 3);
+        preferences.putUChar("boot_speed", static_cast<uint8_t>(bootSpeed));
+      }
+    }
+  } else if (screen == ScreenState::SettingsStorage) {
+    if (backPressed(keys)) goBack();
+    else if (keys.enter) mountEvidence();
+  } else if (screen == ScreenState::SettingsDevice) {
+    if (backPressed(keys)) goBack();
+    else if (keys.enter) {
+      systemOpenedFromSettings = true;
+      openScreen(ScreenState::System);
+    }
+  } else if (screen == ScreenState::SettingsTrust) {
+    moveSelection(keys, 2);
+    if (backPressed(keys)) goBack();
+    else if (keys.enter && selection == 0 && peerKeyValid) {
+      openScreen(ScreenState::ConfirmForgetTrust);
+    } else if (keys.enter && selection == 1) {
+      if (evidenceKeyValid) {
+        memset(evidenceKey, 0, sizeof(evidenceKey));
+        evidenceKeyValid = false;
+        preferences.remove("evid_key");
+        notice = "Evidence key removed";
+        draw();
+      } else {
+        input = "";
+        openScreen(ScreenState::ProvisionEvidenceKey);
+      }
+    } else draw();
+  } else if (screen == ScreenState::ConfirmForgetTrust) {
+    if (backPressed(keys)) goBack();
+    else if (keys.enter) {
+      memset(peerKey, 0, sizeof(peerKey));
+      peerKeyValid = false;
+      trustedP4Id = "";
+      preferences.remove("peer_key");
+      preferences.remove("peer_p4");
+      pairingStatus = "Local trust removed; reset P4 trust";
+      notice = "Local pairing removed";
+      openScreen(ScreenState::SettingsTrust);
+      return;
+    }
+  }
+  draw();
+}
+
+void handleProvisionInput(const Keyboard_Class::KeysState& keys) {
+  if (keys.esc) {
+    if (!preferences.getString("ssid", "").isEmpty()) {
+      wifiSsid = preferences.getString("ssid", "");
+      wifiPassword = preferences.getString("password", "");
+      startConnecting();
+    }
+    return;
+  }
+  if (keys.backspace && !input.isEmpty()) input.remove(input.length() - 1);
+  for (const char value : keys.word) {
+    if (value >= 32 && value <= 126 && input.length() < 63) input += value;
+  }
+  if (keys.enter && (screen == ScreenState::ProvisionPassword || !input.isEmpty())) {
+    if (screen == ScreenState::ProvisionSsid) {
+      wifiSsid = input;
+      input = "";
+      screen = ScreenState::ProvisionPassword;
+    } else {
+      wifiPassword = input;
+      preferences.putString("ssid", wifiSsid);
+      preferences.putString("password", wifiPassword);
+      input = "";
+      startConnecting();
+      return;
+    }
+  }
+  draw();
+}
+
+void handleEvidenceKeyInput(const Keyboard_Class::KeysState& keys) {
+  if (keys.esc) {
+    input = "";
+    goBack();
+    return;
+  }
+  if (keys.backspace && !input.isEmpty()) input.remove(input.length() - 1);
+  for (const char value : keys.word) {
+    if (value >= 32 && value <= 126 && input.length() < 63) input += value;
+  }
+  if (keys.enter && !input.isEmpty()) {
+    sha256Digest(input, evidenceKey);
+    evidenceKeyValid = true;
+    preferences.putBytes("evid_key", evidenceKey, sizeof(evidenceKey));
+    input = "";
+    notice = "Evidence key saved";
+    returnToMenu(ScreenState::SettingsTrust, 1);
+    return;
+  }
+  draw();
+}
+
+}  // namespace
+
+void setup() {
+  auto config = M5.config();
+  config.output_power = true;
+  M5Cardputer.begin(config, true);
+  M5Cardputer.Display.setBrightness(160);
+  Serial.begin(115200);
+  preferences.begin("reconclave", false);
+  const String disabledPolicy = preferences.getString("cap_off", "");
+  size_t policyStart = 0;
+  while (policyStart < disabledPolicy.length()) {
+    int separator = disabledPolicy.indexOf('\n', policyStart);
+    if (separator < 0) separator = disabledPolicy.length();
+    const String key = disabledPolicy.substring(policyStart, separator);
+    if (!key.isEmpty()) disabledCapabilities.push_back(key);
+    policyStart = static_cast<size_t>(separator) + 1;
+  }
+  displayBrightness = preferences.getUChar("brightness", 160);
+  if (displayBrightness < 64 || displayBrightness > 224) displayBrightness = 160;
+  const uint8_t savedTheme = preferences.getUChar("theme", 0);
+  uiTheme = savedTheme <= 2 ? static_cast<UiTheme>(savedTheme) : UiTheme::Field;
+  const uint8_t savedNavigation = preferences.getUChar("nav_style", 0);
+  navigationStyle = savedNavigation <= 1 ? static_cast<NavigationStyle>(savedNavigation) :
+      NavigationStyle::Cards;
+  const uint8_t savedIdle = preferences.getUChar("idle", 1);
+  idleStyle = savedIdle <= 2 ? static_cast<IdleStyle>(savedIdle) : IdleStyle::Radar;
+  screenTimeoutSeconds = preferences.getUShort("timeout_s", 60);
+  if (screenTimeoutSeconds != 0 && screenTimeoutSeconds != 30 &&
+      screenTimeoutSeconds != 60 && screenTimeoutSeconds != 120) screenTimeoutSeconds = 60;
+  bootAnimationEnabled = preferences.getBool("boot_anim", true);
+  searchNodesOnBoot = preferences.getBool("search_boot", false);
+  const uint8_t savedBootSequence = preferences.getUChar("boot_seq", 0);
+  bootSequence = savedBootSequence <= 5 ? static_cast<BootSequence>(savedBootSequence) :
+      BootSequence::CipherRain;
+  const uint8_t savedBootSpeed = preferences.getUChar("boot_speed", 1);
+  bootSpeed = savedBootSpeed <= 2 ? static_cast<BootSpeed>(savedBootSpeed) : BootSpeed::Normal;
+  M5Cardputer.Display.setBrightness(displayBrightness);
+  drawBootAnimation();
+  lastInputMs = millis();
+  const uint64_t chip = ESP.getEfuseMac();
+  char id[32];
+  snprintf(id, sizeof(id), "rc-adv-%012llx", static_cast<unsigned long long>(chip));
+  deviceId = id;
+  if (preferences.getBytesLength("peer_key") == sizeof(peerKey) &&
+      preferences.getBytes("peer_key", peerKey, sizeof(peerKey)) == sizeof(peerKey)) {
+    trustedP4Id = preferences.getString("peer_p4", "");
+    peerKeyValid = !trustedP4Id.isEmpty();
+  }
+  evidenceKeyValid = preferences.getBytesLength("evid_key") == sizeof(evidenceKey) &&
+      preferences.getBytes("evid_key", evidenceKey, sizeof(evidenceKey)) == sizeof(evidenceKey);
+  groveSerial.setRxBufferSize(1024);
+  groveSerial.begin(115200, SERIAL_8N1, kGroveRxPin, kGroveTxPin);
+  mountEvidence();
+  wifiSsid = preferences.getString("ssid", "");
+  wifiPassword = preferences.getString("password", "");
+  if (wifiSsid.isEmpty()) beginProvisioning();
+  else startConnecting();
+}
+
+void loop() {
+  M5Cardputer.update();
+  updateGrove();
+  if (serverReady) server.handleClient();
+
+  if (wifiRestorePending && WiFi.status() == WL_CONNECTED) {
+    wifiRestorePending = false;
+    if (mdnsReady) MDNS.end();
+    mdnsReady = false;
+    startNodeServices();
+    fieldStatus += "; Wi-Fi restored";
+    draw();
+  }
+
+  if (screen == ScreenState::Connecting) {
+    if (WiFi.status() == WL_CONNECTED) {
+      startNodeServices();
+      screen = ScreenState::Home;
+      notice = "Connected";
+      draw();
+      if (searchNodesOnBoot) discover();
+      screen = ScreenState::Home;
+      draw();
+    } else if (millis() - connectStartedMs > kConnectTimeoutMs) {
+      notice = "Connection failed; W to change";
+      draw();
+      connectStartedMs = millis();
+    }
+  }
+
+  const size_t nodeCountBeforeExpiry = remoteNodes.size();
+  remoteNodes.erase(std::remove_if(remoteNodes.begin(), remoteNodes.end(),
+      [](const RemoteNode& node) { return millis() - node.lastSeenMs > kNodeExpiryMs; }),
+      remoteNodes.end());
+  if (!p4.deviceId.isEmpty() && millis() - p4.lastSeenMs > kNodeExpiryMs) {
+    registry.expireBefore(static_cast<uint64_t>(millis() - kNodeExpiryMs) + 1);
+    p4 = {};
+  }
+  if (remoteNodes.size() != nodeCountBeforeExpiry &&
+      (screen == ScreenState::Reconclave || screen == ScreenState::NodeDetail)) {
+    notice = "Offline nodes removed";
+    draw();
+  }
+
+  localHostScan.update();
+  LocalHostResult localResult;
+  bool localChanged = false;
+  while (localHostScan.nextResult(localResult)) {
+    const String ip = localResult.ip.toString();
+    discoveredHosts.push_back(ip);
+    localScoutHosts.push_back(ip);
+    localChanged = true;
+  }
+  // Not gated on scoutRunning itself: that flag is only recomputed inside
+  // mergeScoutProgress, so a purely-local recurring job (which genuinely goes idle
+  // between passes) would otherwise never trigger another merge once it first went
+  // idle, even after the reschedule below starts a new pass.
+  if ((localScoutAssigned || !remoteScoutJobs.empty()) && millis() - lastScoutUiMs >= 250) {
+    lastScoutUiMs = millis();
+    mergeScoutProgress();
+    localChanged = true;
+  }
+  if (localScoutAssigned && !localHostScan.active() && scoutIntervalMinutes > 0) {
+    if (localScoutNextRunMs == 0) {
+      // This local pass just finished; ship its results and schedule the next one.
+      ++scoutRunCount;
+      distributeScoutEvidence(localScoutHosts, deviceId);
+      detectAndRecordChanges(localScoutHosts, deviceId);
+      localScoutNextRunMs = millis() + static_cast<unsigned long>(scoutIntervalMinutes) * 60000UL;
+    } else if (millis() >= localScoutNextRunMs) {
+      localScoutHosts.clear();
+      localScoutNextRunMs = 0;
+      localHostScan.startRange(localScoutFirstHost,
+                               localScoutLastHost - localScoutFirstHost + 1);
+      localChanged = true;
+    }
+  }
+  if (localChanged && screen == ScreenState::Scout) draw();
+
+  portScan.update();
+  NetworkPortResult portResult;
+  bool portChanged = false;
+  while (portScan.nextResult(portResult)) {
+    openPorts.push_back(portResult.port);
+    portChanged = true;
+  }
+  if (portRunning) {
+    if (!portScan.active()) {
+      portRunning = false;
+      portStatus = String(portScan.checked()) + "/" + String(portScan.total()) +
+          " | " + String(openPorts.size()) + " open";
+      portChanged = true;
+    } else if (millis() - lastScoutPollMs >= 150) {
+      lastScoutPollMs = millis();
+      portStatus = String(portScan.checked()) + "/" + String(portScan.total());
+      portChanged = true;
+    }
+  }
+  if (portChanged && screen == ScreenState::PortResults) draw();
+
+  if (scoutRunning && !scoutRemoteNodeId.isEmpty() &&
+      millis() - lastScoutPollMs >= 750) {
+    lastScoutPollMs = millis();
+    for (auto& job : remoteScoutJobs) if (job.running) requestScoutUpdate(job, false);
+    mergeScoutProgress();
+    if (screen == ScreenState::Scout) draw();
+  }
+
+  if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
+    const auto keys = M5Cardputer.Keyboard.keysState();
+    lastInputMs = millis();
+    if (idleActive) {
+      idleActive = false;
+      M5Cardputer.Display.setBrightness(displayBrightness);
+      draw();
+    } else if (screen == ScreenState::ProvisionSsid || screen == ScreenState::ProvisionPassword) {
+      handleProvisionInput(keys);
+    } else if (screen == ScreenState::ProvisionEvidenceKey) {
+      handleEvidenceKeyInput(keys);
+    } else handleApplicationInput(keys);
+  }
+  const bool canIdle = screen != ScreenState::ProvisionSsid &&
+      screen != ScreenState::ProvisionPassword && screen != ScreenState::Connecting &&
+      screen != ScreenState::ProvisionEvidenceKey;
+  if (!idleActive && canIdle && screenTimeoutSeconds > 0 &&
+      millis() - lastInputMs >= static_cast<unsigned long>(screenTimeoutSeconds) * 1000UL) {
+    idleActive = true;
+    idlePhase = 0;
+    lastIdleFrameMs = millis();
+    drawIdle();
+  } else if (idleActive && idleStyle != IdleStyle::Off &&
+             millis() - lastIdleFrameMs >= 250) {
+    lastIdleFrameMs = millis();
+    idlePhase += 5;
+    drawIdle();
+  }
+  delay(10);
+}

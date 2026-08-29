@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reconclave.dev/schemas/reconclave-1-announce.json",
+  "title": "Reconclave v1 announcement payload",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["device_id", "device_type", "firmware", "roles", "capabilities", "status"],
+  "properties": {
+    "device_id": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$" },
+    "device_type": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$" },
+    "firmware": { "type": "string", "minLength": 1, "maxLength": 32 },
+    "roles": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4,
+      "uniqueItems": true,
+      "contains": { "const": "node" },
+      "items": { "enum": ["node", "coordinator", "analysis"] }
+    },
+    "capabilities": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": { "type": "string", "maxLength": 96, "pattern": "^[a-z0-9_-]+(\\.[a-z0-9_-]+)+$" }
+    },
+    "status": { "enum": ["ready", "busy", "degraded"] }
+    ,
+    "security": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["paired", "boot_nonce", "mode"],
+      "properties": {
+        "paired": { "type": "boolean" },
+        "boot_nonce": { "type": "string", "pattern": "^[a-f0-9]{32}$" },
+        "mode": { "const": "hmac-sha256-128" }
+      }
+    }
+  }
+}

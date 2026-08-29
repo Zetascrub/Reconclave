@@ -1,0 +1,11 @@
+{
+  "name": "ReconclaveProtocol",
+  "version": "0.1.0",
+  "description": "Transport-independent Reconclave protocol domain types",
+  "build": {
+    "srcDir": "src",
+    "includeDir": "include"
+  },
+  "frameworks": "*",
+  "platforms": "*"
+}

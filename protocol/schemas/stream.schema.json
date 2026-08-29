@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reconclave.dev/schemas/reconclave-1-stream.json",
+  "title": "Reconclave v1 stream chunk payload",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["stream_id", "chunk_index", "final", "encoding", "data"],
+  "properties": {
+    "stream_id": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$" },
+    "chunk_index": { "type": "integer", "minimum": 0 },
+    "final": { "type": "boolean" },
+    "encoding": { "const": "base64" },
+    "data": { "type": "string", "maxLength": 16384 }
+  }
+}

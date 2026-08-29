@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reconclave.dev/schemas/reconclave-1-request.json",
+  "title": "Reconclave v1 capability request payload",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["request_id", "capability", "arguments"],
+  "properties": {
+    "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$" },
+    "capability": { "type": "string", "maxLength": 96, "pattern": "^[a-z0-9_-]+(\\.[a-z0-9_-]+)+$" },
+    "arguments": { "type": "object" },
+    "auth": { "$ref": "#/$defs/auth" }
+  },
+  "$defs": {
+    "auth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nonce", "tag"],
+      "properties": {
+        "nonce": { "type": "string", "pattern": "^[a-f0-9]{16}$" },
+        "tag": { "type": "string", "pattern": "^[a-f0-9]{32}$" }
+      }
+    }
+  }
+}
