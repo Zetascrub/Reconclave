@@ -20,9 +20,11 @@ from zeroconf import ServiceInfo, Zeroconf
 
 from coordinator import Coordinator
 from reconclave_node import ANNOUNCE_PATH, MESSAGE_PATH, PROTOCOL, Node, local_ip
+from workspace_store import WorkspaceStore
 
 WEB_ROOT = pathlib.Path(__file__).parent / "web" / "dist"
 DEFAULT_TRUST_STORE = pathlib.Path(__file__).resolve().parents[2] / ".reconclave-provisioning" / "fleet.json"
+DEFAULT_WORKSPACE_STORE = pathlib.Path(__file__).resolve().parents[2] / ".reconclave-data" / "workspace.json"
 MAX_BODY_BYTES = 16 * 1024
 
 
@@ -82,6 +84,11 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.send_json(200, self.server.coordinator.state())
             else:
                 self.send_json(403, {"error": "local_access_only"})
+        elif path == "/api/workspace":
+            if self.local_client():
+                self.send_json(200, self.server.workspace.snapshot())
+            else:
+                self.send_json(403, {"error": "local_access_only"})
         elif path == "/api/events":
             if self.local_client():
                 self.stream_events()
@@ -107,6 +114,15 @@ class AppHandler(BaseHTTPRequestHandler):
             if path == MESSAGE_PATH:
                 status, response = self.server.node.respond(body)
                 self.send_json(status, response)
+                return
+            if path == "/api/projects":
+                self.send_json(201, self.server.workspace.create_project(body))
+                return
+            if path == "/api/jobs":
+                self.send_json(200, self.server.workspace.upsert_job(body))
+                return
+            if path == "/api/evidence":
+                self.send_json(201, self.server.workspace.add_evidence(body))
                 return
             parts = path.strip("/").split("/")
             if len(parts) == 4 and parts[:2] == ["api", "nodes"] and parts[3] == "invoke":
@@ -171,9 +187,11 @@ class AppHandler(BaseHTTPRequestHandler):
 class AppServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address: tuple[str, int], node: Node, coordinator: Coordinator) -> None:
+    def __init__(self, address: tuple[str, int], node: Node, coordinator: Coordinator,
+                 workspace: WorkspaceStore) -> None:
         self.node = node
         self.coordinator = coordinator
+        self.workspace = workspace
         super().__init__(address, AppHandler)
 
 
@@ -190,6 +208,8 @@ def main() -> None:
     parser.add_argument("--evidence-key", default=os.environ.get("RECONCLAVE_EVIDENCE_KEY"))
     parser.add_argument("--trust-store", type=pathlib.Path, default=DEFAULT_TRUST_STORE,
                         help="ignored per-link provisioning store")
+    parser.add_argument("--workspace-store", type=pathlib.Path, default=DEFAULT_WORKSPACE_STORE,
+                        help="local project/job/evidence index")
     args = parser.parse_args()
     if args.enable_network_scan and not args.execution_key:
         parser.error("an execution key is required when network scan is enabled")
@@ -211,7 +231,11 @@ def main() -> None:
                               trust_keys=trust_keys)
     if args.mode in ("coordinator", "both"):
         coordinator.start()
-    server = AppServer(("0.0.0.0", args.port), node, coordinator)
+    try:
+        workspace = WorkspaceStore(args.workspace_store)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        parser.error(f"could not load workspace store: {error}")
+    server = AppServer(("0.0.0.0", args.port), node, coordinator, workspace)
     service = ServiceInfo(
         "_reconclave._tcp.local.", f"{args.node_id}._reconclave._tcp.local.",
         addresses=[socket.inet_aton(args.address)], port=args.port,

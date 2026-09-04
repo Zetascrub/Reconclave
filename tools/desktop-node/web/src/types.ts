@@ -50,6 +50,9 @@ export type Activity = {
 }
 
 export type ScanJob = {
+  archiveId?: string
+  projectId?: string
+  scope?: { network: string; start: string; end: string }
   providerId: string
   job_id?: string | number
   job_status: 'idle' | 'running' | 'complete' | 'failed' | 'stopped'
@@ -60,3 +63,8 @@ export type ScanJob = {
   recurring?: boolean
   run_count?: number
 }
+
+export type Project = { id: string; name: string; description: string; created_at_ms: number; updated_at_ms: number }
+export type ArchivedJob = { id: string; project_id: string; provider_id?: string; capability?: string; status?: string; checked?: number; total?: number; hosts?: string[]; scope?: Record<string, string>; error?: string; created_at_ms: number; updated_at_ms: number }
+export type EvidenceRecord = { id: string; project_id: string; job_id?: string; kind: string; title: string; summary: string; data?: { hosts?: string[]; [key: string]: unknown }; captured_at_ms: number }
+export type WorkspaceData = { revision: number; projects: Project[]; jobs: ArchivedJob[]; evidence: EvidenceRecord[] }

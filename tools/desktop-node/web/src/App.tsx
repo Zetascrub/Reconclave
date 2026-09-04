@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { Activity, AppState, CapabilityDescriptor, ReconNode, ScanJob } from './types'
+import type { Activity, AppState, CapabilityDescriptor, Project, ReconNode, ScanJob, WorkspaceData } from './types'
+import WorkspaceViews from './WorkspaceViews'
 
 const emptyState: AppState = { revision: 0, nodes: [], coordinator_id: '', updated_at_ms: 0 }
+const emptyWorkspace: WorkspaceData = { revision: 0, projects: [], jobs: [], evidence: [] }
 
 function savedActivity(): Activity[] {
   try {
@@ -52,7 +54,10 @@ function defaultScope(address: string) {
 }
 
 function App() {
+  const [view, setView] = useState<'network' | 'map' | 'jobs' | 'projects' | 'evidence'>('network')
   const [state, setState] = useState<AppState>(emptyState)
+  const [workspace, setWorkspace] = useState<WorkspaceData>(emptyWorkspace)
+  const [projectId, setProjectId] = useState(() => localStorage.getItem('reconclave.project') ?? '')
   const [selectedId, setSelectedId] = useState('')
   const [connected, setConnected] = useState(false)
   const [busyCapability, setBusyCapability] = useState('')
@@ -68,6 +73,7 @@ function App() {
 
   useEffect(() => {
     fetch('/api/state').then((response) => response.json()).then(setState).catch(() => setConnected(false))
+    refreshWorkspace()
     const events = new EventSource('/api/events')
     events.addEventListener('state', (event) => {
       setState(JSON.parse((event as MessageEvent).data))
@@ -77,6 +83,26 @@ function App() {
     events.onerror = () => setConnected(false)
     return () => events.close()
   }, [])
+
+  useEffect(() => { localStorage.setItem('reconclave.project', projectId) }, [projectId])
+
+  async function refreshWorkspace() {
+    const response = await fetch('/api/workspace')
+    if (response.ok) setWorkspace(await response.json())
+  }
+
+  async function postWorkspace(path: string, body: Record<string, unknown>) {
+    const response = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    if (!response.ok) { const error = await response.json(); throw new Error(error.message ?? error.error ?? 'Workspace update failed') }
+    const result = await response.json()
+    await refreshWorkspace()
+    return result
+  }
+
+  async function createProject(name: string, description: string) {
+    const project = await postWorkspace('/api/projects', { name, description }) as Project
+    setProjectId(project.id)
+  }
 
   useEffect(() => {
     localStorage.setItem('reconclave.activity', JSON.stringify(activity))
@@ -151,7 +177,9 @@ function App() {
         network: scope.network, start_ip: scope.start, end_ip: scope.end,
       }, authorised)
       const next = body.payload?.result as Omit<ScanJob, 'providerId'>
-      setScanJob({ providerId: selected.device_id, ...next })
+      const archived = { providerId: selected.device_id, projectId, archiveId: `${selected.device_id}-${next.job_id}-${Date.now()}`, scope: { ...scope }, ...next }
+      setScanJob(archived)
+      if (projectId) await postWorkspace('/api/jobs', { id: archived.archiveId, project_id: projectId, provider_id: selected.device_id, capability: 'net.discovery.scan', status: next.job_status, checked: next.checked, total: next.total, hosts: next.hosts, scope })
       setScoutOpen(false)
       addActivity({ title: 'Scout dispatched', detail: `${scope.start} → ${scope.end} via ${selected.device_id}`, tone: 'info' })
     } catch (error) {
@@ -169,9 +197,12 @@ function App() {
       try {
         const body = await requestCapability(provider, 'coordination.job.status')
         const next = { providerId: provider.device_id, ...body.payload?.result } as ScanJob
+        next.archiveId = scanJob.archiveId; next.projectId = scanJob.projectId; next.scope = scanJob.scope
         statusFailures.current = 0
         setScanJob(next)
+        if (next.archiveId && next.projectId) await postWorkspace('/api/jobs', { id: next.archiveId, project_id: next.projectId, provider_id: next.providerId, capability: 'net.discovery.scan', status: next.job_status, checked: next.checked, total: next.total, hosts: next.hosts, scope: next.scope, error: next.error })
         if (next.job_status === 'complete') {
+          if (next.archiveId && next.projectId) await postWorkspace('/api/evidence', { id: `${next.archiveId}-network`, project_id: next.projectId, job_id: next.archiveId, kind: 'network-hosts', title: `Scout observation · ${next.scope?.network ?? 'network'}`, summary: `${next.hosts.length} responsive hosts observed by ${next.providerId}`, data: { hosts: next.hosts, scope: next.scope, provider_id: next.providerId } })
           addActivity({ title: 'Scout complete', detail: `${next.hosts.length} responsive host${next.hosts.length === 1 ? '' : 's'} observed`, tone: 'ok' })
         }
       } catch (error) {
@@ -212,15 +243,16 @@ function App() {
 
       <aside className="rail">
         <nav aria-label="Primary navigation">
-          <button className="active" title="Network"><span>⌁</span><small>Network</small></button>
-          <button disabled title="Jobs"><span>◫</span><small>Jobs</small></button>
-          <button disabled title="Projects"><span>◇</span><small>Projects</small></button>
-          <button disabled title="Evidence"><span>▱</span><small>Evidence</small></button>
+          <button className={view === 'network' ? 'active' : ''} title="Network" onClick={() => setView('network')}><span>⌁</span><small>Network</small></button>
+          <button className={view === 'map' ? 'active' : ''} title="Map" onClick={() => setView('map')}><span>◎</span><small>Map</small></button>
+          <button className={view === 'jobs' ? 'active' : ''} title="Jobs" onClick={() => setView('jobs')}><span>◫</span><small>Jobs</small></button>
+          <button className={view === 'projects' ? 'active' : ''} title="Projects" onClick={() => setView('projects')}><span>◇</span><small>Projects</small></button>
+          <button className={view === 'evidence' ? 'active' : ''} title="Evidence" onClick={() => setView('evidence')}><span>▱</span><small>Evidence</small></button>
         </nav>
         <div className="rail-foot"><div className="pulse-ring" /><small>RC/01</small></div>
       </aside>
 
-      <main>
+      <main>{view === 'network' ? <>
         <section className="hero">
           <div><p className="eyebrow">DISTRIBUTED OPERATIONS</p><h1>Network constellation</h1>
             <p className="subhead">Live capability map across trusted and discoverable nodes.</p></div>
@@ -293,12 +325,13 @@ function App() {
             </div>
           </div>
         </section>
-      </main>
+      </> : <WorkspaceViews view={view} workspace={workspace} nodes={state.nodes} projectId={projectId} onProject={setProjectId} onCreate={createProject} />}</main>
       {scoutOpen && selected && <div className="modal-shade" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setScoutOpen(false) }}>
         <section className="scout-modal" role="dialog" aria-modal="true" aria-labelledby="scout-title">
           <div className="modal-head"><div><span className="kicker">SCOPED OPERATION</span><h2 id="scout-title">Configure Network Scout</h2><p>Provider: {selected.device_id}</p></div><button onClick={() => setScoutOpen(false)} aria-label="Close">×</button></div>
           <div className="scope-visual"><span>{scope.start || 'START'}</span><div><i /><i /><i /><i /><i /></div><span>{scope.end || 'END'}</span></div>
           <label className="field"><span>NETWORK / CIDR</span><input value={scope.network} onChange={(event) => setScope({ ...scope, network: event.target.value })} placeholder="192.168.1.0/24" /></label>
+          <label className="field"><span>PROJECT</span><select value={projectId} onChange={(event) => setProjectId(event.target.value)}><option value="">Run without archiving</option>{workspace.projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label>
           <div className="field-pair">
             <label className="field"><span>FIRST ADDRESS</span><input value={scope.start} onChange={(event) => setScope({ ...scope, start: event.target.value })} /></label>
             <label className="field"><span>LAST ADDRESS</span><input value={scope.end} onChange={(event) => setScope({ ...scope, end: event.target.value })} /></label>

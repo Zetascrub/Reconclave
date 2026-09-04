@@ -39,6 +39,15 @@ acknowledgements, IPv6, scopes broader than `/24`, reversed ranges, and network
 or broadcast addresses. Providers still enforce their own attached-network
 scope before execution.
 
+The primary rail also provides persistent **Projects**, **Jobs**, **Evidence**,
+and **Map** workspaces. Create a project before dispatching Scout to archive its
+job lifecycle and a deduplicated network-host evidence summary. Map view can be
+switched between a dynamic node graph and a sortable/filterable list, scoped to
+one project or the complete local archive. Workspace metadata is written
+atomically to the ignored `.reconclave-data/workspace.json` file with owner-only
+permissions; override it with `--workspace-store` when a separate case store is
+required.
+
 The coordinator actively revalidates discovered nodes every 12 seconds rather
 than treating the initial mDNS callback as a permanent health signal. Active
 Scout state and recent activity are retained in browser-local storage, so a
