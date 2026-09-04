@@ -56,6 +56,11 @@ signal, then capture a system snapshot or launch a bounded Network Scout. Scout
 can be one-shot or recurring. These are typed built-in playbooks rather than
 arbitrary executable payloads; rule creation requires an explicit authorisation
 acknowledgement and the backend independently enforces the allowlist.
+On supporting nodes the rule itself is saved to device NVS, with the desktop
+record acting as a management mirror. The device can therefore trigger after a
+cold boot while every coordinator is offline. Results remain in its durable
+outbox until the desktop imports them into the assigned project and acknowledges
+receipt.
 
 Workspace metadata is written
 atomically to the ignored `.reconclave-data/workspace.json` file with owner-only

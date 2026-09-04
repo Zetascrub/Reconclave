@@ -32,7 +32,7 @@
 #include "ping/ping_sock.h"
 #include "generated_trust.h"
 
-#define RC_FIRMWARE_VERSION "0.2.0"
+#define RC_FIRMWARE_VERSION "0.3.0"
 #define RC_PROTOCOL "reconclave/1"
 #define RC_HOSTNAME "reconclave-poe-p4"
 #define RC_INSTANCE "Reconclave Unit PoE-P4"
@@ -60,6 +60,11 @@
 #define RC_SCAN_PING_TIMEOUT_MS 120
 #define RC_RECUR_MIN_INTERVAL_MS 10000
 #define RC_RECUR_MAX_INTERVAL_MS 86400000
+#define RC_AUTOMATION_NAMESPACE "rc_auto"
+#define RC_AUTOMATION_RULES_KEY "rules"
+#define RC_AUTOMATION_OUTBOX_KEY "outbox"
+#define RC_MAX_RULES 4
+#define RC_MAX_OUTBOX 3
 #define RC_LEASE_MIN_MS 1000
 #define RC_LEASE_MAX_MS 60000
 
@@ -108,11 +113,40 @@ typedef struct {
     volatile bool cancel_requested;
     uint32_t interval_ms;
     uint32_t run_count;
+    char rule_id[32];
+    char project_id[64];
     char results[RC_SCAN_MAX_RESULTS][16];
     char error[40];
 } scan_state_t;
 
 static scan_state_t s_scan;
+
+typedef enum { RC_CONDITION_DHCP = 1, RC_CONDITION_INTERNET = 2 } rule_condition_t;
+typedef enum { RC_PLAYBOOK_SCOUT = 1, RC_PLAYBOOK_SNAPSHOT = 2 } rule_playbook_t;
+typedef struct {
+    uint8_t version;
+    bool enabled;
+    uint8_t condition;
+    uint8_t playbook;
+    uint32_t interval_ms;
+    char id[32];
+    char project_id[64];
+} automation_rule_t;
+typedef struct {
+    uint8_t version;
+    uint32_t sequence;
+    uint32_t run_count;
+    uint8_t host_count;
+    char rule_id[32];
+    char project_id[64];
+    char kind[24];
+    char ip[16];
+    char hosts[RC_SCAN_MAX_RESULTS][16];
+} outbox_record_t;
+static automation_rule_t s_rules[RC_MAX_RULES];
+static bool s_rule_matched[RC_MAX_RULES];
+static outbox_record_t s_outbox[RC_MAX_OUTBOX];
+static uint32_t s_outbox_sequence;
 
 static void hex_encode(char *destination, const uint8_t *source, size_t length)
 {
@@ -228,6 +262,50 @@ static bool store_pairing(const char *peer_id, const uint8_t key[RC_KEY_BYTES])
     s_peer_id[peer_id_length] = '\0';
     s_peer_key_valid = true;
     return true;
+}
+
+static void load_automation_state(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(RC_AUTOMATION_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) return;
+    size_t length = sizeof(s_rules);
+    if (nvs_get_blob(handle, RC_AUTOMATION_RULES_KEY, s_rules, &length) != ESP_OK ||
+        length != sizeof(s_rules)) memset(s_rules, 0, sizeof(s_rules));
+    length = sizeof(s_outbox);
+    if (nvs_get_blob(handle, RC_AUTOMATION_OUTBOX_KEY, s_outbox, &length) != ESP_OK ||
+        length != sizeof(s_outbox)) memset(s_outbox, 0, sizeof(s_outbox));
+    for (size_t index = 0; index < RC_MAX_OUTBOX; ++index) {
+        if (s_outbox[index].sequence > s_outbox_sequence) s_outbox_sequence = s_outbox[index].sequence;
+    }
+    nvs_close(handle);
+}
+
+static bool save_automation_blob(const char *key, const void *value, size_t length)
+{
+    nvs_handle_t handle;
+    if (nvs_open(RC_AUTOMATION_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) return false;
+    esp_err_t result = nvs_set_blob(handle, key, value, length);
+    if (result == ESP_OK) result = nvs_commit(handle);
+    nvs_close(handle);
+    return result == ESP_OK;
+}
+
+static void queue_evidence(const char *rule_id, const char *project_id, const char *kind,
+                           uint32_t run_count, char hosts[][16], uint8_t host_count)
+{
+    outbox_record_t record = {.version = 1, .sequence = ++s_outbox_sequence,
+                              .run_count = run_count,
+                              .host_count = host_count > RC_SCAN_MAX_RESULTS ? RC_SCAN_MAX_RESULTS : host_count};
+    strlcpy(record.rule_id, rule_id, sizeof(record.rule_id));
+    strlcpy(record.project_id, project_id, sizeof(record.project_id));
+    strlcpy(record.kind, kind, sizeof(record.kind));
+    strlcpy(record.ip, s_network.ip, sizeof(record.ip));
+    for (size_t index = 0; index < record.host_count; ++index) {
+        strlcpy(record.hosts[index], hosts[index], sizeof(record.hosts[index]));
+    }
+    memmove(&s_outbox[0], &s_outbox[1], sizeof(s_outbox[0]) * (RC_MAX_OUTBOX - 1));
+    s_outbox[RC_MAX_OUTBOX - 1] = record;
+    save_automation_blob(RC_AUTOMATION_OUTBOX_KEY, s_outbox, sizeof(s_outbox));
 }
 
 static uint64_t timestamp_ms(void)
@@ -561,6 +639,10 @@ static void discovery_task(void *argument)
     const uint32_t interval_ms = s_scan.interval_ms;
     portEXIT_CRITICAL(&s_lock);
     ESP_LOGI(TAG, "Discovery job complete: %u host(s)", (unsigned)s_scan.result_count);
+    if (s_scan.rule_id[0] != '\0') {
+        queue_evidence(s_scan.rule_id, s_scan.project_id, "network-hosts",
+                       s_scan.run_count, s_scan.results, s_scan.result_count);
+    }
     if (!repeat) break;
     uint32_t waited = 0;
     while (waited < interval_ms) {
@@ -687,21 +769,29 @@ static cJSON *cancel_response(const char *destination, const char *request_id)
     return scan_response(destination, request_id, false, NULL);
 }
 
+static bool check_internet_possible(network_state_t state, bool *gateway_reachable,
+                                    bool *dns_resolved)
+{
+    *gateway_reachable = false;
+    unsigned a, b, c, d;
+    if (state.has_ip && sscanf(state.gateway, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
+        *gateway_reachable = ping_host((uint8_t)a, (uint8_t)b, (uint8_t)c, (uint8_t)d);
+    }
+    struct addrinfo hints = {.ai_family = AF_INET, .ai_socktype = SOCK_STREAM};
+    struct addrinfo *resolved = NULL;
+    *dns_resolved = state.has_ip && getaddrinfo("example.com", NULL, &hints, &resolved) == 0;
+    if (resolved != NULL) freeaddrinfo(resolved);
+    return *gateway_reachable && *dns_resolved;
+}
+
 static cJSON *connectivity_response(const char *destination, const char *request_id)
 {
     network_state_t state;
     portENTER_CRITICAL(&s_lock);
     state = s_network;
     portEXIT_CRITICAL(&s_lock);
-    bool gateway_reachable = false;
-    unsigned a, b, c, d;
-    if (state.has_ip && sscanf(state.gateway, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
-        gateway_reachable = ping_host((uint8_t)a, (uint8_t)b, (uint8_t)c, (uint8_t)d);
-    }
-    struct addrinfo hints = {.ai_family = AF_INET, .ai_socktype = SOCK_STREAM};
-    struct addrinfo *resolved = NULL;
-    const bool dns_resolved = state.has_ip && getaddrinfo("example.com", NULL, &hints, &resolved) == 0;
-    if (resolved != NULL) freeaddrinfo(resolved);
+    bool gateway_reachable, dns_resolved;
+    const bool internet = check_internet_possible(state, &gateway_reachable, &dns_resolved);
     cJSON *root = new_envelope("response", destination);
     cJSON *payload = cJSON_AddObjectToObject(root, "payload");
     cJSON_AddStringToObject(payload, "request_id", request_id);
@@ -713,7 +803,7 @@ static cJSON *connectivity_response(const char *destination, const char *request
     cJSON_AddStringToObject(result, "gateway", state.gateway);
     cJSON_AddBoolToObject(result, "gateway_reachable", gateway_reachable);
     cJSON_AddBoolToObject(result, "dns_resolved", dns_resolved);
-    cJSON_AddBoolToObject(result, "internet_possible", gateway_reachable && dns_resolved);
+    cJSON_AddBoolToObject(result, "internet_possible", internet);
     return root;
 }
 
@@ -745,6 +835,205 @@ static cJSON *arp_snapshot_response(const char *destination, const char *request
     return root;
 }
 
+static const char *condition_name(uint8_t condition)
+{
+    return condition == RC_CONDITION_INTERNET ? "internet_possible" : "dhcp_assigned";
+}
+
+static const char *playbook_name(uint8_t playbook)
+{
+    return playbook == RC_PLAYBOOK_SNAPSHOT ? "system_snapshot" : "network_scout";
+}
+
+static bool start_rule_scout(const automation_rule_t *rule)
+{
+    bool launch = false;
+    const uint32_t job_id = next_sequence();
+    portENTER_CRITICAL(&s_lock);
+    if (s_scan.status != RC_SCAN_RUNNING) {
+        memset(&s_scan, 0, sizeof(s_scan));
+        s_scan.job_id = job_id;
+        s_scan.status = RC_SCAN_RUNNING;
+        s_scan.first_host = 1;
+        s_scan.last_host = 254;
+        s_scan.recurring = rule->interval_ms != 0;
+        s_scan.interval_ms = rule->interval_ms;
+        strlcpy(s_scan.rule_id, rule->id, sizeof(s_scan.rule_id));
+        strlcpy(s_scan.project_id, rule->project_id, sizeof(s_scan.project_id));
+        launch = true;
+    }
+    portEXIT_CRITICAL(&s_lock);
+    if (!launch) return false;
+    if (xTaskCreate(discovery_task, "rc_auto_scan", 4096, NULL, 4, NULL) != pdPASS) {
+        portENTER_CRITICAL(&s_lock);
+        s_scan.status = RC_SCAN_FAILED;
+        portEXIT_CRITICAL(&s_lock);
+        return false;
+    }
+    return true;
+}
+
+static void automation_task(void *argument)
+{
+    (void)argument;
+    for (;;) {
+        network_state_t network;
+        portENTER_CRITICAL(&s_lock);
+        network = s_network;
+        portEXIT_CRITICAL(&s_lock);
+        bool internet = false;
+        bool gateway, dns;
+        bool needs_internet = false;
+        for (size_t index = 0; index < RC_MAX_RULES; ++index) {
+            if (s_rules[index].version == 1 && s_rules[index].enabled &&
+                s_rules[index].condition == RC_CONDITION_INTERNET) needs_internet = true;
+        }
+        if (needs_internet && network.has_ip) internet = check_internet_possible(network, &gateway, &dns);
+        for (size_t index = 0; index < RC_MAX_RULES; ++index) {
+            automation_rule_t *rule = &s_rules[index];
+            if (rule->version != 1 || !rule->enabled) continue;
+            const bool matched = rule->condition == RC_CONDITION_INTERNET ? internet : network.has_ip;
+            if (!matched) {
+                s_rule_matched[index] = false;
+                continue;
+            }
+            if (s_rule_matched[index]) continue;
+            if (rule->playbook == RC_PLAYBOOK_SNAPSHOT) {
+                char empty_hosts[RC_SCAN_MAX_RESULTS][16] = {{0}};
+                queue_evidence(rule->id, rule->project_id, "system-snapshot", 1,
+                               empty_hosts, 0);
+                s_rule_matched[index] = true;
+            } else if (start_rule_scout(rule)) {
+                s_rule_matched[index] = true;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    }
+}
+
+static cJSON *automation_response(const char *destination, const char *request_id,
+                                  const char *operation, const cJSON *arguments)
+{
+    bool valid = true;
+    if (strcmp(operation, "put") == 0) {
+        const cJSON *rule_json = cJSON_GetObjectItemCaseSensitive(arguments, "rule");
+        const cJSON *id = cJSON_GetObjectItemCaseSensitive(rule_json, "id");
+        const cJSON *project = cJSON_GetObjectItemCaseSensitive(rule_json, "project_id");
+        const cJSON *condition = cJSON_GetObjectItemCaseSensitive(rule_json, "condition");
+        const cJSON *playbook = cJSON_GetObjectItemCaseSensitive(rule_json, "playbook");
+        const cJSON *interval = cJSON_GetObjectItemCaseSensitive(rule_json, "interval_ms");
+        const bool names_valid = cJSON_IsString(id) && strlen(id->valuestring) < 32 &&
+            cJSON_IsString(project) && project->valuestring[0] != '\0' && strlen(project->valuestring) < 64 &&
+            cJSON_IsString(condition) && cJSON_IsString(playbook) && cJSON_IsNumber(interval);
+        uint8_t condition_value = 0, playbook_value = 0;
+        if (names_valid) {
+            if (strcmp(condition->valuestring, "dhcp_assigned") == 0) condition_value = RC_CONDITION_DHCP;
+            if (strcmp(condition->valuestring, "internet_possible") == 0) condition_value = RC_CONDITION_INTERNET;
+            if (strcmp(playbook->valuestring, "network_scout") == 0) playbook_value = RC_PLAYBOOK_SCOUT;
+            if (strcmp(playbook->valuestring, "system_snapshot") == 0) playbook_value = RC_PLAYBOOK_SNAPSHOT;
+        }
+        const uint32_t interval_value = names_valid ? (uint32_t)interval->valuedouble : 0;
+        valid = names_valid && condition_value && playbook_value &&
+            (interval_value == 0 || (interval_value >= RC_RECUR_MIN_INTERVAL_MS &&
+                                     interval_value <= RC_RECUR_MAX_INTERVAL_MS));
+        int slot = -1;
+        if (valid) {
+            for (size_t index = 0; index < RC_MAX_RULES; ++index) {
+                if (strcmp(s_rules[index].id, id->valuestring) == 0) slot = (int)index;
+                if (slot < 0 && s_rules[index].version == 0) slot = (int)index;
+            }
+            valid = slot >= 0;
+        }
+        if (valid) {
+            automation_rule_t rule = {.version = 1, .enabled = true,
+                                      .condition = condition_value, .playbook = playbook_value,
+                                      .interval_ms = interval_value};
+            const cJSON *enabled = cJSON_GetObjectItemCaseSensitive(rule_json, "enabled");
+            if (cJSON_IsBool(enabled)) rule.enabled = cJSON_IsTrue(enabled);
+            strlcpy(rule.id, id->valuestring, sizeof(rule.id));
+            strlcpy(rule.project_id, project->valuestring, sizeof(rule.project_id));
+            s_rules[slot] = rule;
+            s_rule_matched[slot] = false;
+            valid = save_automation_blob(RC_AUTOMATION_RULES_KEY, s_rules, sizeof(s_rules));
+        }
+    } else if (strcmp(operation, "delete") == 0) {
+        const cJSON *id = cJSON_GetObjectItemCaseSensitive(arguments, "id");
+        valid = cJSON_IsString(id);
+        bool found = false;
+        if (valid) for (size_t index = 0; index < RC_MAX_RULES; ++index) {
+            if (strcmp(s_rules[index].id, id->valuestring) == 0) {
+                memset(&s_rules[index], 0, sizeof(s_rules[index]));
+                s_rule_matched[index] = false;
+                found = true;
+            }
+        }
+        valid = valid && found && save_automation_blob(RC_AUTOMATION_RULES_KEY, s_rules, sizeof(s_rules));
+    }
+    cJSON *root = new_envelope("response", destination);
+    cJSON *payload = cJSON_AddObjectToObject(root, "payload");
+    cJSON_AddStringToObject(payload, "request_id", request_id);
+    cJSON_AddStringToObject(payload, "status", valid ? "ok" : "rejected");
+    if (!valid) {
+        cJSON *error = cJSON_AddObjectToObject(payload, "error");
+        cJSON_AddStringToObject(error, "code", "INVALID_RULE");
+        cJSON_AddStringToObject(error, "message", "Rule is invalid, full, missing, or could not be persisted");
+    }
+    cJSON *result = cJSON_AddObjectToObject(payload, "result");
+    cJSON *rules = cJSON_AddArrayToObject(result, "rules");
+    for (size_t index = 0; index < RC_MAX_RULES; ++index) {
+        const automation_rule_t *rule = &s_rules[index];
+        if (rule->version != 1) continue;
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddStringToObject(item, "id", rule->id);
+        cJSON_AddStringToObject(item, "project_id", rule->project_id);
+        cJSON_AddStringToObject(item, "condition", condition_name(rule->condition));
+        cJSON_AddStringToObject(item, "playbook", playbook_name(rule->playbook));
+        cJSON_AddNumberToObject(item, "interval_ms", rule->interval_ms);
+        cJSON_AddBoolToObject(item, "enabled", rule->enabled);
+        cJSON_AddItemToArray(rules, item);
+    }
+    return root;
+}
+
+static cJSON *outbox_response(const char *destination, const char *request_id,
+                              bool acknowledge, const cJSON *arguments)
+{
+    if (acknowledge) {
+        const cJSON *sequence = cJSON_GetObjectItemCaseSensitive(arguments, "sequence");
+        if (cJSON_IsNumber(sequence)) {
+            for (size_t index = 0; index < RC_MAX_OUTBOX; ++index) {
+                if (s_outbox[index].sequence == (uint32_t)sequence->valuedouble) {
+                    memset(&s_outbox[index], 0, sizeof(s_outbox[index]));
+                }
+            }
+            save_automation_blob(RC_AUTOMATION_OUTBOX_KEY, s_outbox, sizeof(s_outbox));
+        }
+    }
+    cJSON *root = new_envelope("response", destination);
+    cJSON *payload = cJSON_AddObjectToObject(root, "payload");
+    cJSON_AddStringToObject(payload, "request_id", request_id);
+    cJSON_AddStringToObject(payload, "status", "ok");
+    cJSON *result = cJSON_AddObjectToObject(payload, "result");
+    cJSON *records = cJSON_AddArrayToObject(result, "records");
+    for (size_t index = 0; index < RC_MAX_OUTBOX; ++index) {
+        const outbox_record_t *record = &s_outbox[index];
+        if (record->version != 1) continue;
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddNumberToObject(item, "sequence", record->sequence);
+        cJSON_AddStringToObject(item, "rule_id", record->rule_id);
+        cJSON_AddStringToObject(item, "project_id", record->project_id);
+        cJSON_AddStringToObject(item, "kind", record->kind);
+        cJSON_AddStringToObject(item, "ip", record->ip);
+        cJSON_AddNumberToObject(item, "run_count", record->run_count);
+        cJSON *hosts = cJSON_AddArrayToObject(item, "hosts");
+        for (size_t host = 0; host < record->host_count; ++host) {
+            cJSON_AddItemToArray(hosts, cJSON_CreateString(record->hosts[host]));
+        }
+        cJSON_AddItemToArray(records, item);
+    }
+    return root;
+}
+
 static cJSON *announcement(void)
 {
     cJSON *root = new_envelope("announce", NULL);
@@ -761,10 +1050,16 @@ static cJSON *announcement(void)
     cJSON_AddItemToArray(capabilities, cJSON_CreateString("coordination.job.cancel"));
     cJSON_AddItemToArray(capabilities, cJSON_CreateString("net.connectivity.check"));
     cJSON_AddItemToArray(capabilities, cJSON_CreateString("net.arp.snapshot"));
+    cJSON_AddItemToArray(capabilities, cJSON_CreateString("automation.rule.put"));
+    cJSON_AddItemToArray(capabilities, cJSON_CreateString("automation.rule.list"));
+    cJSON_AddItemToArray(capabilities, cJSON_CreateString("automation.rule.delete"));
+    cJSON_AddItemToArray(capabilities, cJSON_CreateString("evidence.outbox.read"));
+    cJSON_AddItemToArray(capabilities, cJSON_CreateString("evidence.outbox.ack"));
     cJSON *descriptors = cJSON_AddArrayToObject(payload, "capability_descriptors");
     const char *ids[] = {"system.info", "net.discovery.scan", "coordination.job.status",
                          "coordination.job.cancel", "net.connectivity.check",
-                         "net.arp.snapshot"};
+                         "net.arp.snapshot", "automation.rule.put", "automation.rule.list",
+                         "automation.rule.delete", "evidence.outbox.read", "evidence.outbox.ack"};
     for (size_t index = 0; index < sizeof(ids) / sizeof(ids[0]); ++index) {
         cJSON *descriptor = cJSON_CreateObject();
         cJSON_AddStringToObject(descriptor, "id", ids[index]);
@@ -1002,9 +1297,22 @@ static esp_err_t message_handler(httpd_req_t *request)
     } else if (json_string_equals(capability, "net.arp.snapshot")) {
         response = arp_snapshot_response(source_id, id);
         response_status = "ok";
+    } else if (json_string_equals(capability, "automation.rule.put")) {
+        response = automation_response(source_id, id, "put", arguments);
+    } else if (json_string_equals(capability, "automation.rule.list")) {
+        response = automation_response(source_id, id, "list", arguments);
+    } else if (json_string_equals(capability, "automation.rule.delete")) {
+        response = automation_response(source_id, id, "delete", arguments);
+    } else if (json_string_equals(capability, "evidence.outbox.read")) {
+        response = outbox_response(source_id, id, false, arguments);
+    } else if (json_string_equals(capability, "evidence.outbox.ack")) {
+        response = outbox_response(source_id, id, true, arguments);
     } else {
         response = error_response(source_id, id, "CAPABILITY_UNAVAILABLE", "Capability is not available");
     }
+    const cJSON *output_payload = cJSON_GetObjectItemCaseSensitive(response, "payload");
+    const cJSON *output_status = cJSON_GetObjectItemCaseSensitive(output_payload, "status");
+    if (cJSON_IsString(output_status)) response_status = output_status->valuestring;
     authenticate_response(response, source_id, id, response_status, request_nonce,
                           authenticated_peer != NULL ? authenticated_peer->key : NULL);
     cJSON_Delete(input);
@@ -1138,7 +1446,9 @@ void app_main(void)
     esp_fill_random(s_boot_nonce, sizeof(s_boot_nonce));
     hex_encode(s_boot_nonce_hex, s_boot_nonce, sizeof(s_boot_nonce));
     load_pairing();
+    load_automation_state();
     xTaskCreate(grove_task, "grove_pairing", 4096, NULL, 5, NULL);
+    xTaskCreate(automation_task, "automation", 6144, NULL, 3, NULL);
     start_server();
     initialize_ethernet();
     ESP_LOGI(TAG, "Reconclave %s node %s started", RC_FIRMWARE_VERSION, s_device_id);

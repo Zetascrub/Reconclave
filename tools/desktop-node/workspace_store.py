@@ -122,7 +122,8 @@ class WorkspaceStore:
             now = int(time.time() * 1000)
             rule = {"id": f"rule-{uuid.uuid4().hex[:12]}", "project_id": project_id,
                     "node_id": node_id, "condition": condition, "playbook": playbook,
-                    "interval_ms": interval_ms, "enabled": True, "created_at_ms": now,
+                    "interval_ms": interval_ms, "enabled": True,
+                    "device_managed": body.get("device_managed") is True, "created_at_ms": now,
                     "updated_at_ms": now, "last_triggered_ms": 0, "last_error": ""}
             self.data["automations"].append(rule)
             self._commit()
@@ -135,6 +136,8 @@ class WorkspaceStore:
                 raise KeyError(rule_id)
             if "enabled" in body:
                 rule["enabled"] = body["enabled"] is True
+            if "device_managed" in body:
+                rule["device_managed"] = body["device_managed"] is True
             for key in ("last_triggered_ms", "last_error"):
                 if key in body:
                     rule[key] = body[key]

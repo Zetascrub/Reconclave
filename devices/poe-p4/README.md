@@ -22,6 +22,13 @@ interval after each completed pass, and can be stopped idempotently. Connectivit
 checks report Ethernet, DHCP, gateway reachability, DNS resolution, and a
 conservative `internet_possible` signal without executing arbitrary code.
 
+Up to four automation rules are stored in the P4's NVS. Each rule includes its
+project ID, condition, built-in playbook, enabled state, and optional recurring
+interval, so it survives loss of the coordinator and cold boots. Autonomous
+results enter a three-record NVS outbox. A trusted collector can read and
+acknowledge those records later; deterministic record IDs make repeated reads
+safe during interrupted synchronisation.
+
 The current fleet build embeds a unique key for each authorised coordinator.
 It authenticates the desktop primary at priority 100 and Cardputer secondary at
 priority 50; a signed, expiring lease prevents concurrent ownership and allows

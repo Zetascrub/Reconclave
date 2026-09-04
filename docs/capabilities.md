@@ -171,12 +171,16 @@ that doesn't exist.
 
 ## Conditional operations
 
-The desktop primary coordinator stores condition rules in its local workspace.
+The desktop primary coordinator mirrors condition rules in its local workspace,
+while capable providers store the authoritative rule in NVS.
 Rules select a node, one condition (`dhcp_assigned` or `internet_possible`), and
 one built-in playbook (`system_snapshot` or `network_scout`). A false-to-true
 condition edge triggers the playbook. Network Scout may then continue on the
 provider using the recurring contract above. Rules never contain commands,
 scripts, URLs, or arbitrary payload bytes: the allowlist is validated again by
 the backend, every node request uses provisioned authentication, and all output
-is attached to the selected project. The current rule engine polls every ten
-seconds and is active only while the desktop coordinator runs.
+is attached to the selected project. Providers expose authenticated
+`automation.rule.put`, `automation.rule.list`, and `automation.rule.delete`.
+Autonomous evidence is retained through cold boots and synchronised using
+`evidence.outbox.read` followed by `evidence.outbox.ack`; collectors must use a
+deterministic source-node/sequence ID before acknowledging it.

@@ -95,9 +95,44 @@ class AutomationEngine:
         while not self.stop_event.wait(10):
             snapshot = self.workspace.snapshot()
             nodes = {item["device_id"]: item for item in self.coordinator.state()["nodes"]}
+            for node in nodes.values():
+                if "evidence.outbox.read" not in node.get("capabilities", []):
+                    continue
+                try:
+                    response = self.coordinator.invoke(node["device_id"], "evidence.outbox.read", {})
+                    records = response.get("payload", {}).get("result", {}).get("records", [])
+                    for record in records:
+                        project_id = str(record.get("project_id", ""))
+                        if not any(item.get("id") == project_id for item in snapshot["projects"]):
+                            continue
+                        evidence_id = f"outbox-{node['device_id']}-{int(record['sequence'])}"
+                        self.workspace.add_evidence({
+                            "id": evidence_id, "project_id": project_id,
+                            "job_id": f"rule-{record.get('rule_id', '')}",
+                            "kind": record.get("kind", "node-evidence"),
+                            "title": f"Autonomous P4 result · {node['device_id']}",
+                            "summary": f"Rule {record.get('rule_id')} run {record.get('run_count', 1)}",
+                            "data": {**record, "source_node": node["device_id"]},
+                        })
+                        self.coordinator.invoke(node["device_id"], "evidence.outbox.ack",
+                                                {"sequence": record["sequence"]})
+                except Exception:
+                    pass
             active_ids = set()
             for rule in snapshot.get("automations", []):
-                if not rule.get("enabled"):
+                node = nodes.get(rule["node_id"])
+                if (not rule.get("device_managed") and node is not None and
+                        "automation.rule.put" in node.get("capabilities", [])):
+                    try:
+                        response = self.coordinator.invoke(rule["node_id"], "automation.rule.put",
+                                                          {"rule": rule})
+                        if response.get("payload", {}).get("status") == "ok":
+                            self.workspace.set_automation(rule["id"], {
+                                "device_managed": True, "last_error": ""})
+                    except Exception:
+                        pass
+                    continue
+                if not rule.get("enabled") or rule.get("device_managed"):
                     continue
                 active_ids.add(rule["id"])
                 try:
@@ -248,7 +283,18 @@ class AppHandler(BaseHTTPRequestHandler):
             if path == "/api/automations":
                 if body.get("operator_authorised") is not True:
                     raise PermissionError("explicit automation authorization acknowledgement is required")
-                self.send_json(201, self.server.workspace.create_automation(body))
+                rule = self.server.workspace.create_automation({**body, "device_managed": True})
+                try:
+                    response = self.server.coordinator.invoke(rule["node_id"], "automation.rule.put",
+                                                              {"rule": rule})
+                    accepted = response.get("payload", {}).get("status") == "ok"
+                except Exception:
+                    accepted = False
+                if not accepted:
+                    self.server.workspace.set_automation(rule["id"], {
+                        "enabled": False, "last_error": "Node refused durable rule"})
+                    raise ConnectionError("node refused durable rule")
+                self.send_json(201, rule)
                 return
             if path == "/api/jobs":
                 self.send_json(200, self.server.workspace.upsert_job(body))
@@ -282,8 +328,13 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             parts = path.strip("/").split("/")
             if len(parts) == 3 and parts[:2] == ["api", "automations"]:
-                self.send_json(200, self.server.workspace.set_automation(
-                    urllib.parse.unquote(parts[2]), body))
+                rule = self.server.workspace.set_automation(urllib.parse.unquote(parts[2]), body)
+                if rule.get("device_managed"):
+                    response = self.server.coordinator.invoke(rule["node_id"], "automation.rule.put",
+                                                              {"rule": rule})
+                    if response.get("payload", {}).get("status") != "ok":
+                        raise ConnectionError("node refused durable rule update")
+                self.send_json(200, rule)
                 return
             if len(parts) == 4 and parts[:2] == ["api", "nodes"] and parts[3] == "invoke":
                 capability = str(body.get("capability", ""))
@@ -316,12 +367,23 @@ class AppHandler(BaseHTTPRequestHandler):
         parts = path.strip("/").split("/")
         try:
             if len(parts) == 3 and parts[:2] == ["api", "automations"]:
-                self.send_json(200, self.server.workspace.delete_automation(
-                    urllib.parse.unquote(parts[2])))
+                rule_id = urllib.parse.unquote(parts[2])
+                rule = next((item for item in self.server.workspace.snapshot()["automations"]
+                             if item.get("id") == rule_id), None)
+                if rule is None:
+                    raise KeyError(rule_id)
+                if rule.get("device_managed"):
+                    response = self.server.coordinator.invoke(rule["node_id"],
+                                                              "automation.rule.delete", {"id": rule_id})
+                    if response.get("payload", {}).get("status") != "ok":
+                        raise ConnectionError("node refused durable rule deletion")
+                self.send_json(200, self.server.workspace.delete_automation(rule_id))
             else:
                 self.send_json(404, {"error": "not_found"})
         except KeyError as error:
             self.send_json(404, {"error": "not_found", "message": str(error)})
+        except ConnectionError as error:
+            self.send_json(502, {"error": "node_request_failed", "message": str(error)})
 
     def stream_events(self) -> None:
         try:
