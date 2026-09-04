@@ -19,6 +19,7 @@ from reconclave_node import ANNOUNCE_PATH, AUTH_TAG_BYTES, MESSAGE_PATH, PROTOCO
 
 NODE_TTL_SECONDS = 45.0
 REQUEST_TIMEOUT_SECONDS = 4.0
+REFRESH_INTERVAL_SECONDS = 12.0
 
 
 @dataclass
@@ -64,13 +65,33 @@ class Coordinator(ServiceListener):
         self.changed = threading.Condition(self.lock)
         self.revision = 1
         self.browser: ServiceBrowser | None = None
+        self.stopping = threading.Event()
+        self.refresh_thread: threading.Thread | None = None
 
     def start(self) -> None:
         self.browser = ServiceBrowser(self.zeroconf, "_reconclave._tcp.local.", self)
+        self.refresh_thread = threading.Thread(target=self._refresh_loop,
+                                               name="reconclave-refresh", daemon=True)
+        self.refresh_thread.start()
 
     def close(self) -> None:
+        self.stopping.set()
         if self.browser is not None:
             self.browser.cancel()
+        if self.refresh_thread is not None:
+            self.refresh_thread.join(timeout=1.0)
+
+    def _refresh_loop(self) -> None:
+        while not self.stopping.wait(REFRESH_INTERVAL_SECONDS):
+            with self.lock:
+                targets = [(peer.address, peer.port,
+                            str(peer.announcement.get("_service_name", "")))
+                           for peer in self.peers.values()]
+            for address, port, service_name in targets:
+                if self.stopping.is_set():
+                    return
+                self.refresh_peer(address, port, service_name)
+            self.expire()
 
     def _touch(self) -> None:
         self.revision += 1
@@ -184,7 +205,12 @@ class Coordinator(ServiceListener):
             if key is None:
                 raise PermissionError("the required trust-domain key is not configured")
             nonce = secrets.token_hex(8)
-            canonical = f"{self.node.node_id}|{device_id}|{request_id}|{capability}|{nonce}".encode()
+            boot_nonce = str(advertised.get("security", {}).get("boot_nonce", ""))
+            fields = [self.node.node_id, device_id, request_id, capability]
+            if boot_nonce:
+                fields.append(boot_nonce)
+            fields.append(nonce)
+            canonical = "|".join(fields).encode()
             payload["auth"] = {
                 "nonce": nonce,
                 "tag": hmac.new(key, canonical, hashlib.sha256).digest()[:AUTH_TAG_BYTES].hex(),
@@ -203,4 +229,9 @@ class Coordinator(ServiceListener):
             raise ConnectionError("node request failed") from error
         if result.get("payload", {}).get("request_id") != request_id:
             raise ConnectionError("node returned a mismatched response")
+        if device_id != self.node.node_id:
+            with self.changed:
+                current = self.peers.get(device_id)
+                if current is not None:
+                    current.last_seen = self.clock()
         return result

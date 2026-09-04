@@ -100,6 +100,38 @@ class CoordinatorTests(unittest.TestCase):
             result = self.coordinator.invoke("rc-peer", "net.discovery.scan", {"network": "192.0.2.0/24"})
         self.assertEqual(result["payload"]["status"], "ok")
 
+    def test_p4_style_request_signature_includes_boot_nonce(self):
+        announcement = self.announcement(capabilities=["net.discovery.scan"])
+        announcement["payload"]["security"] = {"boot_nonce": "abc123", "mode": "hmac-sha256-128"}
+        announcement["payload"]["capability_descriptors"] = [{
+            "id": "net.discovery.scan", "version": 1, "permission": "trusted",
+        }]
+        self.coordinator.peers["rc-peer"] = coordinator_module.Peer(
+            "rc-peer", "192.0.2.8", 8767, announcement, self.now)
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        captured = {}
+
+        def load_response(_response):
+            request = coordinator_module.json.loads(captured["request"].data)
+            payload = request["payload"]
+            canonical = (f"rc-local|rc-peer|{payload['request_id']}|net.discovery.scan|"
+                         f"abc123|{payload['auth']['nonce']}").encode()
+            expected = coordinator_module.hmac.new(
+                self.coordinator.execution_key, canonical,
+                coordinator_module.hashlib.sha256).digest()[:16].hex()
+            self.assertEqual(payload["auth"]["tag"], expected)
+            return {"payload": {"request_id": payload["request_id"], "status": "ok", "result": {}}}
+
+        def open_request(request, timeout):
+            captured["request"] = request
+            return response
+
+        with mock.patch.object(coordinator_module.urllib.request, "urlopen", side_effect=open_request), \
+             mock.patch.object(coordinator_module.json, "load", side_effect=load_response):
+            self.coordinator.invoke("rc-peer", "net.discovery.scan", {})
+
     def test_scan_scope_validation_is_bounded_and_consistent(self):
         desktop_module.validate_scan_arguments({
             "network": "192.0.2.0/24", "start_ip": "192.0.2.1", "end_ip": "192.0.2.42",

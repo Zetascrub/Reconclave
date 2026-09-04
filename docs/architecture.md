@@ -47,6 +47,13 @@ IPv4 `/24` or smaller, and the provider independently checks its local scope.
 The acknowledgement is UI/API state and is never presented to a provider as
 authorization in place of a signed engagement scope.
 
+Discovery liveness is confirmed by periodically fetching each peer's current
+announcement. mDNS add/update callbacks seed the roster, successful protocol
+traffic also refreshes liveness, and nodes are removed only after the normal
+expiry window passes without a successful confirmation. Browser-local job and
+activity state allows a UI reload to reconnect to provider-owned job status;
+the provider remains the source of truth for execution.
+
 ## Migration rule
 
 Ghostwire remains a reference implementation. A feature is migrated only by:

@@ -1,7 +1,19 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Activity, AppState, CapabilityDescriptor, ReconNode, ScanJob } from './types'
 
 const emptyState: AppState = { revision: 0, nodes: [], coordinator_id: '', updated_at_ms: 0 }
+
+function savedActivity(): Activity[] {
+  try {
+    const value = JSON.parse(localStorage.getItem('reconclave.activity') ?? '[]') as Array<Omit<Activity, 'time'> & { time: string }>
+    return value.slice(0, 8).map((item) => ({ ...item, time: new Date(item.time) }))
+  } catch { return [] }
+}
+
+function savedJob(): ScanJob | null {
+  try { return JSON.parse(localStorage.getItem('reconclave.scoutJob') ?? 'null') as ScanJob | null }
+  catch { return null }
+}
 
 function timeAgo(seconds: number) {
   if (seconds < 2) return 'just now'
@@ -45,12 +57,14 @@ function App() {
   const [connected, setConnected] = useState(false)
   const [busyCapability, setBusyCapability] = useState('')
   const [result, setResult] = useState<Record<string, unknown> | null>(null)
-  const [activity, setActivity] = useState<Activity[]>([])
+  const [activity, setActivity] = useState<Activity[]>(savedActivity)
   const [filter, setFilter] = useState('')
   const [scoutOpen, setScoutOpen] = useState(false)
   const [scope, setScope] = useState({ network: '', start: '', end: '' })
   const [authorised, setAuthorised] = useState(false)
-  const [scanJob, setScanJob] = useState<ScanJob | null>(null)
+  const [scoutError, setScoutError] = useState('')
+  const [scanJob, setScanJob] = useState<ScanJob | null>(savedJob)
+  const statusFailures = useRef(0)
 
   useEffect(() => {
     fetch('/api/state').then((response) => response.json()).then(setState).catch(() => setConnected(false))
@@ -63,6 +77,15 @@ function App() {
     events.onerror = () => setConnected(false)
     return () => events.close()
   }, [])
+
+  useEffect(() => {
+    localStorage.setItem('reconclave.activity', JSON.stringify(activity))
+  }, [activity])
+
+  useEffect(() => {
+    if (scanJob) localStorage.setItem('reconclave.scoutJob', JSON.stringify(scanJob))
+    else localStorage.removeItem('reconclave.scoutJob')
+  }, [scanJob])
 
   const nodes = useMemo(() => {
     const query = filter.trim().toLowerCase()
@@ -86,6 +109,10 @@ function App() {
       })
       const body = await response.json()
       if (!response.ok) throw new Error(body.message ?? body.error ?? 'Request failed')
+      if (body.payload?.status === 'rejected' || body.payload?.status === 'error') {
+        throw new Error(body.payload?.error?.message ?? body.payload?.error?.code ??
+          `Node returned ${body.payload.status}`)
+      }
       return body
     } catch (error) {
       throw error instanceof Error ? error : new Error('Request failed')
@@ -112,11 +139,13 @@ function App() {
     if (!selected) return
     setScope(defaultScope(selected.address))
     setAuthorised(false)
+    setScoutError('')
     setScoutOpen(true)
   }
 
   async function startScout() {
     if (!selected) return
+    setScoutError('')
     try {
       const body = await requestCapability(selected, 'net.discovery.scan', {
         network: scope.network, start_ip: scope.start, end_ip: scope.end,
@@ -127,6 +156,7 @@ function App() {
       addActivity({ title: 'Scout dispatched', detail: `${scope.start} → ${scope.end} via ${selected.device_id}`, tone: 'info' })
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Dispatch failed'
+      setScoutError(message)
       addActivity({ title: 'Scout refused', detail: message, tone: 'warn' })
     }
   }
@@ -139,12 +169,18 @@ function App() {
       try {
         const body = await requestCapability(provider, 'coordination.job.status')
         const next = { providerId: provider.device_id, ...body.payload?.result } as ScanJob
+        statusFailures.current = 0
         setScanJob(next)
         if (next.job_status === 'complete') {
           addActivity({ title: 'Scout complete', detail: `${next.hosts.length} responsive host${next.hosts.length === 1 ? '' : 's'} observed`, tone: 'ok' })
         }
       } catch (error) {
-        addActivity({ title: 'Scout telemetry lost', detail: error instanceof Error ? error.message : 'Status request failed', tone: 'warn' })
+        statusFailures.current += 1
+        const message = error instanceof Error ? error.message : 'Status request failed'
+        if (statusFailures.current >= 3) {
+          setScanJob((current) => current ? { ...current, job_status: 'failed', error: message } : current)
+          addActivity({ title: 'Scout telemetry lost', detail: message, tone: 'warn' })
+        }
       }
     }, 1000)
     return () => window.clearTimeout(timer)
@@ -203,6 +239,7 @@ function App() {
           <div className="job-progress"><div><span style={{ width: `${scanJob.total ? Math.min(100, scanJob.checked / scanJob.total * 100) : 0}%` }} /></div><small>{scanJob.checked} / {scanJob.total} ADDRESSES</small></div>
           <div className="job-hosts"><strong>{scanJob.hosts?.length ?? 0}</strong><small>HOSTS</small></div>
           <span className={`status-pill ${scanJob.job_status}`}><i />{scanJob.job_status}</span>
+          {scanJob.error && <small className="job-error">{scanJob.error}</small>}
           {scanJob.job_status === 'running' && state.nodes.find((node) => node.device_id === scanJob.providerId)?.capabilities.includes('coordination.job.cancel') && <button className="abort" onClick={cancelScout}>ABORT</button>}
           {scanJob.job_status !== 'running' && <button className="dismiss" onClick={() => setScanJob(null)}>DISMISS</button>}
         </section>}
@@ -266,6 +303,7 @@ function App() {
           </div>
           <div className="scope-note"><strong>BOUNDARY ENFORCEMENT</strong><p>The coordinator permits IPv4 /24 or smaller. The provider independently verifies that this scope is locally attached.</p></div>
           <label className="authorise"><input type="checkbox" checked={authorised} onChange={(event) => setAuthorised(event.target.checked)} /><span><strong>I confirm this network is authorised for assessment.</strong><small>This acknowledgement is required for every dispatched Scout operation.</small></span></label>
+          {scoutError && <div className="modal-error"><strong>DISPATCH REFUSED</strong><span>{scoutError}</span></div>}
           <div className="modal-actions"><button className="secondary" onClick={() => setScoutOpen(false)}>CANCEL</button><button className="primary" disabled={!authorised || !scope.network || !scope.start || !scope.end || !!busyCapability} onClick={startScout}>{busyCapability ? 'DISPATCHING…' : 'DISPATCH SCOUT'}</button></div>
         </section>
       </div>}

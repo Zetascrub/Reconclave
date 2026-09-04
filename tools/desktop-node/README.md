@@ -39,6 +39,19 @@ acknowledgements, IPv6, scopes broader than `/24`, reversed ranges, and network
 or broadcast addresses. Providers still enforce their own attached-network
 scope before execution.
 
+The coordinator actively revalidates discovered nodes every 12 seconds rather
+than treating the initial mDNS callback as a permanent health signal. Active
+Scout state and recent activity are retained in browser-local storage, so a
+page refresh resumes status polling instead of presenting an empty session.
+Protocol-level `rejected` and `error` responses are shown as failures even
+though the HTTP transport itself succeeded.
+
+The P4 paired profile currently trusts one peer identity provisioned over
+Grove. A desktop coordinator cannot operate a P4 already paired exclusively to
+a Cardputer; the P4 will return `AUTHENTICATION_REQUIRED`. The UI now reports
+that refusal explicitly. Multi-coordinator trust is a future trust-model change,
+not something the desktop should bypass.
+
 For UI development, run `npm run dev` in `web/` while `desktop_app.py` is
 running; Vite proxies `/api` requests to port 8767.
 
