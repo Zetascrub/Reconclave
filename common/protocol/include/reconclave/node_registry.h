@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <string>
+#include <deque>
 #include <vector>
 
 namespace reconclave {
@@ -24,7 +25,8 @@ class NodeRegistry {
   std::size_t size() const { return nodes_.size(); }
 
  private:
-  std::vector<NodeRecord> nodes_;
+  // Discovery inserts must not invalidate pointers returned for other live nodes.
+  std::deque<NodeRecord> nodes_;
 };
 
 }  // namespace reconclave

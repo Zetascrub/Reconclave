@@ -44,7 +44,7 @@ def exact_keys(value: dict[str, Any], required: set[str], optional: set[str] = s
 def validate_payload(message_type: str, payload: dict[str, Any], source: str) -> None:
     if message_type == "announce":
         exact_keys(payload, {"device_id", "device_type", "firmware", "roles", "capabilities", "status"},
-                   {"security"})
+                   {"security", "capability_descriptors", "resources"})
         identifier(payload["device_id"], "device_id")
         identifier(payload["device_type"], "device_type")
         require(payload["device_id"] == source, "announcement identity differs from source_node")
@@ -63,6 +63,40 @@ def validate_payload(message_type: str, payload: dict[str, Any], source: str) ->
         require(all(isinstance(item, str) and CAPABILITY.fullmatch(item) for item in capabilities),
                 "invalid capability")
         require(len(capabilities) == len(set(capabilities)), "duplicate capability")
+        descriptors = payload.get("capability_descriptors", [])
+        require(isinstance(descriptors, list) and len(descriptors) <= 64,
+                "invalid capability descriptors")
+        described = set()
+        for descriptor in descriptors:
+            require(isinstance(descriptor, dict), "capability descriptor must be an object")
+            exact_keys(descriptor, {"id", "version", "permission"}, {"features", "limits"})
+            require(descriptor["id"] in capabilities, "descriptor capability is not advertised")
+            require(descriptor["id"] not in described, "duplicate capability descriptor")
+            described.add(descriptor["id"])
+            require(isinstance(descriptor["version"], int) and 1 <= descriptor["version"] <= 65535,
+                    "invalid capability version")
+            require(descriptor["permission"] in {"public", "trusted"},
+                    "invalid capability permission")
+            features = descriptor.get("features", [])
+            require(isinstance(features, list) and len(features) <= 16 and
+                    all(isinstance(item, str) and IDENTIFIER.fullmatch(item) for item in features),
+                    "invalid capability features")
+            limits = descriptor.get("limits", {})
+            require(isinstance(limits, dict), "capability limits must be an object")
+            exact_keys(limits, set(), {"weight", "max_concurrency"})
+            for key, maximum in (("weight", 100), ("max_concurrency", 1024)):
+                value = limits.get(key, 1)
+                require(isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= maximum,
+                        f"invalid capability {key}")
+        resources = payload.get("resources", {})
+        require(isinstance(resources, dict), "resources must be an object")
+        exact_keys(resources, set(), {"network_mbps", "persistent_storage", "storage_free_bytes"})
+        for key in ("network_mbps", "storage_free_bytes"):
+            value = resources.get(key, 0)
+            require(isinstance(value, int) and not isinstance(value, bool) and value >= 0,
+                    f"invalid resource {key}")
+        require(isinstance(resources.get("persistent_storage", False), bool),
+                "invalid persistent_storage resource")
         require(payload["status"] in NODE_STATUSES, "invalid node status")
     elif message_type == "request":
         exact_keys(payload, {"request_id", "capability", "arguments"}, {"auth"})

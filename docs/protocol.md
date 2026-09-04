@@ -17,6 +17,15 @@ describe participation while capabilities describe callable behaviour, so the
 Cardputer ADV can be both `node` and `coordinator` without becoming a permanent
 master.
 
+The required `capabilities` string array is the compatibility index. Nodes may
+also publish `capability_descriptors` containing an `id`, independent capability
+`version`, `permission` (`public` or `trusted`), optional `features`, and optional
+`limits` such as scheduling `weight` and `max_concurrency`. Optional `resources`
+describe the current node (including link speed and persistent storage). A
+coordinator must ignore unknown descriptor fields and fall back to weight 1 when a
+legacy node only publishes capability strings. Selection must not depend on
+`device_type`; that value is informational hardware identity, not policy.
+
 ## Initial capability
 
 `system.info` is the v0.1 proof capability. It is read-only and returns device
@@ -55,7 +64,8 @@ The schema proves shape, not trust. Until node authentication, integrity,
 replay protection, capability permissions, and engagement-scope enforcement
 are implemented, transports must expose only benign information capabilities.
 
-`coordination.job.cancel` and `storage.evidence.write` are the first exception:
+`net.discovery.scan`, `coordination.job.cancel`, and `storage.evidence.write` are
+currently protected by per-request authentication:
 they are not benign, so they carry their own per-request signature and replay
 check (a shared-passphrase HMAC, not the general session authentication this
 section otherwise describes) — see "Authenticated capabilities" in

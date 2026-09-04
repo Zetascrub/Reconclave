@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reconclave.dev/schemas/reconclave-1-evidence.json",
+  "title": "Reconclave evidence record",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["evidence_id", "job_id", "source_node", "target", "timestamp_ms", "observation"],
+  "properties": {
+    "evidence_id": { "type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,160}$" },
+    "job_id": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$" },
+    "source_node": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$" },
+    "target": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "timestamp_ms": { "type": "integer", "minimum": 1 },
+    "project_id": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$" },
+    "scope_id": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$" },
+    "scope_revision": { "type": "integer", "minimum": 1 },
+    "observation": { "type": "object" }
+  }
+}

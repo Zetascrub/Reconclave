@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reconclave.dev/schemas/reconclave-1-task.json",
+  "title": "Reconclave durable recurring task",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task_id", "capability", "arguments", "schedule", "scope"],
+  "properties": {
+    "task_id": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$" },
+    "capability": { "type": "string", "pattern": "^[a-z0-9_-]+(\\.[a-z0-9_-]+)+$" },
+    "arguments": { "type": "object" },
+    "schedule": { "type": "object", "additionalProperties": false,
+      "required": ["interval_ms", "after_completion", "policy"], "properties": {
+        "interval_ms": { "type": "integer", "minimum": 1000 },
+        "after_completion": { "const": true },
+        "policy": { "enum": ["independent", "callback"] },
+        "owner_coordinator": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$" },
+        "callback_endpoint": { "type": "string", "pattern": "^http://", "maxLength": 256 },
+        "max_failures": { "type": "integer", "minimum": 1, "maximum": 10, "default": 3 }
+      } },
+    "scope": { "$ref": "scope.schema.json" }
+  },
+  "allOf": [{ "if": { "properties": { "schedule": { "properties": {
+      "policy": { "const": "callback" } } } } },
+    "then": { "properties": { "schedule": {
+      "required": ["owner_coordinator", "callback_endpoint", "max_failures"] } } } }]
+}

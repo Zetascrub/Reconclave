@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reconclave.dev/schemas/reconclave-1-scope.json",
+  "title": "Reconclave immutable engagement scope revision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["project_id", "scope_id", "revision", "allow", "exclude"],
+  "properties": {
+    "project_id": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$" },
+    "scope_id": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$" },
+    "revision": { "type": "integer", "minimum": 1 },
+    "expires_at_ms": { "type": "integer", "minimum": 1 },
+    "allow": { "type": "array", "minItems": 1, "maxItems": 64, "uniqueItems": true,
+      "items": { "type": "string", "maxLength": 64 } },
+    "exclude": { "type": "array", "maxItems": 64, "uniqueItems": true,
+      "items": { "type": "string", "maxLength": 64 } },
+    "operations": { "type": "array", "maxItems": 64, "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^[a-z0-9_-]+(\\.[a-z0-9_-]+)+$" } },
+    "authorised_by": { "type": "string", "maxLength": 128 },
+    "signature": { "type": "object" }
+  }
+}

@@ -19,6 +19,8 @@ import socket
 import threading
 import time
 import uuid
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -30,9 +32,11 @@ ANNOUNCE_PATH = "/reconclave/v1/announce"
 MESSAGE_PATH = "/reconclave/v1/message"
 MAX_EVIDENCE_RECORD_BYTES = 16 * 1024
 EVIDENCE_REQUIRED_FIELDS = ("job_id", "source_node", "target", "timestamp_ms", "observation")
-# These two capabilities can write persistent state or stop someone else's job, so
-# unlike the read-only capabilities they require a signed, replay-checked request.
-AUTH_REQUIRED_CAPABILITIES = {"storage.evidence.write", "coordination.job.cancel"}
+# Assessment, persistent writes, and job control all cross a trust boundary. A node
+# only advertises these handlers when a key is configured and verifies every call.
+AUTH_REQUIRED_CAPABILITIES = {
+    "net.discovery.scan", "storage.evidence.write", "coordination.job.cancel",
+}
 AUTH_TAG_BYTES = 16
 RECENT_NONCES_PER_SOURCE = 16
 
@@ -62,7 +66,7 @@ def local_ip() -> str:
 class Node:
     def __init__(self, node_id: str, name: str, address: str, port: int,
                  enable_network_scan: bool = False, evidence_dir: str | None = None,
-                 evidence_key: str | None = None) -> None:
+                 evidence_key: str | None = None, execution_key: str | None = None) -> None:
         self.node_id = node_id
         self.name = name
         self.address = address
@@ -77,10 +81,14 @@ class Node:
             "recurring": False, "run_count": 0,
         }
         self.evidence_dir = evidence_dir
+        if self.evidence_dir is not None:
+            os.makedirs(self.evidence_dir, exist_ok=True)
         self.evidence_lock = threading.Lock()
+        self.evidence_ids: set[str] = set()
         # The passphrase itself is never stored, only its digest - mirrors how the
         # Cardputer's Grove-paired peer key is kept.
-        self.auth_key = hashlib.sha256(evidence_key.encode()).digest() if evidence_key else None
+        self.evidence_key = hashlib.sha256(evidence_key.encode()).digest() if evidence_key else None
+        self.execution_key = hashlib.sha256(execution_key.encode()).digest() if execution_key else None
         self.nonce_lock = threading.Lock()
         self.recent_nonces: dict[str, collections.deque] = {}
         # Announcements are generated from this dispatcher. Adding a handler
@@ -89,19 +97,40 @@ class Node:
             "system.info": self.system_info,
             "desktop.resources": self.desktop_resources,
         }
-        if enable_network_scan:
+        if enable_network_scan and self.execution_key is not None:
             self.capability_handlers["net.discovery.scan"] = self.start_network_scan
             self.capability_handlers["coordination.job.status"] = self.network_scan_status
-            if self.auth_key is not None:
+            if self.execution_key is not None:
                 self.capability_handlers["coordination.job.cancel"] = self.cancel_network_scan
-        if evidence_dir is not None and self.auth_key is not None:
+        if evidence_dir is not None and self.evidence_key is not None:
             self.capability_handlers["storage.evidence.write"] = self.write_evidence
+        if enable_network_scan and self.execution_key is not None:
+            self.restore_scan_task()
+
+    def capability_descriptor(self, capability: str) -> dict:
+        descriptor = {
+            "id": capability,
+            "version": 1,
+            "permission": "trusted" if capability in AUTH_REQUIRED_CAPABILITIES else "public",
+            "features": [],
+            "limits": {"weight": 1, "max_concurrency": 1},
+        }
+        if capability == "net.discovery.scan":
+            descriptor["features"] = ["ipv4", "range"]
+            if self.evidence_dir is not None:
+                descriptor["features"] += [
+                    "recurring", "after_completion", "independent", "callback", "durable"
+                ]
+            descriptor["limits"] = {"weight": 4, "max_concurrency": 1}
+        elif capability == "storage.evidence.write":
+            descriptor["features"] = ["jsonl"]
+        return descriptor
 
     def verify_auth(self, source_node: str, destination_node: str, request_id: str,
                      capability: str, auth: object) -> None:
         """Raises CapabilityError unless `auth` is a valid, fresh signature over this
         exact request. Only called for capabilities in AUTH_REQUIRED_CAPABILITIES,
-        which are only ever registered once self.auth_key is set."""
+        which are registered only when their corresponding trust-domain key exists."""
         if not isinstance(auth, dict):
             raise CapabilityError("UNAUTHENTICATED", "request is not signed")
         nonce = str(auth.get("nonce", ""))
@@ -109,7 +138,10 @@ class Node:
         if not nonce or not tag_hex:
             raise CapabilityError("UNAUTHENTICATED", "request is not signed")
         canonical = f"{source_node}|{destination_node}|{request_id}|{capability}|{nonce}".encode()
-        expected = hmac.new(self.auth_key, canonical, hashlib.sha256).digest()[:AUTH_TAG_BYTES]
+        key = self.evidence_key if capability == "storage.evidence.write" else self.execution_key
+        if key is None:
+            raise CapabilityError("UNAUTHENTICATED", "trust key is not configured")
+        expected = hmac.new(key, canonical, hashlib.sha256).digest()[:AUTH_TAG_BYTES]
         try:
             supplied = bytes.fromhex(tag_hex)
         except ValueError:
@@ -161,7 +193,45 @@ class Node:
         with self.scan_lock:
             if self.scan_state["job_status"] == "running":
                 self.scan_state["recurring"] = False
+            self.remove_scan_task()
             return self.network_scan_status_unlocked()
+
+    @property
+    def scan_task_path(self) -> str | None:
+        return os.path.join(self.evidence_dir, "recurring-scan-task.json") if self.evidence_dir else None
+
+    def save_scan_task(self, arguments: dict) -> None:
+        path = self.scan_task_path
+        if path is None:
+            return
+        os.makedirs(self.evidence_dir, exist_ok=True)
+        temporary = path + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump({"active": True, "arguments": arguments}, handle, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+
+    def remove_scan_task(self) -> None:
+        path = self.scan_task_path
+        if path:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+    def restore_scan_task(self) -> None:
+        path = self.scan_task_path
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with open(path, encoding="utf-8") as handle:
+                stored = json.load(handle)
+            if stored.get("active") and isinstance(stored.get("arguments"), dict):
+                self.start_network_scan(stored["arguments"])
+        except (OSError, ValueError, TypeError):
+            # Preserve the file for operator recovery; do not execute malformed state.
+            return
 
     @staticmethod
     def _parse_schedule(arguments: dict) -> int | None:
@@ -187,6 +257,17 @@ class Node:
                         first == network.network_address or last == network.broadcast_address):
                     raise ValueError("scan range must contain usable addresses inside network")
                 interval_ms = self._parse_schedule(arguments)
+                schedule = arguments.get("schedule", {})
+                policy = str(schedule.get("policy", "independent"))
+                callback_endpoint = str(schedule.get("callback_endpoint", ""))
+                owner_coordinator = str(schedule.get("owner_coordinator", ""))
+                if interval_ms is not None and self.evidence_dir is None:
+                    raise ValueError("durable recurring scans require evidence storage")
+                if policy not in ("independent", "callback"):
+                    raise ValueError("unsupported recurring policy")
+                if policy == "callback" and (not callback_endpoint.startswith("http://") or
+                                              not owner_coordinator):
+                    raise ValueError("callback policy requires coordinator identity and endpoint")
             except ValueError as error:
                 self.scan_state = {
                     "job_status": "failed", "checked": 0, "total": 0, "hosts": [], "error": str(error),
@@ -200,7 +281,11 @@ class Node:
                 "job_status": "running", "checked": 0, "total": len(hosts), "hosts": [], "error": "",
                 "recurring": interval_ms is not None, "run_count": 0,
             }
-        threading.Thread(target=self._scan_network, args=(hosts, interval_ms), daemon=True).start()
+        threading.Thread(target=self._scan_network,
+                         args=(hosts, interval_ms, dict(arguments.get("schedule", {}))),
+                         daemon=True).start()
+        if interval_ms is not None:
+            self.save_scan_task(arguments)
         return self.network_scan_status({})
 
     def network_scan_status_unlocked(self) -> dict:
@@ -228,7 +313,23 @@ class Node:
                 sock.close()
         return False
 
-    def _scan_network(self, hosts: list[str], interval_ms: int | None) -> None:
+    def _callback_coordinator_reachable(self, schedule: dict) -> bool:
+        endpoint = str(schedule.get("callback_endpoint", "")).rstrip("/")
+        owner = str(schedule.get("owner_coordinator", ""))
+        if not endpoint or not owner:
+            return False
+        if not endpoint.endswith(ANNOUNCE_PATH):
+            endpoint += ANNOUNCE_PATH
+        try:
+            with urllib.request.urlopen(endpoint, timeout=1.5) as response:
+                document = json.load(response)
+            payload = document.get("payload", {})
+            return payload.get("device_id") == owner and "coordinator" in payload.get("roles", [])
+        except (OSError, ValueError, urllib.error.URLError):
+            return False
+
+    def _scan_network(self, hosts: list[str], interval_ms: int | None,
+                      schedule: dict) -> None:
         while True:
             try:
                 with ThreadPoolExecutor(max_workers=32, thread_name_prefix="recon-scan") as pool:
@@ -251,6 +352,22 @@ class Node:
                 return
             if not still_recurring or interval_ms is None:
                 return
+            if schedule.get("policy", "independent") == "callback":
+                maximum = max(1, min(10, int(schedule.get("max_failures", 3))))
+                reachable = False
+                for attempt in range(maximum):
+                    if self._callback_coordinator_reachable(schedule):
+                        reachable = True
+                        break
+                    if attempt + 1 < maximum and self.scan_cancelled.wait(5 * (2 ** attempt)):
+                        return
+                if not reachable:
+                    with self.scan_lock:
+                        self.scan_state["job_status"] = "stopped"
+                        self.scan_state["recurring"] = False
+                        self.scan_state["error"] = "coordinator callback lease expired"
+                    self.remove_scan_task()
+                    return
             # after_completion semantics: the interval is measured from this run's
             # end, so a slow pass never overlaps the next one.
             if self.scan_cancelled.wait(interval_ms / 1000):
@@ -270,15 +387,30 @@ class Node:
         if len(encoded.encode()) > MAX_EVIDENCE_RECORD_BYTES:
             raise CapabilityError("INVALID_REQUEST", "evidence record exceeds size limit")
         assert self.evidence_dir is not None  # capability is only registered when set
+        evidence_id = str(record.get("evidence_id", ""))
+        if not evidence_id:
+            evidence_id = hashlib.sha256(encoded.encode()).hexdigest()[:32]
+            record["evidence_id"] = evidence_id
+            encoded = json.dumps(record, separators=(",", ":"))
         try:
             os.makedirs(self.evidence_dir, exist_ok=True)
             day = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
             path = os.path.join(self.evidence_dir, f"evidence-{day}.jsonl")
-            with self.evidence_lock, open(path, "a", encoding="utf-8") as handle:
-                handle.write(encoded + "\n")
+            with self.evidence_lock:
+                duplicate = evidence_id in self.evidence_ids
+                if not duplicate:
+                    with open(path, "a", encoding="utf-8") as handle:
+                        handle.write(encoded + "\n")
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    self.evidence_ids.add(evidence_id)
         except OSError as error:
             raise CapabilityError("STORAGE_UNAVAILABLE", str(error)[:160], status="error") from error
-        return {"stored": True}
+        canonical = f"{self.node_id}|{evidence_id}|stored".encode()
+        assert self.evidence_key is not None
+        receipt = hmac.new(self.evidence_key, canonical, hashlib.sha256).digest()[:AUTH_TAG_BYTES].hex()
+        return {"stored": True, "duplicate": duplicate, "evidence_id": evidence_id,
+                "receipt": {"tag": receipt}}
 
     def envelope(self, message_type: str, destination: str | None = None) -> dict:
         with self.lock:
@@ -305,6 +437,15 @@ class Node:
             "firmware": FIRMWARE,
             "roles": ["node"],
             "capabilities": sorted(self.capability_handlers),
+            "capability_descriptors": [
+                self.capability_descriptor(capability)
+                for capability in sorted(self.capability_handlers)
+            ],
+            "resources": {
+                "network_mbps": 1000,
+                "persistent_storage": self.evidence_dir is not None,
+                "storage_free_bytes": shutil.disk_usage(self.evidence_dir or "/").free,
+            },
             "status": "ready",
         }
         return message
@@ -388,6 +529,12 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("invalid body length")
             request = json.loads(self.rfile.read(length))
             status, response = self.server.node.respond(request)
+            capability = request.get("payload", {}).get("capability", "unknown") if isinstance(request, dict) else "unknown"
+            response_payload = response.get("payload", {})
+            outcome = response_payload.get("status", "unknown")
+            error_code = response_payload.get("error", {}).get("code", "")
+            print(f"request capability={capability} outcome={outcome}" +
+                  (f" error={error_code}" if error_code else ""), flush=True)
             self.send_json(status, response)
         except (ValueError, json.JSONDecodeError):
             self.send_json(400, {"error": "invalid_json"})
@@ -415,13 +562,17 @@ def main() -> None:
     parser.add_argument("--evidence-dir", default=None,
                         help="advertise storage.evidence.write and append records under this directory")
     parser.add_argument("--evidence-key", default=None,
-                        help="shared passphrase required to sign storage.evidence.write and "
-                             "coordination.job.cancel requests; must match the coordinator's key. "
-                             "Neither capability is advertised without it")
+                        help="shared passphrase for evidence writes and storage receipts")
+    parser.add_argument("--execution-key", default=None,
+                        help="shared passphrase for trusted scan and job-control requests")
     args = parser.parse_args()
+    if args.enable_network_scan and not args.execution_key:
+        parser.error("--execution-key is required with --enable-network-scan")
+    if args.evidence_dir and not args.evidence_key:
+        parser.error("--evidence-key is required with --evidence-dir")
 
     node = Node(args.node_id, args.name, args.address, args.port, args.enable_network_scan,
-                args.evidence_dir, args.evidence_key)
+                args.evidence_dir, args.evidence_key, args.execution_key)
     server = NodeServer(("0.0.0.0", args.port), node)
     service = ServiceInfo(
         "_reconclave._tcp.local.",

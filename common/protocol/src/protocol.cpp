@@ -115,6 +115,26 @@ ValidationResult validate(const NodeAnnouncement& value) {
     if (!isValidCapability(capability)) result.reject("invalid capability: " + capability);
     if (!unique.insert(capability).second) result.reject("duplicate capability: " + capability);
   }
+  std::unordered_set<std::string> described;
+  for (const auto& descriptor : value.capability_descriptors) {
+    if (!isValidCapability(descriptor.id)) result.reject("invalid capability descriptor");
+    if (unique.find(descriptor.id) == unique.end()) {
+      result.reject("descriptor references unadvertised capability: " + descriptor.id);
+    }
+    if (!described.insert(descriptor.id).second) {
+      result.reject("duplicate capability descriptor: " + descriptor.id);
+    }
+    if (descriptor.version == 0 || descriptor.version > 65535) result.reject("invalid capability version");
+    if (descriptor.permission != "public" && descriptor.permission != "trusted") {
+      result.reject("invalid capability permission");
+    }
+    if (descriptor.features.size() > kMaxCapabilityFeatures) result.reject("too many capability features");
+    for (const auto& feature : descriptor.features) requireIdentifier(result, feature, "capability feature");
+    if (descriptor.weight == 0 || descriptor.weight > 100) result.reject("invalid capability weight");
+    if (descriptor.max_concurrency == 0 || descriptor.max_concurrency > 1024) {
+      result.reject("invalid capability concurrency");
+    }
+  }
   if (value.status != "ready" && value.status != "busy" && value.status != "degraded") {
     result.reject("unknown node status");
   }

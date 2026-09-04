@@ -11,6 +11,7 @@ inline constexpr std::size_t kMaxCapabilities = 64;
 inline constexpr std::size_t kMaxRoles = 4;
 inline constexpr std::size_t kMaxPayloadBytes = 16 * 1024;
 inline constexpr std::size_t kMaxErrorMessageBytes = 256;
+inline constexpr std::size_t kMaxCapabilityFeatures = 16;
 
 enum class MessageType { Announce, Request, Response, Event, Stream, Unknown };
 enum class ResponseStatus { Accepted, Ok, Rejected, Error, Unknown };
@@ -27,12 +28,29 @@ struct Envelope {
   std::string payload_json;
 };
 
+struct CapabilityDescriptor {
+  std::string id;
+  unsigned version{1};
+  std::string permission{"public"};
+  std::vector<std::string> features;
+  std::uint32_t weight{1};
+  std::uint32_t max_concurrency{1};
+};
+
+struct NodeResources {
+  std::uint32_t network_mbps{0};
+  bool persistent_storage{false};
+  std::uint64_t storage_free_bytes{0};
+};
+
 struct NodeAnnouncement {
   std::string device_id;
   std::string device_type;
   std::string firmware;
   std::vector<std::string> roles{"node"};
   std::vector<std::string> capabilities;
+  std::vector<CapabilityDescriptor> capability_descriptors;
+  NodeResources resources;
   std::string status{"ready"};
 };
 

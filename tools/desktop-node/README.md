@@ -14,12 +14,13 @@ as evidence that a host is present. Only scan networks you own or are authorised
 to assess. It is disabled by default; explicitly enable it with:
 
 ```bash
-.venv-desktop-node/bin/python tools/desktop-node/reconclave_node.py --enable-network-scan
+.venv-desktop-node/bin/python tools/desktop-node/reconclave_node.py \
+    --enable-network-scan --execution-key "shared execution passphrase"
 ```
 
 When enabled, the desktop appears automatically among the Cardputer Scout
-providers. Without the flag, those capabilities are neither advertised nor
-callable.
+providers. The scan capability is only registered when both the flag and a
+execution key are present; otherwise it is neither advertised nor callable.
 
 `net.discovery.scan` accepts an optional `schedule: {"interval_ms": N,
 "after_completion": true}` argument to run repeatedly until stopped with
@@ -29,18 +30,19 @@ and `run_count`. See `docs/capabilities.md` for the full contract.
 Passing `--evidence-dir PATH` advertises `storage.evidence.write`, making this
 node an Evidence Collector: any coordinator that knows about it will forward a
 copy of evidence it produces or observes, appended as JSON Lines under
-`PATH/evidence-YYYYMMDD.jsonl`. `storage.evidence.write` and
-`coordination.job.cancel` can write state or stop a job, so **neither is
-advertised without also passing `--evidence-key`** — a shared passphrase that
-must match the coordinator's (on the Cardputer: Settings > Trust > Evidence
-key). Every request to these two capabilities is signed and checked against
+`PATH/evidence-YYYYMMDD.jsonl`. `net.discovery.scan`,
+`storage.evidence.write`, and `coordination.job.cancel` assess or change
+external state. Scan and job control require `--execution-key`; evidence custody
+requires the separate `--evidence-key`. Each must match the corresponding key on
+the coordinator (Cardputer: Settings > Trust). Every request is signed and checked against
 recently-seen nonces; an unsigned, wrongly-signed, or replayed request is
 rejected with `UNAUTHENTICATED`. See "Authenticated capabilities" in
 `docs/capabilities.md` for the exact signature scheme.
 
 ```bash
 .venv-desktop-node/bin/python tools/desktop-node/reconclave_node.py \
-    --evidence-dir ~/reconclave-evidence --evidence-key "correct horse battery staple"
+    --enable-network-scan --execution-key "execution passphrase" \
+    --evidence-dir ~/reconclave-evidence --evidence-key "evidence passphrase"
 ```
 
 Create an isolated environment and run it from the repository root:

@@ -552,21 +552,34 @@ static cJSON *scan_response(const char *destination, const char *request_id,
         portENTER_CRITICAL(&s_lock);
         if (s_scan.status != RC_SCAN_RUNNING) {
             memset(&s_scan, 0, sizeof(s_scan));
-            s_scan.status = RC_SCAN_RUNNING;
             s_scan.job_id = candidate_job_id;
-            s_scan.first_host = 1;
-            s_scan.last_host = 254;
+            s_scan.status = RC_SCAN_FAILED;
             const cJSON *start_ip = cJSON_GetObjectItemCaseSensitive(arguments, "start_ip");
             const cJSON *end_ip = cJSON_GetObjectItemCaseSensitive(arguments, "end_ip");
-            unsigned a, b, c, first, last;
+            const cJSON *network = cJSON_GetObjectItemCaseSensitive(arguments, "network");
+            unsigned local_a, local_b, local_c, local_d;
+            unsigned start_a, start_b, start_c, first;
+            unsigned end_a, end_b, end_c, last;
+            char expected_network[24] = {0};
+            const bool local_valid = sscanf(s_network.ip, "%u.%u.%u.%u", &local_a, &local_b,
+                                            &local_c, &local_d) == 4;
+            if (local_valid) snprintf(expected_network, sizeof(expected_network), "%u.%u.%u.0/24",
+                                      local_a, local_b, local_c);
             if (cJSON_IsString(start_ip) && cJSON_IsString(end_ip) &&
-                sscanf(start_ip->valuestring, "%u.%u.%u.%u", &a, &b, &c, &first) == 4 &&
-                sscanf(end_ip->valuestring, "%u.%u.%u.%u", &a, &b, &c, &last) == 4 &&
+                cJSON_IsString(network) && local_valid &&
+                strcmp(network->valuestring, expected_network) == 0 &&
+                sscanf(start_ip->valuestring, "%u.%u.%u.%u", &start_a, &start_b, &start_c, &first) == 4 &&
+                sscanf(end_ip->valuestring, "%u.%u.%u.%u", &end_a, &end_b, &end_c, &last) == 4 &&
+                start_a == local_a && start_b == local_b && start_c == local_c &&
+                end_a == local_a && end_b == local_b && end_c == local_c &&
                 first >= 1 && first <= last && last <= 254) {
                 s_scan.first_host = (uint8_t)first;
                 s_scan.last_host = (uint8_t)last;
+                s_scan.status = RC_SCAN_RUNNING;
+                launch = true;
+            } else {
+                snprintf(s_scan.error, sizeof(s_scan.error), "Scope outside attached /24");
             }
-            launch = true;
         }
         portEXIT_CRITICAL(&s_lock);
         if (launch && xTaskCreate(discovery_task, "rc_discovery", 4096, NULL, 4, NULL) != pdPASS) {
@@ -612,6 +625,27 @@ static cJSON *announcement(void)
     cJSON_AddItemToArray(capabilities, cJSON_CreateString("system.info"));
     cJSON_AddItemToArray(capabilities, cJSON_CreateString("net.discovery.scan"));
     cJSON_AddItemToArray(capabilities, cJSON_CreateString("coordination.job.status"));
+    cJSON *descriptors = cJSON_AddArrayToObject(payload, "capability_descriptors");
+    const char *ids[] = {"system.info", "net.discovery.scan", "coordination.job.status"};
+    for (size_t index = 0; index < sizeof(ids) / sizeof(ids[0]); ++index) {
+        cJSON *descriptor = cJSON_CreateObject();
+        cJSON_AddStringToObject(descriptor, "id", ids[index]);
+        cJSON_AddNumberToObject(descriptor, "version", 1);
+        cJSON_AddStringToObject(descriptor, "permission", "trusted");
+        cJSON *features = cJSON_AddArrayToObject(descriptor, "features");
+        if (index == 1) {
+            cJSON_AddItemToArray(features, cJSON_CreateString("ipv4"));
+            cJSON_AddItemToArray(features, cJSON_CreateString("range"));
+        }
+        cJSON *limits = cJSON_AddObjectToObject(descriptor, "limits");
+        cJSON_AddNumberToObject(limits, "weight", index == 1 ? 2 : 1);
+        cJSON_AddNumberToObject(limits, "max_concurrency", 1);
+        cJSON_AddItemToArray(descriptors, descriptor);
+    }
+    cJSON *resources = cJSON_AddObjectToObject(payload, "resources");
+    cJSON_AddNumberToObject(resources, "network_mbps", 100);
+    cJSON_AddBoolToObject(resources, "persistent_storage", false);
+    cJSON_AddNumberToObject(resources, "storage_free_bytes", 0);
     cJSON_AddStringToObject(payload, "status", "ready");
     cJSON *security = cJSON_AddObjectToObject(payload, "security");
     cJSON_AddBoolToObject(security, "paired", s_peer_key_valid);

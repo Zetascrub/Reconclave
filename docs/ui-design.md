@@ -3,9 +3,30 @@
 Status: living standard
 Applies to: Cardputer ADV, K230, and future embedded coordinators/nodes
 
-Reconclave should feel like a calm field instrument: dark, legible, deliberate,
-and useful under poor lighting. Device size may change, but navigation,
-information priority, terminology, and colour meaning must remain consistent.
+Reconclave should feel like a professional cyberdeck: expressive, dark,
+legible, deliberate, and useful under poor lighting. Its visual language may
+borrow the energy of hacker cinema and near-future games, but atmosphere never
+obscures evidence, state, scope, or safety. Device size may change, but
+navigation, information priority, terminology, and colour meaning remain
+consistent.
+
+## 0. Cyberdeck identity
+
+The interface balances two modes:
+
+- **Instrument mode** owns working screens. Geometry is stable, copy is calm,
+  and animation communicates real state.
+- **Atmosphere mode** owns boot, title, idle, discovery transitions, and
+  completion moments. It may be cinematic, but must remain interruptible where
+  doing so is safe.
+
+Avoid generic green-code decoration, fake warnings, meaningless percentages,
+or glitches that resemble display faults. Ornament should suggest topology,
+radio activity, packets, trust boundaries, and evidence flow.
+
+The Cardputer home screen is a hybrid mission-control dashboard: a thin live
+status line, one focused mission card, compact paging, and keyboard-first
+navigation. It is neither a wall of status tiles nor a plain application list.
 
 ## 1. Product principles
 
@@ -115,6 +136,40 @@ truncation.
 
 Never use pale text on a bright surface. Colour reinforces meaning but is
 never the only way state is communicated.
+
+### Theme personalities
+
+Themes alter palette, chrome motif, animation treatment, idle presentation,
+title card, and audio pitch family while preserving semantic meaning:
+
+| Theme | Personality | Motion and chrome |
+| --- | --- | --- |
+| Neon Grid | Cyan/teal trusted-network deck | topology cuts, clean traces, precise motion |
+| Night City | Violet, electric blue, and hot-magenta operator console | asymmetric rails, energetic sweeps, sharp cuts |
+| Amber CRT | Warm phosphor field terminal | inset frames, subtle scan texture, measured motion |
+
+Theme decoration must remain outside text safe areas. Themes may never change
+navigation behavior, safety level, or the meaning of a state colour.
+
+## 6.1 Motion and rendering
+
+- Compose a complete frame off-screen and present it atomically whenever RAM
+  permits. Never expose a sequence of clears and individual widget draws.
+- Redraw only when model state, focus, or an animated region changes.
+- Static screens do not run a continuous render loop.
+- Working animation targets 20–30 fps; boot animation targets 30 fps.
+- Prefer moving a bounded region over clearing the full screen.
+- Transitions last 90–180 ms and must not delay input or network servicing.
+- Flicker is an intentional rare glitch accent only; it is never a transition.
+- Long operations update at a bounded cadence and preserve stable result rows.
+
+## 6.2 Sound language
+
+Interface audio is optional and restrained. It provides short cues for focus,
+open, back, confirmation, warning, completion, and boot identity. Navigation
+tones should normally remain below 30 ms; warnings may be longer but must not
+loop. Themes may change pitch family, not semantic meaning. Sound volume and
+enable state persist, and every cue must have a visible equivalent.
 
 ## 7. Standard components
 

@@ -17,8 +17,14 @@ void expect(bool condition, const std::string& description) {
 }
 
 reconclave::NodeAnnouncement p4Announcement() {
-  return {"rc-p4-01", "poe-p4", "0.1.0", {"node"},
-          {"system.info", "net.discovery.scan", "net.tcp.connect"}, "ready"};
+  reconclave::NodeAnnouncement result;
+  result.device_id = "rc-p4-01";
+  result.device_type = "poe-p4";
+  result.firmware = "0.1.0";
+  result.capabilities = {"system.info", "net.discovery.scan", "net.tcp.connect"};
+  result.capability_descriptors = {
+      {"net.discovery.scan", 1, "trusted", {"ipv4", "range"}, 2, 1}};
+  return result;
 }
 
 }  // namespace
@@ -50,6 +56,9 @@ int main() {
   expect(validate(p4).valid, "valid node announcement is accepted");
   p4.capabilities.push_back("net.discovery.scan");
   expect(!validate(p4).valid, "duplicate capabilities are rejected");
+  p4 = p4Announcement();
+  p4.capability_descriptors[0].id = "radio.ble.scan";
+  expect(!validate(p4).valid, "descriptor cannot reference an unadvertised capability");
 
   CapabilityResponse accepted{"req-1", ResponseStatus::Accepted, "job-1", "{}", "", ""};
   expect(validate(accepted).valid, "accepted asynchronous response has a job id");

@@ -23,6 +23,37 @@
       "uniqueItems": true,
       "items": { "type": "string", "maxLength": 96, "pattern": "^[a-z0-9_-]+(\\.[a-z0-9_-]+)+$" }
     },
+    "capability_descriptors": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "version", "permission"],
+        "properties": {
+          "id": { "type": "string", "maxLength": 96, "pattern": "^[a-z0-9_-]+(\\.[a-z0-9_-]+)+$" },
+          "version": { "type": "integer", "minimum": 1, "maximum": 65535 },
+          "permission": { "enum": ["public", "trusted"] },
+          "features": { "type": "array", "maxItems": 16, "uniqueItems": true, "items": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$" } },
+          "limits": {
+            "type": "object", "additionalProperties": false,
+            "properties": {
+              "weight": { "type": "integer", "minimum": 1, "maximum": 100 },
+              "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 1024 }
+            }
+          }
+        }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "network_mbps": { "type": "integer", "minimum": 0 },
+        "persistent_storage": { "type": "boolean" },
+        "storage_free_bytes": { "type": "integer", "minimum": 0 }
+      }
+    },
     "status": { "enum": ["ready", "busy", "degraded"] }
     ,
     "security": {

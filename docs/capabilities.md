@@ -4,6 +4,15 @@ Capability identifiers are lowercase dotted namespaces. Every remotely
 available action must have a documented input, output, permission class, and
 scope behaviour.
 
+Capability discovery is data-driven. The string in `capabilities` remains the
+portable lookup key; an optional matching descriptor supplies version, trust
+permission, feature flags, scheduling weight, and concurrency. Coordinators
+must select on those fields and current resources, never on a table of hardware
+model names. A new board therefore becomes usable by implementing a transport,
+advertising standard capability IDs, and accurately describing its limits. It
+does not require a coordinator firmware change unless it introduces a genuinely
+new capability contract.
+
 | Capability | Initial provider | Permission | v0.1 status |
 |---|---|---|---|
 | `system.info` | All nodes | Read-only, non-sensitive | Contract defined |
@@ -30,16 +39,18 @@ remote execution until their permission and scope enforcement is implemented.
 
 ## Authenticated capabilities
 
-`coordination.job.cancel` and `storage.evidence.write` can write persistent state or
-stop someone else's job, so unlike the read-only capabilities they require a signed,
+`net.discovery.scan`, `coordination.job.cancel`, and `storage.evidence.write` can
+assess networks, write persistent state, or stop someone else's job, so unlike the read-only capabilities they require a signed,
 replay-checked request rather than the "reserved" development posture above. A node
-must not advertise or accept either one until it has an **evidence key** configured —
-a shared passphrase entered identically on the coordinator and on the provider
-(Cardputer: Settings > Trust > Evidence key; desktop node: `--evidence-key`). Both
+must not advertise or accept one until its trust domain is configured. Network scans
+and job control use an **execution key**; evidence writes and receipts use a separate
+**evidence key**. Passphrases are entered identically on the coordinator and provider
+(Cardputer: Settings > Trust; desktop: `--execution-key` and `--evidence-key`). Both
 sides derive a 32-byte key via SHA-256 of the UTF-8 passphrase; the passphrase itself
-is never stored, only its digest.
+is never stored, only its digest. A physical pairing transport may provision a root
+relationship and derive these domains rather than requiring typed passphrases.
 
-Every request to these two capabilities carries an `auth` object alongside the usual
+Every request to these capabilities carries an `auth` object alongside the usual
 envelope:
 
 ```json
@@ -70,7 +81,17 @@ request `arguments`:
   "capability": "net.discovery.scan",
   "arguments": {
     "network": "192.168.8.0/24",
-    "schedule": { "interval_ms": 300000, "after_completion": true }
+    "project_id": "PR001193",
+    "scope_id": "default",
+    "scope_revision": 1,
+    "schedule": {
+      "interval_ms": 300000,
+      "after_completion": true,
+      "policy": "callback",
+      "owner_coordinator": "rc-adv-01",
+      "callback_endpoint": "http://192.168.8.20:8766",
+      "max_failures": 3
+    }
   }
 }
 ```
@@ -83,6 +104,13 @@ minting a new one; `coordination.job.status` additionally reports
 restarts. The job does not become `complete`/`cancelled` until it is
 explicitly stopped with `coordination.job.cancel`, which providers must accept
 as idempotent — calling it with nothing running still returns `ok`.
+
+`policy` is either `independent` or `callback`. Independent tasks continue from
+their durable node-owned definition. Callback tasks verify that the named
+coordinator remains reachable after each completed run; checks are bounded and
+do not overlap the next run. Three consecutive failures stop the task. Providers
+advertise the matching `independent` and/or `callback` feature only when they
+implement that policy durably.
 
 ## `storage.evidence.write` — Evidence Collector
 
