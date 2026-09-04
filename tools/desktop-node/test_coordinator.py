@@ -177,6 +177,32 @@ class CoordinatorTests(unittest.TestCase):
                 "network": "192.0.2.0/24", "start_ip": "192.0.2.42", "end_ip": "192.0.2.1",
             })
 
+    def test_host_inspection_rejects_unapproved_or_external_targets(self):
+        with self.assertRaises(PermissionError):
+            desktop_module.inspect_hosts("192.0.2.10", {"hosts": ["192.0.2.20"], "ports": [80]})
+        with self.assertRaises(ValueError):
+            desktop_module.inspect_hosts("192.0.2.10", {
+                "operator_authorised": True, "hosts": ["198.51.100.2"], "ports": [80],
+            })
+        with self.assertRaises(ValueError):
+            desktop_module.inspect_hosts("192.0.2.10", {
+                "operator_authorised": True, "hosts": ["192.0.2.20"], "ports": [0],
+            })
+
+    def test_host_inspection_reports_only_open_ports(self):
+        connection = mock.MagicMock()
+        connection.__enter__.return_value = connection
+        connection.connect_ex.side_effect = lambda target: 0 if target[1] == 443 else 111
+        with mock.patch.object(desktop_module.socket, "socket", return_value=connection):
+            result = desktop_module.inspect_hosts("192.0.2.10", {
+                "operator_authorised": True,
+                "hosts": ["192.0.2.20"], "ports": [80, 443],
+            })
+        self.assertEqual(result["checked"], 2)
+        self.assertEqual(result["hosts"], [{
+            "address": "192.0.2.20", "open_ports": [443], "checked_ports": 2,
+        }])
+
     def test_trust_store_selects_unique_peer_keys(self):
         with __import__("tempfile").TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "fleet.json"

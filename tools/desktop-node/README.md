@@ -42,8 +42,13 @@ scope before execution.
 The primary rail also provides persistent **Projects**, **Jobs**, **Evidence**,
 and **Map** workspaces. Create a project before dispatching Scout to archive its
 job lifecycle and a deduplicated network-host evidence summary. Map view can be
-switched between a dynamic node graph and a sortable/filterable list, scoped to
-one project or the complete local archive. Workspace metadata is written
+switched between an interactive node graph and a sortable/filterable list.
+Selecting one host reveals its identity, status, capabilities, prior evidence,
+and latest observed ports; multiple hosts can be selected for a bounded TCP
+inspection using common, web, or custom port sets. Inspection is limited to 16
+hosts and 128 ports on the desktop's attached `/24`, requires an explicit
+authorisation acknowledgement, and archives its job and evidence in the active
+project. Evidence cards open a full structured-data viewer. Workspace metadata is written
 atomically to the ignored `.reconclave-data/workspace.json` file with owner-only
 permissions; override it with `--workspace-store` when a separate case store is
 required.

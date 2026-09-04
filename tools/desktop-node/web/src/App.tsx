@@ -104,6 +104,15 @@ function App() {
     setProjectId(project.id)
   }
 
+  async function inspectSelectedHosts(hosts: string[], ports: number[]) {
+    const response = await fetch('/api/inspect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hosts, ports, project_id: projectId, operator_authorised: true }) })
+    const result = await response.json()
+    if (!response.ok) throw new Error(result.message ?? result.error ?? 'Host inspection failed')
+    await refreshWorkspace()
+    addActivity({ title: 'TCP inspection complete', detail: `${hosts.length} host${hosts.length === 1 ? '' : 's'} · ${ports.length} ports`, tone: 'ok' })
+    return result
+  }
+
   useEffect(() => {
     localStorage.setItem('reconclave.activity', JSON.stringify(activity))
   }, [activity])
@@ -325,7 +334,7 @@ function App() {
             </div>
           </div>
         </section>
-      </> : <WorkspaceViews view={view} workspace={workspace} nodes={state.nodes} projectId={projectId} onProject={setProjectId} onCreate={createProject} />}</main>
+      </> : <WorkspaceViews view={view} workspace={workspace} nodes={state.nodes} projectId={projectId} onProject={setProjectId} onCreate={createProject} onInspect={inspectSelectedHosts} />}</main>
       {scoutOpen && selected && <div className="modal-shade" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setScoutOpen(false) }}>
         <section className="scout-modal" role="dialog" aria-modal="true" aria-labelledby="scout-title">
           <div className="modal-head"><div><span className="kicker">SCOPED OPERATION</span><h2 id="scout-title">Configure Network Scout</h2><p>Provider: {selected.device_id}</p></div><button onClick={() => setScoutOpen(false)} aria-label="Close">×</button></div>

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import ipaddress
 import json
 import mimetypes
@@ -12,6 +13,7 @@ import pathlib
 import signal
 import socket
 import threading
+import time
 import urllib.parse
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,6 +28,49 @@ WEB_ROOT = pathlib.Path(__file__).parent / "web" / "dist"
 DEFAULT_TRUST_STORE = pathlib.Path(__file__).resolve().parents[2] / ".reconclave-provisioning" / "fleet.json"
 DEFAULT_WORKSPACE_STORE = pathlib.Path(__file__).resolve().parents[2] / ".reconclave-data" / "workspace.json"
 MAX_BODY_BYTES = 16 * 1024
+MAX_INSPECTION_HOSTS = 16
+MAX_INSPECTION_PORTS = 128
+
+
+def inspect_hosts(local_address: str, body: dict) -> dict:
+    if body.get("operator_authorised") is not True:
+        raise PermissionError("explicit host inspection authorization acknowledgement is required")
+    local = ipaddress.ip_address(local_address)
+    network = ipaddress.ip_network(f"{local}/24", strict=False)
+    raw_hosts = body.get("hosts", [])
+    raw_ports = body.get("ports", [])
+    if not isinstance(raw_hosts, list) or not 1 <= len(raw_hosts) <= MAX_INSPECTION_HOSTS:
+        raise ValueError(f"hosts must contain 1-{MAX_INSPECTION_HOSTS} addresses")
+    if not isinstance(raw_ports, list) or not 1 <= len(raw_ports) <= MAX_INSPECTION_PORTS:
+        raise ValueError(f"ports must contain 1-{MAX_INSPECTION_PORTS} values")
+    hosts = []
+    for value in dict.fromkeys(str(item) for item in raw_hosts):
+        address = ipaddress.ip_address(value)
+        if address.version != 4 or address not in network or address in (network.network_address, network.broadcast_address):
+            raise ValueError("every target must be a usable address on the attached /24")
+        hosts.append(str(address))
+    ports = []
+    for value in dict.fromkeys(raw_ports):
+        port = int(value)
+        if not 1 <= port <= 65535:
+            raise ValueError("ports must be between 1 and 65535")
+        ports.append(port)
+
+    def probe(pair: tuple[str, int]) -> tuple[str, int, bool]:
+        host, port = pair
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as connection:
+            connection.settimeout(0.35)
+            return host, port, connection.connect_ex((host, port)) == 0
+
+    results = {host: [] for host in hosts}
+    pairs = [(host, port) for host in hosts for port in ports]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(64, len(pairs))) as pool:
+        for host, port, opened in pool.map(probe, pairs):
+            if opened:
+                results[host].append(port)
+    return {"hosts": [{"address": host, "open_ports": sorted(results[host]),
+                        "checked_ports": len(ports)} for host in hosts],
+            "ports": sorted(ports), "checked": len(pairs)}
 
 
 def validate_scan_arguments(arguments: dict) -> None:
@@ -123,6 +168,30 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/evidence":
                 self.send_json(201, self.server.workspace.add_evidence(body))
+                return
+            if path == "/api/inspect":
+                result = inspect_hosts(self.server.node.address, body)
+                project_id = str(body.get("project_id", ""))
+                job_id = f"inspect-{uuid.uuid4().hex[:12]}"
+                if project_id:
+                    self.server.workspace.upsert_job({
+                        "id": job_id, "project_id": project_id,
+                        "provider_id": self.server.node.node_id,
+                        "capability": "net.tcp.inspect", "status": "complete",
+                        "checked": result["checked"], "total": result["checked"],
+                        "hosts": [item["address"] for item in result["hosts"]],
+                        "scope": {"ports": result["ports"]},
+                    })
+                    self.server.workspace.add_evidence({
+                        "id": f"{job_id}-tcp", "project_id": project_id,
+                        "job_id": job_id, "kind": "tcp-services",
+                        "title": f"TCP inspection · {len(result['hosts'])} host(s)",
+                        "summary": f"{sum(len(item['open_ports']) for item in result['hosts'])} open ports observed",
+                        "data": result,
+                    })
+                result["job_id"] = job_id
+                result["captured_at_ms"] = int(time.time() * 1000)
+                self.send_json(200, result)
                 return
             parts = path.strip("/").split("/")
             if len(parts) == 4 and parts[:2] == ["api", "nodes"] and parts[3] == "invoke":
