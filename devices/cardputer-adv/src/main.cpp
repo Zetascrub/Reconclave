@@ -2101,15 +2101,18 @@ bool evidenceRequestAuthenticated(const String& source, const String& destinatio
 
 bool executionRequestAuthenticated(const String& source, const String& destination,
                                    const String& requestId, const char* capability,
-                                   JsonVariantConst auth) {
-  if (!executionKeyValid) return false;
+                                   JsonVariantConst auth, String& nonceOut) {
+  if (!executionKeyValid || source != RC_PROVISIONED_PRIMARY_ID) return false;
   const String nonce = auth["nonce"] | "";
   const char* tagHex = auth["tag"] | "";
-  if (nonce.isEmpty() || tagHex == nullptr || strlen(tagHex) != kTagBytes * 2) return false;
+  const int priority = auth["coordinator_priority"] | -1;
+  const uint32_t leaseMs = auth["lease_ms"] | 0;
+  if (nonce.isEmpty() || tagHex == nullptr || strlen(tagHex) != kTagBytes * 2 ||
+      priority != 100 || leaseMs < 1000 || leaseMs > 60000) return false;
   if (std::find(recentExecutionNonces.begin(), recentExecutionNonces.end(), nonce) !=
       recentExecutionNonces.end()) return false;
   const String canonical = source + "|" + destination + "|" + requestId + "|" + capability +
-      "|" + nodeBootNonceHex + "|" + nonce;
+      "|" + nodeBootNonceHex + "|" + nonce + "|" + String(priority) + "|" + String(leaseMs);
   uint8_t expectedTag[kTagBytes];
   uint8_t suppliedTag[kTagBytes];
   if (!computeExecutionTag(canonical, expectedTag) ||
@@ -2117,7 +2120,23 @@ bool executionRequestAuthenticated(const String& source, const String& destinati
       !constantTimeEqual(expectedTag, suppliedTag, sizeof(expectedTag))) return false;
   recentExecutionNonces.push_back(nonce);
   if (recentExecutionNonces.size() > kRecentNonceCount) recentExecutionNonces.erase(recentExecutionNonces.begin());
+  nonceOut = nonce;
   return true;
+}
+
+void authenticateExecutionResponse(JsonDocument& response, const String& destination,
+                                   const String& requestId, const String& nonce) {
+  JsonObject payload = response["payload"];
+  const String status = payload["status"] | "rejected";
+  const String canonical = deviceId + "|" + destination + "|" + requestId + "|" + status +
+      "|" + nodeBootNonceHex + "|" + nonce;
+  uint8_t tag[kTagBytes];
+  if (!computeExecutionTag(canonical, tag)) return;
+  char tagHex[kTagBytes * 2 + 1];
+  hexEncode(tagHex, tag, sizeof(tag));
+  JsonObject auth = payload["auth"].to<JsonObject>();
+  auth["nonce"] = nonce;
+  auth["tag"] = tagHex;
 }
 
 void addRemoteScanResult(JsonObject payload, const String& requestId) {
@@ -2152,6 +2171,8 @@ void handleMessage() {
   const String capability = request["payload"]["capability"] | "";
   JsonDocument response;
   addEnvelope(response, "response", source);
+  String executionNonce;
+  bool executionAuthenticated = false;
   if (error || String(request["proto"] | "") != kProtocol ||
       String(request["type"] | "") != "request" ||
       String(request["destination_node"] | "") != deviceId) {
@@ -2162,8 +2183,9 @@ void handleMessage() {
     if (participationMode == ParticipationMode::CoordinatorOnly || !executionKeyValid ||
         !capabilityEnabled(deviceId, capability)) {
       addErrorPayload(response, requestId, "CAPABILITY_UNAVAILABLE", "Capability is not available");
-    } else if (!executionRequestAuthenticated(source, deviceId, requestId, capability.c_str(),
-                                               request["payload"]["auth"])) {
+    } else if (!(executionAuthenticated = executionRequestAuthenticated(
+                     source, deviceId, requestId, capability.c_str(),
+                     request["payload"]["auth"], executionNonce))) {
       addErrorPayload(response, requestId, "UNAUTHENTICATED", "request is not signed or was replayed");
     } else if (capability == "coordination.job.cancel") {
       remoteHostScan.stop();
@@ -2267,6 +2289,9 @@ void handleMessage() {
     result["uptime_ms"] = millis();
     result["free_memory_bytes"] = ESP.getFreeHeap();
     result["ip"] = WiFi.localIP().toString();
+  }
+  if (executionAuthenticated) {
+    authenticateExecutionResponse(response, source, requestId, executionNonce);
   }
   sendServerJson(response);
 }
