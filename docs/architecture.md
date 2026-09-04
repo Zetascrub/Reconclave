@@ -27,6 +27,20 @@ adapters own framing and JSON conversion; the domain layer validates the
 decoded values. This lets both current devices compile the same rules and
 prevents the coordinator from being the only trust boundary.
 
+## Desktop coordinator
+
+The desktop runtime is a protocol participant and local application server. Its
+Python process owns mDNS, node expiry, authenticated request signing, and LAN
+traffic. The React interface receives roster changes over a server-sent event
+stream and sends operator actions to loopback-only JSON endpoints. Browsers do
+not discover nodes, hold trust-domain keys, or contact assessment nodes
+directly.
+
+The public LAN listener exposes only the Reconclave announcement and message
+endpoints. Coordinator APIs reject non-loopback clients. This permits the same
+process to act as a node, coordinator, or both without turning the browser UI
+into a remote control surface.
+
 ## Migration rule
 
 Ghostwire remains a reference implementation. A feature is migrated only by:

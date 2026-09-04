@@ -1,0 +1,101 @@
+from __future__ import annotations
+
+import importlib.util
+import pathlib
+import sys
+import types
+import unittest
+from unittest import mock
+
+
+fake_zeroconf = sys.modules.get("zeroconf", types.ModuleType("zeroconf"))
+fake_zeroconf.ServiceBrowser = mock.MagicMock
+fake_zeroconf.ServiceInfo = mock.MagicMock
+fake_zeroconf.ServiceListener = object
+fake_zeroconf.Zeroconf = mock.MagicMock
+sys.modules["zeroconf"] = fake_zeroconf
+
+HERE = pathlib.Path(__file__).parent
+node_spec = importlib.util.spec_from_file_location("reconclave_node", HERE / "reconclave_node.py")
+node_module = importlib.util.module_from_spec(node_spec)
+assert node_spec.loader is not None
+node_spec.loader.exec_module(node_module)
+sys.modules["reconclave_node"] = node_module
+coordinator_spec = importlib.util.spec_from_file_location("coordinator", HERE / "coordinator.py")
+coordinator_module = importlib.util.module_from_spec(coordinator_spec)
+assert coordinator_spec.loader is not None
+sys.modules["coordinator"] = coordinator_module
+coordinator_spec.loader.exec_module(coordinator_module)
+
+
+class CoordinatorTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 100.0
+        self.node = node_module.Node("rc-local", "Local", "127.0.0.1", 8767)
+        self.node.roles = ["node", "coordinator"]
+        self.coordinator = coordinator_module.Coordinator(
+            self.node, mock.MagicMock(), execution_key="test execution",
+            clock=lambda: self.now)
+
+    def announcement(self, device_id="rc-peer", capabilities=None):
+        return {
+            "proto": "reconclave/1", "type": "announce",
+            "payload": {
+                "device_id": device_id, "device_type": "test-node", "firmware": "0.1",
+                "roles": ["node"], "capabilities": capabilities or ["system.info"],
+                "capability_descriptors": [], "resources": {}, "status": "ready",
+            },
+        }
+
+    def test_refresh_adds_peer_and_expiry_removes_it(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        with mock.patch.object(coordinator_module.urllib.request, "urlopen", return_value=response), \
+             mock.patch.object(coordinator_module.json, "load", return_value=self.announcement()):
+            self.assertTrue(self.coordinator.refresh_peer("192.0.2.8", 8767, "peer.local"))
+        state = self.coordinator.state()
+        self.assertEqual([item["device_id"] for item in state["nodes"]], ["rc-local", "rc-peer"])
+        self.now += coordinator_module.NODE_TTL_SECONDS + 1
+        self.assertEqual([item["device_id"] for item in self.coordinator.state()["nodes"]], ["rc-local"])
+
+    def test_invoke_rejects_unadvertised_capability_without_network_request(self):
+        peer = coordinator_module.Peer("rc-peer", "192.0.2.8", 8767,
+                                       self.announcement(), self.now)
+        self.coordinator.peers[peer.device_id] = peer
+        with mock.patch.object(coordinator_module.urllib.request, "urlopen") as opener:
+            with self.assertRaisesRegex(ValueError, "not advertised"):
+                self.coordinator.invoke("rc-peer", "net.discovery.scan", {})
+            opener.assert_not_called()
+
+    def test_trusted_invoke_is_signed_with_execution_domain(self):
+        announcement = self.announcement(capabilities=["net.discovery.scan"])
+        announcement["payload"]["capability_descriptors"] = [{
+            "id": "net.discovery.scan", "version": 1, "permission": "trusted",
+            "features": [], "limits": {"weight": 1, "max_concurrency": 1},
+        }]
+        self.coordinator.peers["rc-peer"] = coordinator_module.Peer(
+            "rc-peer", "192.0.2.8", 8767, announcement, self.now)
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+
+        def response_document(stream):
+            sent = stream
+            if hasattr(stream, "full_url"):
+                sent = stream
+            request_body = sent.data
+            request = coordinator_module.json.loads(request_body)
+            request_id = request["payload"]["request_id"]
+            self.assertIn("auth", request["payload"])
+            return {"payload": {"request_id": request_id, "status": "ok", "result": {}}}
+
+        with mock.patch.object(coordinator_module.urllib.request, "urlopen", return_value=response) as opener, \
+             mock.patch.object(coordinator_module.json, "load") as loader:
+            loader.side_effect = lambda _response: response_document(opener.call_args.args[0])
+            result = self.coordinator.invoke("rc-peer", "net.discovery.scan", {"network": "192.0.2.0/24"})
+        self.assertEqual(result["payload"]["status"], "ok")
+
+
+if __name__ == "__main__":
+    unittest.main()

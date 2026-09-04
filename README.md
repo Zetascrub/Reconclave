@@ -28,7 +28,7 @@ ctest --test-dir build --output-on-failure
 |---|---|---|
 | Cardputer ADV | Firmware builds | Node/coordinator, discovery UI, `system.info` client/server |
 | Unit PoE-P4 | Firmware builds | Ethernet node, mDNS, `system.info` server |
-| Desktop/laptop | Python script available | Read-only mDNS node and `system.info` server |
+| Desktop/laptop | Web coordinator MVP available | Live mDNS roster, capability inspection, command dispatch, and node services |
 | T-Display K230 | Awaiting hardware | Capability-aware console and vision capabilities |
 
 The original Ghostwire repository remains unchanged. Device-specific code will
@@ -39,6 +39,8 @@ See [docs/architecture.md](docs/architecture.md) and
 The [embedded interface style guide](docs/ui-design.md) defines the shared
 visual, navigation, layout, contextual-menu, and copy rules for Cardputer and
 the future K230 interface.
+The [desktop node guide](tools/desktop-node/README.md) covers the local web
+coordinator and headless-node launch profiles.
 The [pre-K230 implementation plan](docs/pre-k230-plan.md) defines the next
 Cardputer/P4 vertical slice and the security gate before remote assessment.
 

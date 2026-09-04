@@ -435,7 +435,7 @@ class Node:
             "device_id": self.node_id,
             "device_type": "desktop-node",
             "firmware": FIRMWARE,
-            "roles": ["node"],
+            "roles": getattr(self, "roles", ["node"]),
             "capabilities": sorted(self.capability_handlers),
             "capability_descriptors": [
                 self.capability_descriptor(capability)

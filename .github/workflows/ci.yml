@@ -17,7 +17,22 @@ jobs:
       - name: Validate complete protocol vectors
         run: python3 tools/protocol-debugger/validate_vectors.py protocol/test-vectors/*.json
       - name: Test desktop node protocol handling
-        run: python3 -m unittest tools/desktop-node/test_reconclave_node.py
+        run: python3 -m unittest tools/desktop-node/test_reconclave_node.py tools/desktop-node/test_coordinator.py
+
+  desktop-web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/desktop-node/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: tools/desktop-node/web/package-lock.json
+      - run: npm ci
+      - run: npm run build
 
   cardputer-firmware:
     runs-on: ubuntu-latest

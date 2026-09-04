@@ -1,4 +1,43 @@
-# Reconclave desktop node
+# Reconclave desktop
+
+## Web coordinator
+
+The desktop web application is the recommended interactive runtime. It acts as
+a node, coordinator, or both; discovers `_reconclave._tcp.local` peers; expires
+stale nodes after 45 seconds; presents capability and resource metadata; and
+can invoke safe inspection capabilities from a live node detail view.
+
+Build the React interface once, then start the local application:
+
+```bash
+cd tools/desktop-node/web
+npm install
+npm run build
+cd ..
+../../.venv-desktop-node/bin/python desktop_app.py --mode both
+```
+
+Open <http://127.0.0.1:8767>. The live roster and command API are deliberately
+loopback-only. The Reconclave announcement and message endpoints remain
+available to other nodes on the LAN.
+
+Trusted capability requests can be enabled without placing secrets in shell
+history by using environment variables:
+
+```bash
+RECONCLAVE_EXECUTION_KEY="..." RECONCLAVE_EVIDENCE_KEY="..." \
+  ../../.venv-desktop-node/bin/python desktop_app.py --mode both \
+  --enable-network-scan --evidence-dir ./evidence
+```
+
+The current UI directly invokes `system.info`, `desktop.resources`, and
+`coordination.job.status`. Assessment capabilities are visible but remain
+disabled until their scope/configuration workflow is implemented.
+
+For UI development, run `npm run dev` in `web/` while `desktop_app.py` is
+running; Vite proxies `/api` requests to port 8767.
+
+## Headless node
 
 This read-only Python node advertises itself over mDNS, serves a Reconclave v1
 announcement, and implements `system.info`, `desktop.resources`, and bounded
