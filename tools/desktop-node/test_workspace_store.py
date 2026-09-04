@@ -23,11 +23,27 @@ class WorkspaceStoreTests(unittest.TestCase):
             self.assertEqual(restored["jobs"][0]["status"], "complete")
             self.assertEqual(restored["evidence"][0]["data"]["hosts"], ["192.0.2.4"])
 
+            rule = store.create_automation({"project_id": project["id"], "node_id": "rc-p4",
+                                            "condition": "dhcp_assigned",
+                                            "playbook": "system_snapshot", "interval_ms": 0})
+            store.set_automation(rule["id"], {"enabled": False})
+            self.assertFalse(WorkspaceStore(path).snapshot()["automations"][0]["enabled"])
+            store.delete_automation(rule["id"])
+            self.assertEqual(store.snapshot()["automations"], [])
+
     def test_rejects_job_for_unknown_project(self):
         with tempfile.TemporaryDirectory() as directory:
             store = WorkspaceStore(pathlib.Path(directory) / "workspace.json")
             with self.assertRaisesRegex(ValueError, "project does not exist"):
                 store.upsert_job({"id": "job-1", "project_id": "missing"})
+
+    def test_automation_rejects_arbitrary_payloads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = WorkspaceStore(pathlib.Path(directory) / "workspace.json")
+            project = store.create_project({"name": "Lab"})
+            with self.assertRaisesRegex(ValueError, "unsupported automation playbook"):
+                store.create_automation({"project_id": project["id"], "node_id": "rc-p4",
+                                         "condition": "dhcp_assigned", "playbook": "shell"})
 
 
 if __name__ == "__main__":

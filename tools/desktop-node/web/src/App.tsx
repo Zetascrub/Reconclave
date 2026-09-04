@@ -3,7 +3,7 @@ import type { Activity, AppState, CapabilityDescriptor, Project, ReconNode, Scan
 import WorkspaceViews from './WorkspaceViews'
 
 const emptyState: AppState = { revision: 0, nodes: [], coordinator_id: '', updated_at_ms: 0 }
-const emptyWorkspace: WorkspaceData = { revision: 0, projects: [], jobs: [], evidence: [] }
+const emptyWorkspace: WorkspaceData = { revision: 0, projects: [], jobs: [], evidence: [], automations: [] }
 
 function savedActivity(): Activity[] {
   try {
@@ -54,7 +54,7 @@ function defaultScope(address: string) {
 }
 
 function App() {
-  const [view, setView] = useState<'network' | 'map' | 'jobs' | 'projects' | 'evidence'>('network')
+  const [view, setView] = useState<'network' | 'map' | 'jobs' | 'projects' | 'evidence' | 'automations'>('network')
   const [state, setState] = useState<AppState>(emptyState)
   const [workspace, setWorkspace] = useState<WorkspaceData>(emptyWorkspace)
   const [projectId, setProjectId] = useState(() => localStorage.getItem('reconclave.project') ?? '')
@@ -68,6 +68,7 @@ function App() {
   const [scope, setScope] = useState({ network: '', start: '', end: '' })
   const [authorised, setAuthorised] = useState(false)
   const [scoutError, setScoutError] = useState('')
+  const [recurringMinutes, setRecurringMinutes] = useState(0)
   const [scanJob, setScanJob] = useState<ScanJob | null>(savedJob)
   const statusFailures = useRef(0)
 
@@ -111,6 +112,21 @@ function App() {
     await refreshWorkspace()
     addActivity({ title: 'TCP inspection complete', detail: `${hosts.length} host${hosts.length === 1 ? '' : 's'} · ${ports.length} ports`, tone: 'ok' })
     return result
+  }
+
+  async function createAutomation(body: Record<string, unknown>) {
+    await postWorkspace('/api/automations', { ...body, project_id: projectId, operator_authorised: true })
+    addActivity({ title: 'Automation armed', detail: `${body.condition} → ${body.playbook}`, tone: 'info' })
+  }
+
+  async function updateAutomation(id: string, body: Record<string, unknown>) {
+    await postWorkspace(`/api/automations/${encodeURIComponent(id)}`, body)
+  }
+
+  async function deleteAutomation(id: string) {
+    const response = await fetch(`/api/automations/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    if (!response.ok) throw new Error('Could not delete automation')
+    await refreshWorkspace()
   }
 
   useEffect(() => {
@@ -182,9 +198,9 @@ function App() {
     if (!selected) return
     setScoutError('')
     try {
-      const body = await requestCapability(selected, 'net.discovery.scan', {
-        network: scope.network, start_ip: scope.start, end_ip: scope.end,
-      }, authorised)
+      const arguments_: Record<string, unknown> = { network: scope.network, start_ip: scope.start, end_ip: scope.end }
+      if (recurringMinutes > 0) arguments_.schedule = { interval_ms: recurringMinutes * 60000, after_completion: true }
+      const body = await requestCapability(selected, 'net.discovery.scan', arguments_, authorised)
       const next = body.payload?.result as Omit<ScanJob, 'providerId'>
       const archived = { providerId: selected.device_id, projectId, archiveId: `${selected.device_id}-${next.job_id}-${Date.now()}`, scope: { ...scope }, ...next }
       setScanJob(archived)
@@ -210,6 +226,10 @@ function App() {
         statusFailures.current = 0
         setScanJob(next)
         if (next.archiveId && next.projectId) await postWorkspace('/api/jobs', { id: next.archiveId, project_id: next.projectId, provider_id: next.providerId, capability: 'net.discovery.scan', status: next.job_status, checked: next.checked, total: next.total, hosts: next.hosts, scope: next.scope, error: next.error })
+        if (next.recurring && (next.run_count ?? 0) > (scanJob.run_count ?? 0)) {
+          if (next.archiveId && next.projectId) await postWorkspace('/api/evidence', { id: `${next.archiveId}-run-${next.run_count}`, project_id: next.projectId, job_id: next.archiveId, kind: 'network-hosts', title: `Recurring Scout run ${next.run_count}`, summary: `${next.hosts.length} responsive hosts observed by ${next.providerId}`, data: { hosts: next.hosts, scope: next.scope, provider_id: next.providerId, run_count: next.run_count } })
+          addActivity({ title: `Scout run ${next.run_count} complete`, detail: `${next.hosts.length} responsive hosts observed`, tone: 'ok' })
+        }
         if (next.job_status === 'complete') {
           if (next.archiveId && next.projectId) await postWorkspace('/api/evidence', { id: `${next.archiveId}-network`, project_id: next.projectId, job_id: next.archiveId, kind: 'network-hosts', title: `Scout observation · ${next.scope?.network ?? 'network'}`, summary: `${next.hosts.length} responsive hosts observed by ${next.providerId}`, data: { hosts: next.hosts, scope: next.scope, provider_id: next.providerId } })
           addActivity({ title: 'Scout complete', detail: `${next.hosts.length} responsive host${next.hosts.length === 1 ? '' : 's'} observed`, tone: 'ok' })
@@ -257,6 +277,7 @@ function App() {
           <button className={view === 'jobs' ? 'active' : ''} title="Jobs" onClick={() => setView('jobs')}><span>◫</span><small>Jobs</small></button>
           <button className={view === 'projects' ? 'active' : ''} title="Projects" onClick={() => setView('projects')}><span>◇</span><small>Projects</small></button>
           <button className={view === 'evidence' ? 'active' : ''} title="Evidence" onClick={() => setView('evidence')}><span>▱</span><small>Evidence</small></button>
+          <button className={view === 'automations' ? 'active' : ''} title="Automations" onClick={() => setView('automations')}><span>↻</span><small>Rules</small></button>
         </nav>
         <div className="rail-foot"><div className="pulse-ring" /><small>RC/01</small></div>
       </aside>
@@ -276,7 +297,7 @@ function App() {
 
         {scanJob && <section className={`job-strip ${scanJob.job_status}`}>
           <div className="job-orbit"><span>{scanJob.job_status === 'running' ? '⌁' : '✓'}</span></div>
-          <div className="job-title"><span className="kicker">ACTIVE OPERATION</span><strong>NETWORK SCOUT</strong><small>{scanJob.providerId} · job {scanJob.job_id ?? 'pending'}</small></div>
+          <div className="job-title"><span className="kicker">ACTIVE OPERATION</span><strong>NETWORK SCOUT</strong><small>{scanJob.providerId} · job {scanJob.job_id ?? 'pending'}{scanJob.recurring ? ` · run ${scanJob.run_count ?? 0}` : ''}</small></div>
           <div className="job-progress"><div><span style={{ width: `${scanJob.total ? Math.min(100, scanJob.checked / scanJob.total * 100) : 0}%` }} /></div><small>{scanJob.checked} / {scanJob.total} ADDRESSES</small></div>
           <div className="job-hosts"><strong>{scanJob.hosts?.length ?? 0}</strong><small>HOSTS</small></div>
           <span className={`status-pill ${scanJob.job_status}`}><i />{scanJob.job_status}</span>
@@ -314,7 +335,7 @@ function App() {
                 {selected.capabilities.map((capability) => {
                   const meta = capabilityMeta(selected, capability)
                   const isScout = capability === 'net.discovery.scan'
-                  const directlyInvokable = capability === 'system.info' || capability === 'desktop.resources' || capability === 'coordination.job.status'
+                  const directlyInvokable = capability === 'system.info' || capability === 'desktop.resources' || capability === 'coordination.job.status' || capability === 'net.connectivity.check' || capability === 'net.arp.snapshot'
                   return <article key={capability}>
                     <div className="cap-sigil">{capability.split('.').map((part) => part[0]).join('').slice(0, 2).toUpperCase()}</div>
                     <div className="cap-copy"><strong>{capability}</strong><span>v{meta.version} · {meta.permission}</span>{meta.features?.length ? <small>{meta.features.join(' · ')}</small> : null}</div>
@@ -334,7 +355,7 @@ function App() {
             </div>
           </div>
         </section>
-      </> : <WorkspaceViews view={view} workspace={workspace} nodes={state.nodes} projectId={projectId} onProject={setProjectId} onCreate={createProject} onInspect={inspectSelectedHosts} />}</main>
+      </> : <WorkspaceViews view={view} workspace={workspace} nodes={state.nodes} projectId={projectId} onProject={setProjectId} onCreate={createProject} onInspect={inspectSelectedHosts} onCreateAutomation={createAutomation} onUpdateAutomation={updateAutomation} onDeleteAutomation={deleteAutomation} />}</main>
       {scoutOpen && selected && <div className="modal-shade" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setScoutOpen(false) }}>
         <section className="scout-modal" role="dialog" aria-modal="true" aria-labelledby="scout-title">
           <div className="modal-head"><div><span className="kicker">SCOPED OPERATION</span><h2 id="scout-title">Configure Network Scout</h2><p>Provider: {selected.device_id}</p></div><button onClick={() => setScoutOpen(false)} aria-label="Close">×</button></div>
@@ -345,6 +366,7 @@ function App() {
             <label className="field"><span>FIRST ADDRESS</span><input value={scope.start} onChange={(event) => setScope({ ...scope, start: event.target.value })} /></label>
             <label className="field"><span>LAST ADDRESS</span><input value={scope.end} onChange={(event) => setScope({ ...scope, end: event.target.value })} /></label>
           </div>
+          <label className="field"><span>RECURRING</span><select value={recurringMinutes} onChange={(event) => setRecurringMinutes(Number(event.target.value))}><option value={0}>One-time operation</option><option value={1}>Every minute</option><option value={5}>Every 5 minutes</option><option value={15}>Every 15 minutes</option><option value={60}>Every hour</option></select></label>
           <div className="scope-note"><strong>BOUNDARY ENFORCEMENT</strong><p>The coordinator permits IPv4 /24 or smaller. The provider independently verifies that this scope is locally attached.</p></div>
           <label className="authorise"><input type="checkbox" checked={authorised} onChange={(event) => setAuthorised(event.target.checked)} /><span><strong>I confirm this network is authorised for assessment.</strong><small>This acknowledgement is required for every dispatched Scout operation.</small></span></label>
           {scoutError && <div className="modal-error"><strong>DISPATCH REFUSED</strong><span>{scoutError}</span></div>}

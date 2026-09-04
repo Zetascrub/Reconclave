@@ -27,11 +27,12 @@
 #include "nvs_flash.h"
 #include "lwip/ip_addr.h"
 #include "lwip/etharp.h"
+#include "lwip/netdb.h"
 #include "lwip/tcpip.h"
 #include "ping/ping_sock.h"
 #include "generated_trust.h"
 
-#define RC_FIRMWARE_VERSION "0.1.0"
+#define RC_FIRMWARE_VERSION "0.2.0"
 #define RC_PROTOCOL "reconclave/1"
 #define RC_HOSTNAME "reconclave-poe-p4"
 #define RC_INSTANCE "Reconclave Unit PoE-P4"
@@ -57,6 +58,8 @@
 #define RC_SCAN_MAX_HOSTS 254
 #define RC_SCAN_MAX_RESULTS 48
 #define RC_SCAN_PING_TIMEOUT_MS 120
+#define RC_RECUR_MIN_INTERVAL_MS 10000
+#define RC_RECUR_MAX_INTERVAL_MS 86400000
 #define RC_LEASE_MIN_MS 1000
 #define RC_LEASE_MAX_MS 60000
 
@@ -101,6 +104,10 @@ typedef struct {
     uint8_t first_host;
     uint8_t last_host;
     uint8_t result_count;
+    bool recurring;
+    volatile bool cancel_requested;
+    uint32_t interval_ms;
+    uint32_t run_count;
     char results[RC_SCAN_MAX_RESULTS][16];
     char error[40];
 } scan_state_t;
@@ -494,6 +501,7 @@ static bool probe_local_host(uint8_t a, uint8_t b, uint8_t c, uint8_t d)
 static void discovery_task(void *argument)
 {
     (void)argument;
+    for (;;) {
     esp_netif_ip_info_t info;
     if (s_eth_netif == NULL || esp_netif_get_ip_info(s_eth_netif, &info) != ESP_OK ||
         info.ip.addr == 0) {
@@ -523,6 +531,7 @@ static void discovery_task(void *argument)
     s_scan.total = (uint16_t)total;
     portEXIT_CRITICAL(&s_lock);
     for (uint32_t index = 0; index < total; ++index) {
+        if (s_scan.cancel_requested) break;
         const uint32_t candidate = network + first_host + index;
         bool found = false;
         if (candidate != ip_value) {
@@ -545,9 +554,32 @@ static void discovery_task(void *argument)
         portEXIT_CRITICAL(&s_lock);
     }
     portENTER_CRITICAL(&s_lock);
-    s_scan.status = RC_SCAN_COMPLETE;
+    ++s_scan.run_count;
+    const bool repeat = s_scan.recurring && !s_scan.cancel_requested;
+    s_scan.status = repeat ? RC_SCAN_RUNNING :
+        (s_scan.cancel_requested ? RC_SCAN_IDLE : RC_SCAN_COMPLETE);
+    const uint32_t interval_ms = s_scan.interval_ms;
     portEXIT_CRITICAL(&s_lock);
     ESP_LOGI(TAG, "Discovery job complete: %u host(s)", (unsigned)s_scan.result_count);
+    if (!repeat) break;
+    uint32_t waited = 0;
+    while (waited < interval_ms) {
+        vTaskDelay(pdMS_TO_TICKS(250));
+        waited += 250;
+        if (s_scan.cancel_requested) break;
+    }
+    portENTER_CRITICAL(&s_lock);
+    if (s_scan.cancel_requested) {
+        s_scan.status = RC_SCAN_IDLE;
+        portEXIT_CRITICAL(&s_lock);
+        break;
+    }
+    s_scan.checked = 0;
+    s_scan.total = 0;
+    s_scan.result_count = 0;
+    memset(s_scan.results, 0, sizeof(s_scan.results));
+    portEXIT_CRITICAL(&s_lock);
+    }
     vTaskDelete(NULL);
 }
 
@@ -575,6 +607,7 @@ static cJSON *scan_response(const char *destination, const char *request_id,
             const cJSON *start_ip = cJSON_GetObjectItemCaseSensitive(arguments, "start_ip");
             const cJSON *end_ip = cJSON_GetObjectItemCaseSensitive(arguments, "end_ip");
             const cJSON *network = cJSON_GetObjectItemCaseSensitive(arguments, "network");
+            const cJSON *schedule = cJSON_GetObjectItemCaseSensitive(arguments, "schedule");
             unsigned local_a, local_b, local_c, local_d;
             unsigned start_a, start_b, start_c, first;
             unsigned end_a, end_b, end_c, last;
@@ -583,7 +616,19 @@ static cJSON *scan_response(const char *destination, const char *request_id,
                                             &local_c, &local_d) == 4;
             if (local_valid) snprintf(expected_network, sizeof(expected_network), "%u.%u.%u.0/24",
                                       local_a, local_b, local_c);
-            if (cJSON_IsString(start_ip) && cJSON_IsString(end_ip) &&
+            bool schedule_valid = true;
+            if (schedule != NULL) {
+                const cJSON *interval = cJSON_GetObjectItemCaseSensitive(schedule, "interval_ms");
+                const cJSON *after = cJSON_GetObjectItemCaseSensitive(schedule, "after_completion");
+                schedule_valid = cJSON_IsObject(schedule) && cJSON_IsNumber(interval) &&
+                    interval->valuedouble >= RC_RECUR_MIN_INTERVAL_MS &&
+                    interval->valuedouble <= RC_RECUR_MAX_INTERVAL_MS && cJSON_IsTrue(after);
+                if (schedule_valid) {
+                    s_scan.recurring = true;
+                    s_scan.interval_ms = (uint32_t)interval->valuedouble;
+                }
+            }
+            if (cJSON_IsString(start_ip) && cJSON_IsString(end_ip) && schedule_valid &&
                 cJSON_IsString(network) && local_valid &&
                 strcmp(network->valuestring, expected_network) == 0 &&
                 sscanf(start_ip->valuestring, "%u.%u.%u.%u", &start_a, &start_b, &start_c, &first) == 4 &&
@@ -620,12 +665,82 @@ static cJSON *scan_response(const char *destination, const char *request_id,
     cJSON_AddStringToObject(result, "job_status", scan_status_name(snapshot.status));
     cJSON_AddNumberToObject(result, "checked", snapshot.checked);
     cJSON_AddNumberToObject(result, "total", snapshot.total);
+    cJSON_AddBoolToObject(result, "recurring", snapshot.recurring);
+    cJSON_AddNumberToObject(result, "run_count", snapshot.run_count);
     if (snapshot.error[0] != '\0') {
         cJSON_AddStringToObject(result, "error", snapshot.error);
     }
     cJSON *hosts = cJSON_AddArrayToObject(result, "hosts");
     for (size_t index = 0; index < snapshot.result_count; ++index) {
         cJSON_AddItemToArray(hosts, cJSON_CreateString(snapshot.results[index]));
+    }
+    return root;
+}
+
+static cJSON *cancel_response(const char *destination, const char *request_id)
+{
+    portENTER_CRITICAL(&s_lock);
+    s_scan.cancel_requested = true;
+    s_scan.recurring = false;
+    if (s_scan.status != RC_SCAN_RUNNING) s_scan.status = RC_SCAN_IDLE;
+    portEXIT_CRITICAL(&s_lock);
+    return scan_response(destination, request_id, false, NULL);
+}
+
+static cJSON *connectivity_response(const char *destination, const char *request_id)
+{
+    network_state_t state;
+    portENTER_CRITICAL(&s_lock);
+    state = s_network;
+    portEXIT_CRITICAL(&s_lock);
+    bool gateway_reachable = false;
+    unsigned a, b, c, d;
+    if (state.has_ip && sscanf(state.gateway, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
+        gateway_reachable = ping_host((uint8_t)a, (uint8_t)b, (uint8_t)c, (uint8_t)d);
+    }
+    struct addrinfo hints = {.ai_family = AF_INET, .ai_socktype = SOCK_STREAM};
+    struct addrinfo *resolved = NULL;
+    const bool dns_resolved = state.has_ip && getaddrinfo("example.com", NULL, &hints, &resolved) == 0;
+    if (resolved != NULL) freeaddrinfo(resolved);
+    cJSON *root = new_envelope("response", destination);
+    cJSON *payload = cJSON_AddObjectToObject(root, "payload");
+    cJSON_AddStringToObject(payload, "request_id", request_id);
+    cJSON_AddStringToObject(payload, "status", "ok");
+    cJSON *result = cJSON_AddObjectToObject(payload, "result");
+    cJSON_AddBoolToObject(result, "link_up", state.link_up);
+    cJSON_AddBoolToObject(result, "dhcp_assigned", state.has_ip);
+    cJSON_AddStringToObject(result, "ip", state.ip);
+    cJSON_AddStringToObject(result, "gateway", state.gateway);
+    cJSON_AddBoolToObject(result, "gateway_reachable", gateway_reachable);
+    cJSON_AddBoolToObject(result, "dns_resolved", dns_resolved);
+    cJSON_AddBoolToObject(result, "internet_possible", gateway_reachable && dns_resolved);
+    return root;
+}
+
+static cJSON *arp_snapshot_response(const char *destination, const char *request_id)
+{
+    cJSON *root = new_envelope("response", destination);
+    cJSON *payload = cJSON_AddObjectToObject(root, "payload");
+    cJSON_AddStringToObject(payload, "request_id", request_id);
+    cJSON_AddStringToObject(payload, "status", "ok");
+    cJSON *result = cJSON_AddObjectToObject(payload, "result");
+    cJSON *entries = cJSON_AddArrayToObject(result, "entries");
+    for (size_t index = 0; index < ARP_TABLE_SIZE; ++index) {
+        ip4_addr_t *address = NULL;
+        struct netif *interface = NULL;
+        struct eth_addr *hardware = NULL;
+        if (!etharp_get_entry(index, &address, &interface, &hardware) ||
+            address == NULL || hardware == NULL) continue;
+        char ip[16];
+        char mac[18];
+        ip4addr_ntoa_r(address, ip, sizeof(ip));
+        snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
+                 hardware->addr[0], hardware->addr[1], hardware->addr[2],
+                 hardware->addr[3], hardware->addr[4], hardware->addr[5]);
+        cJSON *entry = cJSON_CreateObject();
+        cJSON_AddStringToObject(entry, "address", ip);
+        cJSON_AddStringToObject(entry, "mac", mac);
+        cJSON_AddItemToArray(entries, entry);
     }
     return root;
 }
@@ -643,8 +758,13 @@ static cJSON *announcement(void)
     cJSON_AddItemToArray(capabilities, cJSON_CreateString("system.info"));
     cJSON_AddItemToArray(capabilities, cJSON_CreateString("net.discovery.scan"));
     cJSON_AddItemToArray(capabilities, cJSON_CreateString("coordination.job.status"));
+    cJSON_AddItemToArray(capabilities, cJSON_CreateString("coordination.job.cancel"));
+    cJSON_AddItemToArray(capabilities, cJSON_CreateString("net.connectivity.check"));
+    cJSON_AddItemToArray(capabilities, cJSON_CreateString("net.arp.snapshot"));
     cJSON *descriptors = cJSON_AddArrayToObject(payload, "capability_descriptors");
-    const char *ids[] = {"system.info", "net.discovery.scan", "coordination.job.status"};
+    const char *ids[] = {"system.info", "net.discovery.scan", "coordination.job.status",
+                         "coordination.job.cancel", "net.connectivity.check",
+                         "net.arp.snapshot"};
     for (size_t index = 0; index < sizeof(ids) / sizeof(ids[0]); ++index) {
         cJSON *descriptor = cJSON_CreateObject();
         cJSON_AddStringToObject(descriptor, "id", ids[index]);
@@ -654,6 +774,8 @@ static cJSON *announcement(void)
         if (index == 1) {
             cJSON_AddItemToArray(features, cJSON_CreateString("ipv4"));
             cJSON_AddItemToArray(features, cJSON_CreateString("range"));
+            cJSON_AddItemToArray(features, cJSON_CreateString("recurring"));
+            cJSON_AddItemToArray(features, cJSON_CreateString("after-completion"));
         }
         cJSON *limits = cJSON_AddObjectToObject(descriptor, "limits");
         cJSON_AddNumberToObject(limits, "weight", index == 1 ? 2 : 1);
@@ -870,6 +992,15 @@ static esp_err_t message_handler(httpd_req_t *request)
         response_status = "ok";
     } else if (json_string_equals(capability, "coordination.job.status")) {
         response = scan_response(source_id, id, false, arguments);
+        response_status = "ok";
+    } else if (json_string_equals(capability, "coordination.job.cancel")) {
+        response = cancel_response(source_id, id);
+        response_status = "ok";
+    } else if (json_string_equals(capability, "net.connectivity.check")) {
+        response = connectivity_response(source_id, id);
+        response_status = "ok";
+    } else if (json_string_equals(capability, "net.arp.snapshot")) {
+        response = arp_snapshot_response(source_id, id);
         response_status = "ok";
     } else {
         response = error_response(source_id, id, "CAPABILITY_UNAVAILABLE", "Capability is not available");

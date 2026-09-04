@@ -48,7 +48,16 @@ and latest observed ports; multiple hosts can be selected for a bounded TCP
 inspection using common, web, or custom port sets. Inspection is limited to 16
 hosts and 128 ports on the desktop's attached `/24`, requires an explicit
 authorisation acknowledgement, and archives its job and evidence in the active
-project. Evidence cards open a full structured-data viewer. Workspace metadata is written
+project. Evidence cards open a full structured-data viewer.
+
+The **Rules** workspace manages condition-driven P4 operations. It can react to
+a DHCP address becoming available or to the P4's conservative Internet-possible
+signal, then capture a system snapshot or launch a bounded Network Scout. Scout
+can be one-shot or recurring. These are typed built-in playbooks rather than
+arbitrary executable payloads; rule creation requires an explicit authorisation
+acknowledgement and the backend independently enforces the allowlist.
+
+Workspace metadata is written
 atomically to the ignored `.reconclave-data/workspace.json` file with owner-only
 permissions; override it with `--workspace-store` when a separate case store is
 required.

@@ -18,6 +18,8 @@ new capability contract.
 | `system.info` | All nodes | Read-only, non-sensitive | Contract defined |
 | `net.discovery.scan` | Cardputer, PoE-P4, desktop | Assessment + network scope | Reserved |
 | `net.tcp.connect` | Cardputer, PoE-P4 | Assessment + host/port scope | Reserved |
+| `net.connectivity.check` | PoE-P4 | Read-only network health | Implemented |
+| `net.arp.snapshot` | PoE-P4 | Read-only neighbour cache | Implemented |
 | `radio.ble.scan` | Cardputer | Assessment | Reserved |
 | `radio.lora.send` | Cardputer | Explicit transmit | Reserved |
 | `location.gps.read` | Cardputer | Sensitive location | Reserved |
@@ -166,3 +168,15 @@ one-shot Scout job, or a recurring job with a single local provider. A
 recurring job spread across multiple providers on independent schedules isn't
 compared yet, since that needs run-cohort synchronisation across providers
 that doesn't exist.
+
+## Conditional operations
+
+The desktop primary coordinator stores condition rules in its local workspace.
+Rules select a node, one condition (`dhcp_assigned` or `internet_possible`), and
+one built-in playbook (`system_snapshot` or `network_scout`). A false-to-true
+condition edge triggers the playbook. Network Scout may then continue on the
+provider using the recurring contract above. Rules never contain commands,
+scripts, URLs, or arbitrary payload bytes: the allowlist is validated again by
+the backend, every node request uses provisioned authentication, and all output
+is attached to the selected project. The current rule engine polls every ten
+seconds and is active only while the desktop coordinator runs.

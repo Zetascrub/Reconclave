@@ -68,4 +68,5 @@ export type Project = { id: string; name: string; description: string; created_a
 export type ArchivedJob = { id: string; project_id: string; provider_id?: string; capability?: string; status?: string; checked?: number; total?: number; hosts?: string[]; scope?: Record<string, string>; error?: string; created_at_ms: number; updated_at_ms: number }
 export type EvidenceHost = string | { address: string; open_ports?: number[]; checked_ports?: number }
 export type EvidenceRecord = { id: string; project_id: string; job_id?: string; kind: string; title: string; summary: string; data?: { hosts?: EvidenceHost[]; [key: string]: unknown }; captured_at_ms: number }
-export type WorkspaceData = { revision: number; projects: Project[]; jobs: ArchivedJob[]; evidence: EvidenceRecord[] }
+export type AutomationRule = { id: string; project_id: string; node_id: string; condition: 'dhcp_assigned' | 'internet_possible'; playbook: 'network_scout' | 'system_snapshot'; interval_ms: number; enabled: boolean; created_at_ms: number; updated_at_ms: number; last_triggered_ms: number; last_error: string }
+export type WorkspaceData = { revision: number; projects: Project[]; jobs: ArchivedJob[]; evidence: EvidenceRecord[]; automations: AutomationRule[] }

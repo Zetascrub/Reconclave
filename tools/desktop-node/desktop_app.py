@@ -32,6 +32,88 @@ MAX_INSPECTION_HOSTS = 16
 MAX_INSPECTION_PORTS = 128
 
 
+class AutomationEngine:
+    """Evaluates a small, auditable allowlist of node conditions and playbooks."""
+    def __init__(self, coordinator: Coordinator, workspace: WorkspaceStore) -> None:
+        self.coordinator = coordinator
+        self.workspace = workspace
+        self.stop_event = threading.Event()
+        self.condition_state: dict[str, bool] = {}
+        self.thread = threading.Thread(target=self._run, name="reconclave-automations", daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def close(self) -> None:
+        self.stop_event.set()
+        self.thread.join(timeout=2)
+
+    def _condition(self, rule: dict, nodes: dict[str, dict]) -> tuple[bool, dict]:
+        node = nodes.get(rule["node_id"])
+        if node is None:
+            return False, {}
+        if rule["condition"] == "dhcp_assigned":
+            return bool(node.get("address")), {"ip": node.get("address"), "dhcp_assigned": True}
+        response = self.coordinator.invoke(rule["node_id"], "net.connectivity.check", {})
+        result = response.get("payload", {}).get("result", {})
+        return result.get("internet_possible") is True, result
+
+    def _trigger(self, rule: dict, condition_result: dict) -> None:
+        now = int(time.time() * 1000)
+        if rule["playbook"] == "system_snapshot":
+            response = self.coordinator.invoke(rule["node_id"], "system.info", {})
+            result = response.get("payload", {}).get("result", {})
+            self.workspace.add_evidence({
+                "project_id": rule["project_id"], "kind": "automation-snapshot",
+                "title": f"Triggered snapshot · {rule['node_id']}",
+                "summary": f"{rule['condition']} condition activated",
+                "data": {"condition": condition_result, "result": result, "rule_id": rule["id"]},
+                "captured_at_ms": now,
+            })
+        else:
+            address = ipaddress.ip_address(condition_result.get("ip") or
+                                           next(item["address"] for item in self.coordinator.state()["nodes"]
+                                                if item["device_id"] == rule["node_id"]))
+            network = ipaddress.ip_network(f"{address}/24", strict=False)
+            arguments = {"network": str(network), "start_ip": str(network.network_address + 1),
+                         "end_ip": str(network.broadcast_address - 1)}
+            if rule.get("interval_ms"):
+                arguments["schedule"] = {"interval_ms": rule["interval_ms"],
+                                         "after_completion": True}
+            response = self.coordinator.invoke(rule["node_id"], "net.discovery.scan", arguments)
+            result = response.get("payload", {}).get("result", {})
+            self.workspace.upsert_job({
+                "id": f"auto-{rule['id']}-{now}", "project_id": rule["project_id"],
+                "provider_id": rule["node_id"], "capability": "net.discovery.scan",
+                "status": result.get("job_status", "running"), "checked": result.get("checked", 0),
+                "total": result.get("total", 0), "hosts": result.get("hosts", []),
+                "scope": {**arguments, "automation_rule": rule["id"]},
+            })
+        self.workspace.set_automation(rule["id"], {"last_triggered_ms": now, "last_error": ""})
+
+    def _run(self) -> None:
+        while not self.stop_event.wait(10):
+            snapshot = self.workspace.snapshot()
+            nodes = {item["device_id"]: item for item in self.coordinator.state()["nodes"]}
+            active_ids = set()
+            for rule in snapshot.get("automations", []):
+                if not rule.get("enabled"):
+                    continue
+                active_ids.add(rule["id"])
+                try:
+                    matched, result = self._condition(rule, nodes)
+                    previous = self.condition_state.get(rule["id"], False)
+                    self.condition_state[rule["id"]] = matched
+                    if matched and not previous:
+                        self._trigger(rule, result)
+                except Exception as error:
+                    message = str(error)[:300]
+                    if rule.get("last_error") != message:
+                        self.workspace.set_automation(rule["id"], {"last_error": message})
+            self.condition_state = {key: value for key, value in self.condition_state.items()
+                                    if key in active_ids}
+
+
 def inspect_hosts(local_address: str, body: dict) -> dict:
     if body.get("operator_authorised") is not True:
         raise PermissionError("explicit host inspection authorization acknowledgement is required")
@@ -163,6 +245,11 @@ class AppHandler(BaseHTTPRequestHandler):
             if path == "/api/projects":
                 self.send_json(201, self.server.workspace.create_project(body))
                 return
+            if path == "/api/automations":
+                if body.get("operator_authorised") is not True:
+                    raise PermissionError("explicit automation authorization acknowledgement is required")
+                self.send_json(201, self.server.workspace.create_automation(body))
+                return
             if path == "/api/jobs":
                 self.send_json(200, self.server.workspace.upsert_job(body))
                 return
@@ -194,6 +281,10 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.send_json(200, result)
                 return
             parts = path.strip("/").split("/")
+            if len(parts) == 3 and parts[:2] == ["api", "automations"]:
+                self.send_json(200, self.server.workspace.set_automation(
+                    urllib.parse.unquote(parts[2]), body))
+                return
             if len(parts) == 4 and parts[:2] == ["api", "nodes"] and parts[3] == "invoke":
                 capability = str(body.get("capability", ""))
                 arguments = body.get("arguments", {})
@@ -216,6 +307,21 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_json(400, {"error": "invalid_request", "message": str(error)})
         except ConnectionError as error:
             self.send_json(502, {"error": "node_request_failed", "message": str(error)})
+
+    def do_DELETE(self) -> None:
+        path = urllib.parse.urlsplit(self.path).path
+        if not self.local_client():
+            self.send_json(403, {"error": "local_access_only"})
+            return
+        parts = path.strip("/").split("/")
+        try:
+            if len(parts) == 3 and parts[:2] == ["api", "automations"]:
+                self.send_json(200, self.server.workspace.delete_automation(
+                    urllib.parse.unquote(parts[2])))
+            else:
+                self.send_json(404, {"error": "not_found"})
+        except KeyError as error:
+            self.send_json(404, {"error": "not_found", "message": str(error)})
 
     def stream_events(self) -> None:
         try:
@@ -305,6 +411,8 @@ def main() -> None:
     except (OSError, ValueError, json.JSONDecodeError) as error:
         parser.error(f"could not load workspace store: {error}")
     server = AppServer(("0.0.0.0", args.port), node, coordinator, workspace)
+    automations = AutomationEngine(coordinator, workspace)
+    automations.start()
     service = ServiceInfo(
         "_reconclave._tcp.local.", f"{args.node_id}._reconclave._tcp.local.",
         addresses=[socket.inet_aton(args.address)], port=args.port,
@@ -323,6 +431,7 @@ def main() -> None:
     try:
         server.serve_forever(poll_interval=0.25)
     finally:
+        automations.close()
         coordinator.close()
         zeroconf.unregister_service(service)
         zeroconf.close()

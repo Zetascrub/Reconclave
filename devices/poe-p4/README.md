@@ -8,12 +8,19 @@ It advertises `_reconclave._tcp.local`, serves its announcement at
 `/reconclave/v1/message`. Trusted capabilities are enabled only when the
 generated fleet provisioning header is present at build time.
 
-The current paired MVP also exposes `net.discovery.scan` and
-`coordination.job.status`. Discovery runs in a dedicated task, is bounded to
+The current paired firmware exposes `net.discovery.scan`,
+`coordination.job.status`, authenticated `coordination.job.cancel`, and
+`net.connectivity.check`, and a passive `net.arp.snapshot`. Discovery runs in a dedicated task, is bounded to
 at most 254 addresses on the P4's directly attached subnet, retains at most 48
 responsive hosts in RAM, and requires authenticated requests. Starting a new
 scan replaces the previous in-memory result set; the Cardputer can explicitly
 export completed results to microSD.
+
+Discovery also supports non-overlapping volatile recurring runs from 10 seconds
+to 24 hours. The job retains its ID, reports `run_count`, waits the requested
+interval after each completed pass, and can be stopped idempotently. Connectivity
+checks report Ethernet, DHCP, gateway reachability, DNS resolution, and a
+conservative `internet_possible` signal without executing arbitrary code.
 
 The current fleet build embeds a unique key for each authorised coordinator.
 It authenticates the desktop primary at priority 100 and Cardputer secondary at
