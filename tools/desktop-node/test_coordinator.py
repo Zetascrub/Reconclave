@@ -103,6 +103,8 @@ class CoordinatorTests(unittest.TestCase):
             request = coordinator_module.json.loads(request_body)
             request_id = request["payload"]["request_id"]
             self.assertIn("auth", request["payload"])
+            self.assertEqual(request["payload"]["auth"]["coordinator_priority"], 100)
+            self.assertEqual(request["payload"]["auth"]["lease_ms"], 15000)
             return self.authenticated_response(request)
 
         with mock.patch.object(coordinator_module.urllib.request, "urlopen", return_value=response) as opener, \
@@ -128,7 +130,7 @@ class CoordinatorTests(unittest.TestCase):
             request = coordinator_module.json.loads(captured["request"].data)
             payload = request["payload"]
             canonical = (f"rc-local|rc-peer|{payload['request_id']}|net.discovery.scan|"
-                         f"abc123|{payload['auth']['nonce']}").encode()
+                         f"abc123|{payload['auth']['nonce']}|100|15000").encode()
             expected = coordinator_module.hmac.new(
                 self.coordinator.execution_key, canonical,
                 coordinator_module.hashlib.sha256).digest()[:16].hex()

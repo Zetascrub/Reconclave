@@ -265,6 +265,8 @@ function App() {
                 <div><small>LINK PROFILE</small><strong>{selected.resources.network_mbps ? `${selected.resources.network_mbps} Mbps` : 'Unreported'}</strong></div>
                 <div><small>STORAGE FREE</small><strong>{bytes(selected.resources.storage_free_bytes)}</strong></div>
                 <div><small>ROLES</small><strong>{selected.roles.join(' / ')}</strong></div>
+                <div><small>TRUST</small><strong>{selected.security?.paired ? selected.security.mode ?? 'Paired' : 'Public / unpaired'}</strong></div>
+                <div><small>ACTIVE COORDINATOR</small><strong>{selected.security?.active_coordinator ? `${selected.security.active_coordinator} · P${selected.security.active_priority}` : selected.security?.primary_coordinator ?? 'None leased'}</strong></div>
               </div>
               <div className="cap-head"><div><span className="kicker">CAPABILITY MATRIX</span><h3>Available actions</h3></div><span>{selected.capabilities.length} advertised</span></div>
               <div className="capabilities">

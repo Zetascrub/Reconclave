@@ -63,7 +63,9 @@ envelope:
 ```
 
 `tag` is a 16-byte HMAC-SHA256, truncated, over the canonical string
-`source_node|destination_node|request_id|capability|nonce`, hex-encoded. The receiver
+`source_node|destination_node|request_id|capability|boot_nonce|nonce`, hex-encoded.
+The `boot_nonce` is the target's 128-bit value from its current announcement, so
+a captured request cannot be replayed after the target restarts. The receiver
 verifies the tag and rejects the request with `UNAUTHENTICATED` if it's missing,
 wrong, or if `nonce` has already been accepted from that `source_node` (each receiver
 keeps a small bounded set of recently accepted nonces per source, rather than relying

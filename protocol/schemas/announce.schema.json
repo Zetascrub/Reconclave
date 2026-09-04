@@ -63,7 +63,13 @@
       "properties": {
         "paired": { "type": "boolean" },
         "boot_nonce": { "type": "string", "pattern": "^[a-f0-9]{32}$" },
-        "mode": { "const": "hmac-sha256-128" }
+        "mode": { "enum": ["hmac-sha256-128", "provisioned-hmac-sha256-128"] },
+        "trusted_coordinators": { "type": "integer", "minimum": 0, "maximum": 255 },
+        "primary_coordinator": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$" },
+        "coordinator_priority": { "type": "integer", "minimum": 0, "maximum": 255 },
+        "active_coordinator": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$" },
+        "active_priority": { "type": "integer", "minimum": 0, "maximum": 255 },
+        "lease_remaining_ms": { "type": "integer", "minimum": 0, "maximum": 60000 }
       }
     }
   }

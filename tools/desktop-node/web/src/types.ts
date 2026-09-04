@@ -18,6 +18,15 @@ export type ReconNode = {
     persistent_storage?: boolean
     storage_free_bytes?: number
   }
+  security?: {
+    paired?: boolean
+    mode?: string
+    primary_coordinator?: string
+    coordinator_priority?: number
+    active_coordinator?: string
+    active_priority?: number
+    lease_remaining_ms?: number
+  }
   status: 'ready' | 'busy' | 'degraded'
   address: string
   port: number

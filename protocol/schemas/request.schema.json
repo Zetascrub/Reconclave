@@ -18,6 +18,8 @@
       "required": ["nonce", "tag"],
       "properties": {
         "nonce": { "type": "string", "pattern": "^[a-f0-9]{16}$" },
+        "coordinator_priority": { "type": "integer", "minimum": 0, "maximum": 255 },
+        "lease_ms": { "type": "integer", "minimum": 1000, "maximum": 60000 },
         "tag": { "type": "string", "pattern": "^[a-f0-9]{32}$" }
       }
     }

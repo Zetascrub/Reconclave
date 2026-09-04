@@ -20,6 +20,8 @@ from reconclave_node import ANNOUNCE_PATH, AUTH_TAG_BYTES, MESSAGE_PATH, PROTOCO
 NODE_TTL_SECONDS = 45.0
 REQUEST_TIMEOUT_SECONDS = 4.0
 REFRESH_INTERVAL_SECONDS = 12.0
+COORDINATOR_PRIORITY = 100
+COORDINATOR_LEASE_MS = 15000
 
 
 @dataclass
@@ -40,6 +42,7 @@ class Peer:
             "capabilities": payload.get("capabilities", []),
             "capability_descriptors": payload.get("capability_descriptors", []),
             "resources": payload.get("resources", {}),
+            "security": payload.get("security", {}),
             "status": payload.get("status", "degraded"),
             "address": self.address,
             "port": self.port,
@@ -212,10 +215,12 @@ class Coordinator(ServiceListener):
             fields = [self.node.node_id, device_id, request_id, capability]
             if boot_nonce:
                 fields.append(boot_nonce)
-            fields.append(nonce)
+            fields.extend([nonce, str(COORDINATOR_PRIORITY), str(COORDINATOR_LEASE_MS)])
             canonical = "|".join(fields).encode()
             payload["auth"] = {
                 "nonce": nonce,
+                "coordinator_priority": COORDINATOR_PRIORITY,
+                "lease_ms": COORDINATOR_LEASE_MS,
                 "tag": hmac.new(key, canonical, hashlib.sha256).digest()[:AUTH_TAG_BYTES].hex(),
             }
         request["payload"] = payload

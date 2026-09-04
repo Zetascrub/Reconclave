@@ -340,6 +340,7 @@ std::vector<String> recentEvidenceNonces;
 std::vector<String> recentExecutionNonces;
 char nodeBootNonceHex[33]{};
 constexpr size_t kRecentNonceCount = 16;
+constexpr uint32_t kCoordinatorLeaseMs = 15000;
 String groveP4Id;
 String groveBootNonce;
 bool groveP4Paired;
@@ -2078,9 +2079,9 @@ bool evidenceRecordValid(JsonVariantConst evidence) {
 }
 
 // Verifies a signed, fresh request for one of the non-benign evidence-network
-// capabilities. Only the request is authenticated (not the response) and replay
-// protection is a bounded recent-nonce set rather than sequence numbers, since a
-// sender's sequence counter resets to 1 on reboot (see docs/capabilities.md).
+// capabilities. Replay protection combines this boot session with a bounded
+// recent-nonce set rather than sequence numbers, since a sender's sequence counter
+// resets to 1 on reboot (see docs/capabilities.md).
 bool evidenceRequestAuthenticated(const String& source, const String& destination,
                                   const String& requestId, const char* capability,
                                   JsonVariantConst auth) {
@@ -2524,7 +2525,8 @@ void requestSystemInfo(RemoteNode& provider) {
     if (nonce == 0) nonce = 1;
     snprintf(nonceHex, sizeof(nonceHex), "%016llx", static_cast<unsigned long long>(nonce));
     const String canonical = deviceId + "|" + provider.deviceId + "|" + requestId +
-        "|system.info|" + groveBootNonce + "|" + nonceHex;
+        "|system.info|" + groveBootNonce + "|" + nonceHex + "|" +
+        String(RC_COORDINATOR_PRIORITY) + "|" + String(kCoordinatorLeaseMs);
     uint8_t requestTag[kTagBytes];
     if (!computeTag(canonical, requestTag)) {
       notice = "Could not authenticate request";
@@ -2535,6 +2537,8 @@ void requestSystemInfo(RemoteNode& provider) {
     hexEncode(requestTagHex, requestTag, sizeof(requestTag));
     JsonObject auth = payload["auth"].to<JsonObject>();
     auth["nonce"] = nonceHex;
+    auth["coordinator_priority"] = RC_COORDINATOR_PRIORITY;
+    auth["lease_ms"] = kCoordinatorLeaseMs;
     auth["tag"] = requestTagHex;
   }
   String body;
@@ -2679,13 +2683,16 @@ void requestScoutUpdate(RemoteScoutJob& job, bool start) {
     if (nonce == 0) nonce = 1;
     snprintf(nonceHex, sizeof(nonceHex), "%016llx", static_cast<unsigned long long>(nonce));
     const String canonical = deviceId + "|" + provider->deviceId + "|" + requestId + "|" +
-        capability + "|" + groveBootNonce + "|" + nonceHex;
+        capability + "|" + groveBootNonce + "|" + nonceHex + "|" +
+        String(RC_COORDINATOR_PRIORITY) + "|" + String(kCoordinatorLeaseMs);
     uint8_t requestTag[kTagBytes];
     if (!computeTag(canonical, requestTag)) return;
     char requestTagHex[kTagBytes * 2 + 1];
     hexEncode(requestTagHex, requestTag, sizeof(requestTag));
     JsonObject auth = payload["auth"].to<JsonObject>();
     auth["nonce"] = nonceHex;
+    auth["coordinator_priority"] = RC_COORDINATOR_PRIORITY;
+    auth["lease_ms"] = kCoordinatorLeaseMs;
     auth["tag"] = requestTagHex;
   } else if (trustedCapability) {
     if (!executionKeyValid) {

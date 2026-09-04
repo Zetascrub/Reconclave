@@ -57,6 +57,8 @@
 #define RC_SCAN_MAX_HOSTS 254
 #define RC_SCAN_MAX_RESULTS 48
 #define RC_SCAN_PING_TIMEOUT_MS 120
+#define RC_LEASE_MIN_MS 1000
+#define RC_LEASE_MAX_MS 60000
 
 typedef struct {
     bool started;
@@ -80,6 +82,9 @@ static uint8_t s_boot_nonce[16];
 static char s_boot_nonce_hex[33];
 static uint64_t s_recent_nonces[16];
 static size_t s_recent_nonce_cursor;
+static char s_lease_owner_id[32];
+static uint8_t s_lease_priority;
+static uint32_t s_lease_expires_ms;
 
 typedef enum {
     RC_SCAN_IDLE,
@@ -666,6 +671,12 @@ static cJSON *announcement(void)
     cJSON_AddStringToObject(security, "mode", "provisioned-hmac-sha256-128");
     cJSON_AddNumberToObject(security, "trusted_coordinators",
                             sizeof(RC_PROVISIONED_PEERS) / sizeof(RC_PROVISIONED_PEERS[0]));
+    const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    if (s_lease_owner_id[0] != '\0' && (int32_t)(s_lease_expires_ms - now) > 0) {
+        cJSON_AddStringToObject(security, "active_coordinator", s_lease_owner_id);
+        cJSON_AddNumberToObject(security, "active_priority", s_lease_priority);
+        cJSON_AddNumberToObject(security, "lease_remaining_ms", s_lease_expires_ms - now);
+    }
     return root;
 }
 
@@ -722,7 +733,8 @@ static cJSON *system_info_response(const char *destination, const char *request_
 static bool authenticate_request(const cJSON *input, const char *source_id,
                                  const char *request_id, const char *capability,
                                  uint64_t *nonce_out,
-                                 const rc_provisioned_peer_t **peer_out)
+                                 const rc_provisioned_peer_t **peer_out,
+                                 uint32_t *lease_ms_out)
 {
     const rc_provisioned_peer_t *peer = provisioned_peer(source_id);
     if (peer == NULL) return false;
@@ -730,24 +742,44 @@ static bool authenticate_request(const cJSON *input, const char *source_id,
     const cJSON *auth = cJSON_GetObjectItemCaseSensitive(payload, "auth");
     const cJSON *nonce_json = cJSON_GetObjectItemCaseSensitive(auth, "nonce");
     const cJSON *tag_json = cJSON_GetObjectItemCaseSensitive(auth, "tag");
+    const cJSON *priority_json = cJSON_GetObjectItemCaseSensitive(auth, "coordinator_priority");
+    const cJSON *lease_json = cJSON_GetObjectItemCaseSensitive(auth, "lease_ms");
     if (!cJSON_IsObject(auth) || !cJSON_IsString(nonce_json) ||
-        !cJSON_IsString(tag_json) || strlen(nonce_json->valuestring) != 16) return false;
+        !cJSON_IsString(tag_json) || !cJSON_IsNumber(priority_json) ||
+        !cJSON_IsNumber(lease_json) || strlen(nonce_json->valuestring) != 16 ||
+        priority_json->valueint != peer->priority ||
+        lease_json->valueint < RC_LEASE_MIN_MS || lease_json->valueint > RC_LEASE_MAX_MS) return false;
     char *nonce_end = NULL;
     const uint64_t nonce = strtoull(nonce_json->valuestring, &nonce_end, 16);
-    if (nonce_end == nonce_json->valuestring || *nonce_end != '\0' || nonce_seen_or_record(nonce)) {
+    if (nonce_end == nonce_json->valuestring || *nonce_end != '\0') {
         return false;
     }
     char canonical[320];
-    snprintf(canonical, sizeof(canonical), "%s|%s|%s|%s|%s|%s", source_id,
+    snprintf(canonical, sizeof(canonical), "%s|%s|%s|%s|%s|%s|%d|%d", source_id,
              s_device_id, request_id, capability, s_boot_nonce_hex,
-             nonce_json->valuestring);
+             nonce_json->valuestring, priority_json->valueint, lease_json->valueint);
     uint8_t expected[RC_TAG_BYTES];
     uint8_t supplied[RC_TAG_BYTES];
     if (!compute_tag_with_key(peer->key, canonical, expected) ||
         !hex_decode(supplied, sizeof(supplied), tag_json->valuestring) ||
         !constant_time_equal(expected, supplied, sizeof(expected))) return false;
+    if (nonce_seen_or_record(nonce)) return false;
     *nonce_out = nonce;
     *peer_out = peer;
+    *lease_ms_out = (uint32_t)lease_json->valueint;
+    return true;
+}
+
+static bool coordinator_lease_accept(const rc_provisioned_peer_t *peer, uint32_t lease_ms)
+{
+    const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    const bool active = s_lease_owner_id[0] != '\0' &&
+                        (int32_t)(s_lease_expires_ms - now) > 0;
+    const bool same_owner = active && strcmp(s_lease_owner_id, peer->peer_id) == 0;
+    if (active && !same_owner && peer->priority <= s_lease_priority) return false;
+    strlcpy(s_lease_owner_id, peer->peer_id, sizeof(s_lease_owner_id));
+    s_lease_priority = peer->priority;
+    s_lease_expires_ms = now + lease_ms;
     return true;
 }
 
@@ -816,6 +848,7 @@ static esp_err_t message_handler(httpd_req_t *request)
 
     cJSON *response;
     uint64_t request_nonce = 0;
+    uint32_t requested_lease_ms = 0;
     const rc_provisioned_peer_t *authenticated_peer = NULL;
     const char *response_status = "rejected";
     if (!json_string_equals(proto, RC_PROTOCOL) || !json_string_equals(type, "request") ||
@@ -824,8 +857,11 @@ static esp_err_t message_handler(httpd_req_t *request)
         response = error_response(source_id, id, "INVALID_REQUEST", "Malformed or misdirected request");
     } else if (!authenticate_request(input, source_id, id,
                                      cJSON_IsString(capability) ? capability->valuestring : "",
-                                     &request_nonce, &authenticated_peer)) {
+                                     &request_nonce, &authenticated_peer, &requested_lease_ms)) {
         response = error_response(source_id, id, "AUTHENTICATION_REQUIRED", "Coordinator is not provisioned");
+    } else if (!coordinator_lease_accept(authenticated_peer, requested_lease_ms)) {
+        response = error_response(source_id, id, "COORDINATOR_LEASE_HELD",
+                                  "A higher-priority coordinator holds the active lease");
     } else if (json_string_equals(capability, "system.info")) {
         response = system_info_response(source_id, id);
         response_status = "ok";

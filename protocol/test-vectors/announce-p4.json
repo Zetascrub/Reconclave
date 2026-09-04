@@ -11,6 +11,12 @@
     "firmware": "0.1.0",
     "roles": ["node"],
     "capabilities": ["system.info", "net.discovery.scan", "net.tcp.connect"],
-    "status": "ready"
+    "status": "ready",
+    "security": {
+      "paired": true,
+      "boot_nonce": "0123456789abcdef0123456789abcdef",
+      "mode": "provisioned-hmac-sha256-128",
+      "trusted_coordinators": 2
+    }
   }
 }

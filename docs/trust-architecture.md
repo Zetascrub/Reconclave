@@ -39,12 +39,15 @@ new boot nonce before trusted commands are attempted.
 
 ## Coordinator selection
 
-Priority declares the desired ownership order: desktop 100, Cardputer 50. The
-current profile establishes the identities and cryptographic separation needed
-for failover, but does not yet implement a distributed lease. Until that lands,
-operators must avoid issuing concurrent jobs from both coordinators. The next
-protocol revision will add a signed, expiring coordinator lease with monotonic
-generation and deterministic priority/identity tie-breaks.
+Priority declares the ownership order: desktop 100, Cardputer 50. Every trusted
+request carries a signed priority and a bounded 15-second lease request. The P4
+renews requests from the active owner, permits a higher-priority coordinator to
+preempt, and rejects a different coordinator at equal or lower priority until
+the lease expires. This lets the Cardputer take over when the desktop has been
+absent for 15 seconds while making desktop recovery deterministic. Lease state
+is intentionally volatile and clears on P4 restart; authentication is always
+performed before lease selection, and a caller cannot claim a priority other
+than the value compiled into its provisioned P4 trust record.
 
 ## Migration to production transport
 
