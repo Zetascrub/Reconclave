@@ -5,8 +5,8 @@ proven by Ghostwire: IP101 Ethernet wiring and the common-anode status LED.
 
 It advertises `_reconclave._tcp.local`, serves its announcement at
 `/reconclave/v1/announce`, and accepts protocol requests at
-`/reconclave/v1/message`. Only the read-only `system.info` capability is
-enabled until pairing, authentication, and engagement scope exist.
+`/reconclave/v1/message`. Trusted capabilities are enabled only when the
+generated fleet provisioning header is present at build time.
 
 The current paired MVP also exposes `net.discovery.scan` and
 `coordination.job.status`. Discovery runs in a dedicated task, is bounded to
@@ -15,10 +15,13 @@ responsive hosts in RAM, and requires authenticated requests. Starting a new
 scan replaces the previous in-memory result set; the Cardputer can explicitly
 export completed results to microSD.
 
-Grove UART on GPIO53/54 provides the physical trust bootstrap. The P4 accepts
-its first peer record, persists it in NVS, and will only accept the same peer
-secret afterward. Each boot creates a new network challenge so captured
-requests cannot be replayed after a power cycle.
+The current fleet build embeds a unique key for each authorised coordinator.
+It authenticates the desktop primary at priority 100 and Cardputer secondary at
+priority 50; a signed, expiring lease prevents concurrent ownership and allows
+deterministic failover. Each boot creates a new network challenge so captured
+requests cannot be replayed after a power cycle. Grove UART on GPIO53/54 and
+its legacy NVS record remain a recovery/development path, not the authoritative
+network command trust source for a provisioned build.
 
 ## Build
 

@@ -92,8 +92,10 @@ actions. Announcements are keyed by device ID, so future K230, Cardputer, and
 P4 nodes can coexist in the roster; capabilities that are not implemented for
 a particular node remain unavailable instead of being treated as P4 actions.
 
-The initial wire transport is bounded HTTP request/response and exposes only
-non-sensitive `system.info`. The paired build authenticates requests and responses with a
-persistent 256-bit Grove-provisioned secret, a fresh per-request nonce, and a
-per-boot P4 challenge. Pairing survives power loss because both peers store the
-trust record in NVS.
+The initial wire transport is bounded HTTP request/response. The provisioned
+fleet build authenticates P4 requests and responses with a unique 256-bit
+Cardputer-P4 key, a fresh per-request nonce, and the P4's per-boot challenge.
+It identifies itself as the priority-50 secondary coordinator and requests a
+short signed lease, allowing takeover when the priority-100 desktop is absent.
+The legacy Grove/NVS pairing workflow remains available for recovery builds but
+does not override generated fleet trust.
