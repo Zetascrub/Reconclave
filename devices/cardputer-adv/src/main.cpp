@@ -17,6 +17,7 @@
 
 #include <reconclave/node_registry.h>
 #include "assets/zeta_title.h"
+#include "generated_trust.h"
 #include "network_host_scan_service.h"
 #include "network_port_scan_service.h"
 
@@ -337,6 +338,7 @@ bool provisioningExecutionKey{false};
 // request can't be replayed against it. Small and bounded; no persistence needed.
 std::vector<String> recentEvidenceNonces;
 std::vector<String> recentExecutionNonces;
+char nodeBootNonceHex[33]{};
 constexpr size_t kRecentNonceCount = 16;
 String groveP4Id;
 String groveBootNonce;
@@ -2038,6 +2040,12 @@ void fillAnnouncement(JsonDocument& document) {
   resources["persistent_storage"] = sdAvailable;
   resources["storage_free_bytes"] = 0;
   payload["status"] = "ready";
+  JsonObject security = payload["security"].to<JsonObject>();
+  security["paired"] = true;
+  security["boot_nonce"] = nodeBootNonceHex;
+  security["mode"] = "provisioned-hmac-sha256-128";
+  security["primary_coordinator"] = RC_PROVISIONED_PRIMARY_ID;
+  security["coordinator_priority"] = RC_COORDINATOR_PRIORITY;
 }
 
 void sendServerJson(JsonDocument& document, int status = 200) {
@@ -2080,7 +2088,8 @@ bool evidenceRequestAuthenticated(const String& source, const String& destinatio
   const String nonce = auth["nonce"] | "";
   const char* tagHex = auth["tag"] | "";
   if (nonce.isEmpty() || tagHex == nullptr || strlen(tagHex) != kTagBytes * 2) return false;
-  const String canonical = source + "|" + destination + "|" + requestId + "|" + capability + "|" + nonce;
+  const String canonical = source + "|" + destination + "|" + requestId + "|" + capability +
+      "|" + nodeBootNonceHex + "|" + nonce;
   uint8_t expectedTag[kTagBytes];
   uint8_t suppliedTag[kTagBytes];
   if (!computeEvidenceTag(canonical, expectedTag)) return false;
@@ -2098,7 +2107,8 @@ bool executionRequestAuthenticated(const String& source, const String& destinati
   if (nonce.isEmpty() || tagHex == nullptr || strlen(tagHex) != kTagBytes * 2) return false;
   if (std::find(recentExecutionNonces.begin(), recentExecutionNonces.end(), nonce) !=
       recentExecutionNonces.end()) return false;
-  const String canonical = source + "|" + destination + "|" + requestId + "|" + capability + "|" + nonce;
+  const String canonical = source + "|" + destination + "|" + requestId + "|" + capability +
+      "|" + nodeBootNonceHex + "|" + nonce;
   uint8_t expectedTag[kTagBytes];
   uint8_t suppliedTag[kTagBytes];
   if (!computeExecutionTag(canonical, expectedTag) ||
@@ -4361,7 +4371,16 @@ void setup() {
   lastInputMs = millis();
   const uint64_t chip = ESP.getEfuseMac();
   char id[32];
-  snprintf(id, sizeof(id), "rc-adv-%012llx", static_cast<unsigned long long>(chip));
+  // ESP.getEfuseMac() exposes the six MAC bytes in little-endian integer order.
+  // Render the network/hardware order so the runtime identity matches the ID
+  // printed by the flasher and used during offline provisioning.
+  snprintf(id, sizeof(id), "rc-adv-%02x%02x%02x%02x%02x%02x",
+           static_cast<unsigned int>((chip >> 0) & 0xff),
+           static_cast<unsigned int>((chip >> 8) & 0xff),
+           static_cast<unsigned int>((chip >> 16) & 0xff),
+           static_cast<unsigned int>((chip >> 24) & 0xff),
+           static_cast<unsigned int>((chip >> 32) & 0xff),
+           static_cast<unsigned int>((chip >> 40) & 0xff));
   deviceId = id;
   if (preferences.getBytesLength("peer_key") == sizeof(peerKey) &&
       preferences.getBytes("peer_key", peerKey, sizeof(peerKey)) == sizeof(peerKey)) {
@@ -4372,6 +4391,16 @@ void setup() {
       preferences.getBytes("evid_key", evidenceKey, sizeof(evidenceKey)) == sizeof(evidenceKey);
   executionKeyValid = preferences.getBytesLength("exec_key") == sizeof(executionKey) &&
       preferences.getBytes("exec_key", executionKey, sizeof(executionKey)) == sizeof(executionKey);
+  // Build-time provisioning is authoritative for this fleet generation. Each
+  // relationship has a distinct key; no fleet-wide command secret exists.
+  trustedP4Id = RC_PROVISIONED_P4_ID;
+  memcpy(peerKey, RC_PROVISIONED_P4_KEY, sizeof(peerKey));
+  peerKeyValid = true;
+  memcpy(executionKey, RC_PROVISIONED_PRIMARY_KEY, sizeof(executionKey));
+  executionKeyValid = true;
+  uint8_t nodeBootNonce[16];
+  esp_fill_random(nodeBootNonce, sizeof(nodeBootNonce));
+  hexEncode(nodeBootNonceHex, nodeBootNonce, sizeof(nodeBootNonce));
   groveSerial.setRxBufferSize(1024);
   groveSerial.begin(115200, SERIAL_8N1, kGroveRxPin, kGroveTxPin);
   mountEvidence();

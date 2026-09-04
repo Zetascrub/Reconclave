@@ -11,3 +11,6 @@ __pycache__/
 **/node_modules/
 **/dist/
 *.tsbuildinfo
+/.reconclave-provisioning/
+devices/poe-p4/main/generated_trust.h
+devices/cardputer-adv/src/generated_trust.h

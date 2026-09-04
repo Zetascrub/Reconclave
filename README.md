@@ -41,6 +41,9 @@ visual, navigation, layout, contextual-menu, and copy rules for Cardputer and
 the future K230 interface.
 The [desktop node guide](tools/desktop-node/README.md) covers the local web
 coordinator and headless-node launch profiles.
+The [trust architecture](docs/trust-architecture.md) describes offline fleet
+provisioning, per-link identities, coordinator priority, rotation, and the
+planned migration from authenticated HTTP to mutually authenticated TLS.
 The [pre-K230 implementation plan](docs/pre-k230-plan.md) defines the next
 Cardputer/P4 vertical slice and the security gate before remote assessment.
 

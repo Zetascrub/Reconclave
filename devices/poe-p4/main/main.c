@@ -29,6 +29,7 @@
 #include "lwip/etharp.h"
 #include "lwip/tcpip.h"
 #include "ping/ping_sock.h"
+#include "generated_trust.h"
 
 #define RC_FIRMWARE_VERSION "0.1.0"
 #define RC_PROTOCOL "reconclave/1"
@@ -150,17 +151,29 @@ static uint32_t crc32(const char *data, size_t length)
     return ~crc;
 }
 
-static bool compute_tag(const char *message, uint8_t output[RC_TAG_BYTES])
+static bool compute_tag_with_key(const uint8_t key[RC_KEY_BYTES], const char *message,
+                                 uint8_t output[RC_TAG_BYTES])
 {
-    if (!s_peer_key_valid || message == NULL) return false;
+    if (key == NULL || message == NULL) return false;
     uint8_t full[32];
     const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-    if (info == NULL || mbedtls_md_hmac(info, s_peer_key, sizeof(s_peer_key),
+    if (info == NULL || mbedtls_md_hmac(info, key, RC_KEY_BYTES,
                                        (const uint8_t *)message, strlen(message), full) != 0) {
         return false;
     }
     memcpy(output, full, RC_TAG_BYTES);
     return true;
+}
+
+static const rc_provisioned_peer_t *provisioned_peer(const char *peer_id)
+{
+    if (peer_id == NULL) return NULL;
+    for (size_t index = 0; index < sizeof(RC_PROVISIONED_PEERS) / sizeof(RC_PROVISIONED_PEERS[0]); ++index) {
+        if (strcmp(peer_id, RC_PROVISIONED_PEERS[index].peer_id) == 0) {
+            return &RC_PROVISIONED_PEERS[index];
+        }
+    }
+    return NULL;
 }
 
 static bool nonce_seen_or_record(uint64_t nonce)
@@ -648,9 +661,11 @@ static cJSON *announcement(void)
     cJSON_AddNumberToObject(resources, "storage_free_bytes", 0);
     cJSON_AddStringToObject(payload, "status", "ready");
     cJSON *security = cJSON_AddObjectToObject(payload, "security");
-    cJSON_AddBoolToObject(security, "paired", s_peer_key_valid);
+    cJSON_AddBoolToObject(security, "paired", true);
     cJSON_AddStringToObject(security, "boot_nonce", s_boot_nonce_hex);
-    cJSON_AddStringToObject(security, "mode", "hmac-sha256-128");
+    cJSON_AddStringToObject(security, "mode", "provisioned-hmac-sha256-128");
+    cJSON_AddNumberToObject(security, "trusted_coordinators",
+                            sizeof(RC_PROVISIONED_PEERS) / sizeof(RC_PROVISIONED_PEERS[0]));
     return root;
 }
 
@@ -706,9 +721,11 @@ static cJSON *system_info_response(const char *destination, const char *request_
 
 static bool authenticate_request(const cJSON *input, const char *source_id,
                                  const char *request_id, const char *capability,
-                                 uint64_t *nonce_out)
+                                 uint64_t *nonce_out,
+                                 const rc_provisioned_peer_t **peer_out)
 {
-    if (!s_peer_key_valid || strcmp(source_id, s_peer_id) != 0) return false;
+    const rc_provisioned_peer_t *peer = provisioned_peer(source_id);
+    if (peer == NULL) return false;
     const cJSON *payload = cJSON_GetObjectItemCaseSensitive(input, "payload");
     const cJSON *auth = cJSON_GetObjectItemCaseSensitive(payload, "auth");
     const cJSON *nonce_json = cJSON_GetObjectItemCaseSensitive(auth, "nonce");
@@ -726,25 +743,26 @@ static bool authenticate_request(const cJSON *input, const char *source_id,
              nonce_json->valuestring);
     uint8_t expected[RC_TAG_BYTES];
     uint8_t supplied[RC_TAG_BYTES];
-    if (!compute_tag(canonical, expected) ||
+    if (!compute_tag_with_key(peer->key, canonical, expected) ||
         !hex_decode(supplied, sizeof(supplied), tag_json->valuestring) ||
         !constant_time_equal(expected, supplied, sizeof(expected))) return false;
     *nonce_out = nonce;
+    *peer_out = peer;
     return true;
 }
 
 static void authenticate_response(cJSON *response, const char *destination,
                                   const char *request_id, const char *status,
-                                  uint64_t nonce)
+                                  uint64_t nonce, const uint8_t key[RC_KEY_BYTES])
 {
-    if (!s_peer_key_valid || nonce == 0) return;
+    if (key == NULL || nonce == 0) return;
     char nonce_hex[17];
     snprintf(nonce_hex, sizeof(nonce_hex), "%016llx", (unsigned long long)nonce);
     char canonical[320];
     snprintf(canonical, sizeof(canonical), "%s|%s|%s|%s|%s|%s", s_device_id,
              destination, request_id, status, s_boot_nonce_hex, nonce_hex);
     uint8_t tag[RC_TAG_BYTES];
-    if (!compute_tag(canonical, tag)) return;
+    if (!compute_tag_with_key(key, canonical, tag)) return;
     char tag_hex[RC_TAG_BYTES * 2 + 1];
     hex_encode(tag_hex, tag, sizeof(tag));
     cJSON *payload = cJSON_GetObjectItemCaseSensitive(response, "payload");
@@ -798,6 +816,7 @@ static esp_err_t message_handler(httpd_req_t *request)
 
     cJSON *response;
     uint64_t request_nonce = 0;
+    const rc_provisioned_peer_t *authenticated_peer = NULL;
     const char *response_status = "rejected";
     if (!json_string_equals(proto, RC_PROTOCOL) || !json_string_equals(type, "request") ||
         !cJSON_IsObject(payload) || !cJSON_IsString(source) ||
@@ -805,8 +824,8 @@ static esp_err_t message_handler(httpd_req_t *request)
         response = error_response(source_id, id, "INVALID_REQUEST", "Malformed or misdirected request");
     } else if (!authenticate_request(input, source_id, id,
                                      cJSON_IsString(capability) ? capability->valuestring : "",
-                                     &request_nonce)) {
-        response = error_response(source_id, id, "AUTHENTICATION_REQUIRED", "Pair over Grove or establish trust");
+                                     &request_nonce, &authenticated_peer)) {
+        response = error_response(source_id, id, "AUTHENTICATION_REQUIRED", "Coordinator is not provisioned");
     } else if (json_string_equals(capability, "system.info")) {
         response = system_info_response(source_id, id);
         response_status = "ok";
@@ -819,7 +838,8 @@ static esp_err_t message_handler(httpd_req_t *request)
     } else {
         response = error_response(source_id, id, "CAPABILITY_UNAVAILABLE", "Capability is not available");
     }
-    authenticate_response(response, source_id, id, response_status, request_nonce);
+    authenticate_response(response, source_id, id, response_status, request_nonce,
+                          authenticated_peer != NULL ? authenticated_peer->key : NULL);
     cJSON_Delete(input);
     return send_json(request, response);
 }

@@ -51,6 +51,17 @@ class CoordinatorTests(unittest.TestCase):
             },
         }
 
+    def authenticated_response(self, request, boot_nonce=""):
+        payload = request["payload"]
+        nonce = payload["auth"]["nonce"]
+        request_id = payload["request_id"]
+        canonical = f"rc-peer|rc-local|{request_id}|ok|{boot_nonce}|{nonce}".encode()
+        tag = coordinator_module.hmac.new(
+            self.coordinator.execution_key, canonical,
+            coordinator_module.hashlib.sha256).digest()[:16].hex()
+        return {"payload": {"request_id": request_id, "status": "ok", "result": {},
+                            "auth": {"nonce": nonce, "tag": tag}}}
+
     def test_refresh_adds_peer_and_expiry_removes_it(self):
         response = mock.MagicMock()
         response.__enter__.return_value = response
@@ -92,7 +103,7 @@ class CoordinatorTests(unittest.TestCase):
             request = coordinator_module.json.loads(request_body)
             request_id = request["payload"]["request_id"]
             self.assertIn("auth", request["payload"])
-            return {"payload": {"request_id": request_id, "status": "ok", "result": {}}}
+            return self.authenticated_response(request)
 
         with mock.patch.object(coordinator_module.urllib.request, "urlopen", return_value=response) as opener, \
              mock.patch.object(coordinator_module.json, "load") as loader:
@@ -122,7 +133,7 @@ class CoordinatorTests(unittest.TestCase):
                 self.coordinator.execution_key, canonical,
                 coordinator_module.hashlib.sha256).digest()[:16].hex()
             self.assertEqual(payload["auth"]["tag"], expected)
-            return {"payload": {"request_id": payload["request_id"], "status": "ok", "result": {}}}
+            return self.authenticated_response(request, "abc123")
 
         def open_request(request, timeout):
             captured["request"] = request
@@ -131,6 +142,25 @@ class CoordinatorTests(unittest.TestCase):
         with mock.patch.object(coordinator_module.urllib.request, "urlopen", side_effect=open_request), \
              mock.patch.object(coordinator_module.json, "load", side_effect=load_response):
             self.coordinator.invoke("rc-peer", "net.discovery.scan", {})
+
+    def test_trusted_invoke_rejects_unauthenticated_response(self):
+        announcement = self.announcement(capabilities=["net.discovery.scan"])
+        announcement["payload"]["capability_descriptors"] = [{
+            "id": "net.discovery.scan", "version": 1, "permission": "trusted",
+        }]
+        self.coordinator.peers["rc-peer"] = coordinator_module.Peer(
+            "rc-peer", "192.0.2.8", 8767, announcement, self.now)
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        with mock.patch.object(coordinator_module.urllib.request, "urlopen", return_value=response) as opener, \
+             mock.patch.object(coordinator_module.json, "load") as loader:
+            loader.side_effect = lambda _response: {"payload": {
+                "request_id": coordinator_module.json.loads(opener.call_args.args[0].data)["payload"]["request_id"],
+                "status": "ok", "result": {},
+            }}
+            with self.assertRaises(ConnectionError):
+                self.coordinator.invoke("rc-peer", "net.discovery.scan", {})
 
     def test_scan_scope_validation_is_bounded_and_consistent(self):
         desktop_module.validate_scan_arguments({
@@ -144,6 +174,18 @@ class CoordinatorTests(unittest.TestCase):
             desktop_module.validate_scan_arguments({
                 "network": "192.0.2.0/24", "start_ip": "192.0.2.42", "end_ip": "192.0.2.1",
             })
+
+    def test_trust_store_selects_unique_peer_keys(self):
+        with __import__("tempfile").TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "fleet.json"
+            path.write_text(__import__("json").dumps({"links": {
+                "rc-local|rc-peer": "11" * 32,
+                "rc-local|rc-other": "22" * 32,
+                "unrelated|rc-peer": "33" * 32,
+            }}))
+            keys = desktop_module.load_trust_keys(path, "rc-local")
+        self.assertEqual(keys, {"rc-peer": bytes.fromhex("11" * 32),
+                                "rc-other": bytes.fromhex("22" * 32)})
 
 
 if __name__ == "__main__":

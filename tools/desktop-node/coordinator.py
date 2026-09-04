@@ -54,12 +54,14 @@ class Coordinator(ServiceListener):
     def __init__(self, node: Node, zeroconf: Zeroconf,
                  execution_key: str | None = None,
                  evidence_key: str | None = None,
+                 trust_keys: dict[str, bytes] | None = None,
                  clock: Callable[[], float] = time.monotonic) -> None:
         self.node = node
         self.zeroconf = zeroconf
         self.clock = clock
         self.execution_key = hashlib.sha256(execution_key.encode()).digest() if execution_key else None
         self.evidence_key = hashlib.sha256(evidence_key.encode()).digest() if evidence_key else None
+        self.trust_keys = trust_keys or {}
         self.peers: dict[str, Peer] = {}
         self.lock = threading.RLock()
         self.changed = threading.Condition(self.lock)
@@ -201,7 +203,8 @@ class Coordinator(ServiceListener):
                 permission = descriptor.get("permission", "public")
                 break
         if permission == "trusted":
-            key = self.evidence_key if capability == "storage.evidence.write" else self.execution_key
+            key = (self.evidence_key if capability == "storage.evidence.write" else
+                   self.trust_keys.get(device_id, self.execution_key))
             if key is None:
                 raise PermissionError("the required trust-domain key is not configured")
             nonce = secrets.token_hex(8)
@@ -229,6 +232,20 @@ class Coordinator(ServiceListener):
             raise ConnectionError("node request failed") from error
         if result.get("payload", {}).get("request_id") != request_id:
             raise ConnectionError("node returned a mismatched response")
+        if permission == "trusted":
+            response_payload = result.get("payload", {})
+            response_auth = response_payload.get("auth", {})
+            response_nonce = response_auth.get("nonce")
+            response_tag = response_auth.get("tag")
+            status = response_payload.get("status", "")
+            if response_nonce != nonce or not isinstance(response_tag, str):
+                raise ConnectionError("node returned an unauthenticated response")
+            response_canonical = "|".join([
+                device_id, self.node.node_id, request_id, status, boot_nonce, nonce,
+            ]).encode()
+            expected_tag = hmac.new(key, response_canonical, hashlib.sha256).digest()[:AUTH_TAG_BYTES].hex()
+            if not hmac.compare_digest(response_tag, expected_tag):
+                raise ConnectionError("node returned an invalid response authentication tag")
         if device_id != self.node.node_id:
             with self.changed:
                 current = self.peers.get(device_id)

@@ -22,6 +22,7 @@ from coordinator import Coordinator
 from reconclave_node import ANNOUNCE_PATH, MESSAGE_PATH, PROTOCOL, Node, local_ip
 
 WEB_ROOT = pathlib.Path(__file__).parent / "web" / "dist"
+DEFAULT_TRUST_STORE = pathlib.Path(__file__).resolve().parents[2] / ".reconclave-provisioning" / "fleet.json"
 MAX_BODY_BYTES = 16 * 1024
 
 
@@ -35,6 +36,22 @@ def validate_scan_arguments(arguments: dict) -> None:
     if (first not in network or last not in network or first > last or
             first == network.network_address or last == network.broadcast_address):
         raise ValueError("scan range must contain usable addresses inside network")
+
+
+def load_trust_keys(path: pathlib.Path | None, coordinator_id: str) -> dict[str, bytes]:
+    if path is None or not path.is_file():
+        return {}
+    document = json.loads(path.read_text(encoding="utf-8"))
+    keys = {}
+    for link, value in document.get("links", {}).items():
+        peers = link.split("|")
+        if len(peers) != 2 or coordinator_id not in peers:
+            continue
+        peer_id = peers[1] if peers[0] == coordinator_id else peers[0]
+        if not isinstance(value, str) or len(value) != 64:
+            raise ValueError(f"invalid trust key for {peer_id}")
+        keys[peer_id] = bytes.fromhex(value)
+    return keys
 
 
 class AppHandler(BaseHTTPRequestHandler):
@@ -171,6 +188,8 @@ def main() -> None:
     parser.add_argument("--evidence-dir", default=None)
     parser.add_argument("--execution-key", default=os.environ.get("RECONCLAVE_EXECUTION_KEY"))
     parser.add_argument("--evidence-key", default=os.environ.get("RECONCLAVE_EVIDENCE_KEY"))
+    parser.add_argument("--trust-store", type=pathlib.Path, default=DEFAULT_TRUST_STORE,
+                        help="ignored per-link provisioning store")
     args = parser.parse_args()
     if args.enable_network_scan and not args.execution_key:
         parser.error("an execution key is required when network scan is enabled")
@@ -184,7 +203,12 @@ def main() -> None:
                 args.evidence_key, args.execution_key)
     node.roles = ["node"] + (["coordinator"] if args.mode in ("coordinator", "both") else [])
     zeroconf = Zeroconf()
-    coordinator = Coordinator(node, zeroconf, args.execution_key, args.evidence_key)
+    try:
+        trust_keys = load_trust_keys(args.trust_store, args.node_id)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        parser.error(f"could not load trust store: {error}")
+    coordinator = Coordinator(node, zeroconf, args.execution_key, args.evidence_key,
+                              trust_keys=trust_keys)
     if args.mode in ("coordinator", "both"):
         coordinator.start()
     server = AppServer(("0.0.0.0", args.port), node, coordinator)
@@ -202,6 +226,7 @@ def main() -> None:
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
     print(f"Reconclave desktop {args.mode} at http://127.0.0.1:{args.port}")
+    print(f"Provisioned peer identities: {len(trust_keys)}")
     try:
         server.serve_forever(poll_interval=0.25)
     finally:
