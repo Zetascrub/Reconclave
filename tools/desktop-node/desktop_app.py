@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import mimetypes
 import os
@@ -22,6 +23,18 @@ from reconclave_node import ANNOUNCE_PATH, MESSAGE_PATH, PROTOCOL, Node, local_i
 
 WEB_ROOT = pathlib.Path(__file__).parent / "web" / "dist"
 MAX_BODY_BYTES = 16 * 1024
+
+
+def validate_scan_arguments(arguments: dict) -> None:
+    """Reject broad or internally inconsistent assessment scopes before dispatch."""
+    network = ipaddress.ip_network(str(arguments.get("network", "")), strict=True)
+    if network.version != 4 or network.num_addresses > 256:
+        raise ValueError("network must be an IPv4 /24 or smaller")
+    first = ipaddress.ip_address(str(arguments.get("start_ip", "")))
+    last = ipaddress.ip_address(str(arguments.get("end_ip", "")))
+    if (first not in network or last not in network or first > last or
+            first == network.network_address or last == network.broadcast_address):
+        raise ValueError("scan range must contain usable addresses inside network")
 
 
 class AppHandler(BaseHTTPRequestHandler):
@@ -84,6 +97,10 @@ class AppHandler(BaseHTTPRequestHandler):
                 arguments = body.get("arguments", {})
                 if not isinstance(arguments, dict):
                     raise ValueError("arguments must be an object")
+                if capability == "net.discovery.scan":
+                    if body.get("operator_authorised") is not True:
+                        raise PermissionError("explicit scope authorization acknowledgement is required")
+                    validate_scan_arguments(arguments)
                 response = self.server.coordinator.invoke(
                     urllib.parse.unquote(parts[2]), capability, arguments)
                 self.send_json(200, response)

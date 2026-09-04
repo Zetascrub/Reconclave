@@ -41,6 +41,12 @@ endpoints. Coordinator APIs reject non-loopback clients. This permits the same
 process to act as a node, coordinator, or both without turning the browser UI
 into a remote control surface.
 
+Assessment dispatch has layered scope enforcement. The web workflow requires
+an operator acknowledgement, the desktop API bounds discovery to a coherent
+IPv4 `/24` or smaller, and the provider independently checks its local scope.
+The acknowledgement is UI/API state and is never presented to a provider as
+authorization in place of a signed engagement scope.
+
 ## Migration rule
 
 Ghostwire remains a reference implementation. A feature is migrated only by:

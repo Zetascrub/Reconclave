@@ -39,3 +39,15 @@ export type Activity = {
   detail: string
   tone: 'ok' | 'warn' | 'info'
 }
+
+export type ScanJob = {
+  providerId: string
+  job_id?: string | number
+  job_status: 'idle' | 'running' | 'complete' | 'failed' | 'stopped'
+  checked: number
+  total: number
+  hosts: string[]
+  error?: string
+  recurring?: boolean
+  run_count?: number
+}

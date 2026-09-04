@@ -30,9 +30,14 @@ RECONCLAVE_EXECUTION_KEY="..." RECONCLAVE_EVIDENCE_KEY="..." \
   --enable-network-scan --evidence-dir ./evidence
 ```
 
-The current UI directly invokes `system.info`, `desktop.resources`, and
-`coordination.job.status`. Assessment capabilities are visible but remain
-disabled until their scope/configuration workflow is implemented.
+The UI directly invokes `system.info`, `desktop.resources`, and
+`coordination.job.status`. Selecting `net.discovery.scan` opens the Scout
+configuration workflow. It derives a suggested `/24` from the provider,
+requires an explicit authorization acknowledgement, and shows live progress
+and responsive hosts. The backend independently rejects missing
+acknowledgements, IPv6, scopes broader than `/24`, reversed ranges, and network
+or broadcast addresses. Providers still enforce their own attached-network
+scope before execution.
 
 For UI development, run `npm run dev` in `web/` while `desktop_app.py` is
 running; Vite proxies `/api` requests to port 8767.

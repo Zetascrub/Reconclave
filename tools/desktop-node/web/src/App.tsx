@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import type { Activity, AppState, CapabilityDescriptor, ReconNode } from './types'
+import type { Activity, AppState, CapabilityDescriptor, ReconNode, ScanJob } from './types'
 
 const emptyState: AppState = { revision: 0, nodes: [], coordinator_id: '', updated_at_ms: 0 }
 
@@ -30,6 +30,15 @@ function NodeGlyph({ node }: { node: ReconNode }) {
   return <div className={`node-glyph ${node.status}`}><span>{label}</span><i /></div>
 }
 
+function defaultScope(address: string) {
+  const octets = address.split('.')
+  if (octets.length !== 4 || octets.some((part) => !/^\d+$/.test(part))) {
+    return { network: '', start: '', end: '' }
+  }
+  const prefix = octets.slice(0, 3).join('.')
+  return { network: `${prefix}.0/24`, start: `${prefix}.1`, end: `${prefix}.254` }
+}
+
 function App() {
   const [state, setState] = useState<AppState>(emptyState)
   const [selectedId, setSelectedId] = useState('')
@@ -38,6 +47,10 @@ function App() {
   const [result, setResult] = useState<Record<string, unknown> | null>(null)
   const [activity, setActivity] = useState<Activity[]>([])
   const [filter, setFilter] = useState('')
+  const [scoutOpen, setScoutOpen] = useState(false)
+  const [scope, setScope] = useState({ network: '', start: '', end: '' })
+  const [authorised, setAuthorised] = useState(false)
+  const [scanJob, setScanJob] = useState<ScanJob | null>(null)
 
   useEffect(() => {
     fetch('/api/state').then((response) => response.json()).then(setState).catch(() => setConnected(false))
@@ -64,25 +77,89 @@ function App() {
     setActivity((items) => [{ ...entry, id: crypto.randomUUID(), time: new Date() }, ...items].slice(0, 8))
   }
 
-  async function invoke(capability: string) {
-    if (!selected) return
+  async function requestCapability(node: ReconNode, capability: string, arguments_: Record<string, unknown> = {}, operatorAuthorised = false) {
     setBusyCapability(capability)
-    setResult(null)
     try {
-      const response = await fetch(`/api/nodes/${encodeURIComponent(selected.device_id)}/invoke`, {
+      const response = await fetch(`/api/nodes/${encodeURIComponent(node.device_id)}/invoke`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ capability, arguments: {} }),
+        body: JSON.stringify({ capability, arguments: arguments_, operator_authorised: operatorAuthorised }),
       })
       const body = await response.json()
       if (!response.ok) throw new Error(body.message ?? body.error ?? 'Request failed')
+      return body
+    } catch (error) {
+      throw error instanceof Error ? error : new Error('Request failed')
+    } finally {
+      setBusyCapability('')
+    }
+  }
+
+  async function invoke(capability: string) {
+    if (!selected) return
+    setResult(null)
+    try {
+      const body = await requestCapability(selected, capability)
       setResult(body)
       addActivity({ title: capability, detail: `${selected.device_id} returned ${body.payload?.status ?? 'a response'}`, tone: 'ok' })
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Request failed'
       setResult({ error: message })
       addActivity({ title: capability, detail: message, tone: 'warn' })
-    } finally {
-      setBusyCapability('')
+    }
+  }
+
+  function configureScout() {
+    if (!selected) return
+    setScope(defaultScope(selected.address))
+    setAuthorised(false)
+    setScoutOpen(true)
+  }
+
+  async function startScout() {
+    if (!selected) return
+    try {
+      const body = await requestCapability(selected, 'net.discovery.scan', {
+        network: scope.network, start_ip: scope.start, end_ip: scope.end,
+      }, authorised)
+      const next = body.payload?.result as Omit<ScanJob, 'providerId'>
+      setScanJob({ providerId: selected.device_id, ...next })
+      setScoutOpen(false)
+      addActivity({ title: 'Scout dispatched', detail: `${scope.start} → ${scope.end} via ${selected.device_id}`, tone: 'info' })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Dispatch failed'
+      addActivity({ title: 'Scout refused', detail: message, tone: 'warn' })
+    }
+  }
+
+  useEffect(() => {
+    if (!scanJob || scanJob.job_status !== 'running') return
+    const provider = state.nodes.find((node) => node.device_id === scanJob.providerId)
+    if (!provider) return
+    const timer = window.setTimeout(async () => {
+      try {
+        const body = await requestCapability(provider, 'coordination.job.status')
+        const next = { providerId: provider.device_id, ...body.payload?.result } as ScanJob
+        setScanJob(next)
+        if (next.job_status === 'complete') {
+          addActivity({ title: 'Scout complete', detail: `${next.hosts.length} responsive host${next.hosts.length === 1 ? '' : 's'} observed`, tone: 'ok' })
+        }
+      } catch (error) {
+        addActivity({ title: 'Scout telemetry lost', detail: error instanceof Error ? error.message : 'Status request failed', tone: 'warn' })
+      }
+    }, 1000)
+    return () => window.clearTimeout(timer)
+  }, [scanJob, state.nodes])
+
+  async function cancelScout() {
+    if (!scanJob) return
+    const provider = state.nodes.find((node) => node.device_id === scanJob.providerId)
+    if (!provider) return
+    try {
+      const body = await requestCapability(provider, 'coordination.job.cancel', { job_id: scanJob.job_id })
+      setScanJob({ providerId: provider.device_id, ...body.payload?.result })
+      addActivity({ title: 'Scout cancelled', detail: provider.device_id, tone: 'info' })
+    } catch (error) {
+      addActivity({ title: 'Cancel failed', detail: error instanceof Error ? error.message : 'Request failed', tone: 'warn' })
     }
   }
 
@@ -120,6 +197,16 @@ function App() {
           <article><span className="metric-icon amber">△</span><div><strong>{coordinatorCount.toString().padStart(2, '0')}</strong><small>COORDINATORS</small></div><em>ONLINE</em></article>
         </section>
 
+        {scanJob && <section className={`job-strip ${scanJob.job_status}`}>
+          <div className="job-orbit"><span>{scanJob.job_status === 'running' ? '⌁' : '✓'}</span></div>
+          <div className="job-title"><span className="kicker">ACTIVE OPERATION</span><strong>NETWORK SCOUT</strong><small>{scanJob.providerId} · job {scanJob.job_id ?? 'pending'}</small></div>
+          <div className="job-progress"><div><span style={{ width: `${scanJob.total ? Math.min(100, scanJob.checked / scanJob.total * 100) : 0}%` }} /></div><small>{scanJob.checked} / {scanJob.total} ADDRESSES</small></div>
+          <div className="job-hosts"><strong>{scanJob.hosts?.length ?? 0}</strong><small>HOSTS</small></div>
+          <span className={`status-pill ${scanJob.job_status}`}><i />{scanJob.job_status}</span>
+          {scanJob.job_status === 'running' && state.nodes.find((node) => node.device_id === scanJob.providerId)?.capabilities.includes('coordination.job.cancel') && <button className="abort" onClick={cancelScout}>ABORT</button>}
+          {scanJob.job_status !== 'running' && <button className="dismiss" onClick={() => setScanJob(null)}>DISMISS</button>}
+        </section>}
+
         <section className="workspace">
           <div className="roster panel">
             <div className="panel-head"><div><span className="kicker">NODE ROSTER</span><h2>Connected systems</h2></div><span className="count">{nodes.length}</span></div>
@@ -146,11 +233,12 @@ function App() {
               <div className="capabilities">
                 {selected.capabilities.map((capability) => {
                   const meta = capabilityMeta(selected, capability)
+                  const isScout = capability === 'net.discovery.scan'
                   const directlyInvokable = capability === 'system.info' || capability === 'desktop.resources' || capability === 'coordination.job.status'
                   return <article key={capability}>
                     <div className="cap-sigil">{capability.split('.').map((part) => part[0]).join('').slice(0, 2).toUpperCase()}</div>
                     <div className="cap-copy"><strong>{capability}</strong><span>v{meta.version} · {meta.permission}</span>{meta.features?.length ? <small>{meta.features.join(' · ')}</small> : null}</div>
-                    <button disabled={!directlyInvokable || !!busyCapability} onClick={() => invoke(capability)}>{busyCapability === capability ? 'CALLING…' : directlyInvokable ? 'INVOKE' : 'CONFIGURE'}</button>
+                    <button disabled={(!directlyInvokable && !isScout) || !!busyCapability || (isScout && scanJob?.job_status === 'running')} onClick={() => isScout ? configureScout() : invoke(capability)}>{busyCapability === capability ? 'CALLING…' : isScout ? 'CONFIGURE' : directlyInvokable ? 'INVOKE' : 'PLANNED'}</button>
                   </article>
                 })}
               </div>
@@ -167,6 +255,20 @@ function App() {
           </div>
         </section>
       </main>
+      {scoutOpen && selected && <div className="modal-shade" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setScoutOpen(false) }}>
+        <section className="scout-modal" role="dialog" aria-modal="true" aria-labelledby="scout-title">
+          <div className="modal-head"><div><span className="kicker">SCOPED OPERATION</span><h2 id="scout-title">Configure Network Scout</h2><p>Provider: {selected.device_id}</p></div><button onClick={() => setScoutOpen(false)} aria-label="Close">×</button></div>
+          <div className="scope-visual"><span>{scope.start || 'START'}</span><div><i /><i /><i /><i /><i /></div><span>{scope.end || 'END'}</span></div>
+          <label className="field"><span>NETWORK / CIDR</span><input value={scope.network} onChange={(event) => setScope({ ...scope, network: event.target.value })} placeholder="192.168.1.0/24" /></label>
+          <div className="field-pair">
+            <label className="field"><span>FIRST ADDRESS</span><input value={scope.start} onChange={(event) => setScope({ ...scope, start: event.target.value })} /></label>
+            <label className="field"><span>LAST ADDRESS</span><input value={scope.end} onChange={(event) => setScope({ ...scope, end: event.target.value })} /></label>
+          </div>
+          <div className="scope-note"><strong>BOUNDARY ENFORCEMENT</strong><p>The coordinator permits IPv4 /24 or smaller. The provider independently verifies that this scope is locally attached.</p></div>
+          <label className="authorise"><input type="checkbox" checked={authorised} onChange={(event) => setAuthorised(event.target.checked)} /><span><strong>I confirm this network is authorised for assessment.</strong><small>This acknowledgement is required for every dispatched Scout operation.</small></span></label>
+          <div className="modal-actions"><button className="secondary" onClick={() => setScoutOpen(false)}>CANCEL</button><button className="primary" disabled={!authorised || !scope.network || !scope.start || !scope.end || !!busyCapability} onClick={startScout}>{busyCapability ? 'DISPATCHING…' : 'DISPATCH SCOUT'}</button></div>
+        </section>
+      </div>}
     </div>
   )
 }

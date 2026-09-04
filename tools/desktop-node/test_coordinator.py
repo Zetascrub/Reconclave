@@ -26,6 +26,10 @@ coordinator_module = importlib.util.module_from_spec(coordinator_spec)
 assert coordinator_spec.loader is not None
 sys.modules["coordinator"] = coordinator_module
 coordinator_spec.loader.exec_module(coordinator_module)
+desktop_spec = importlib.util.spec_from_file_location("desktop_app", HERE / "desktop_app.py")
+desktop_module = importlib.util.module_from_spec(desktop_spec)
+assert desktop_spec.loader is not None
+desktop_spec.loader.exec_module(desktop_module)
 
 
 class CoordinatorTests(unittest.TestCase):
@@ -95,6 +99,19 @@ class CoordinatorTests(unittest.TestCase):
             loader.side_effect = lambda _response: response_document(opener.call_args.args[0])
             result = self.coordinator.invoke("rc-peer", "net.discovery.scan", {"network": "192.0.2.0/24"})
         self.assertEqual(result["payload"]["status"], "ok")
+
+    def test_scan_scope_validation_is_bounded_and_consistent(self):
+        desktop_module.validate_scan_arguments({
+            "network": "192.0.2.0/24", "start_ip": "192.0.2.1", "end_ip": "192.0.2.42",
+        })
+        with self.assertRaises(ValueError):
+            desktop_module.validate_scan_arguments({
+                "network": "192.0.0.0/16", "start_ip": "192.0.2.1", "end_ip": "192.0.2.42",
+            })
+        with self.assertRaises(ValueError):
+            desktop_module.validate_scan_arguments({
+                "network": "192.0.2.0/24", "start_ip": "192.0.2.42", "end_ip": "192.0.2.1",
+            })
 
 
 if __name__ == "__main__":
