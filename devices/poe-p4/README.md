@@ -27,7 +27,8 @@ project ID, condition, built-in playbook, enabled state, and optional recurring
 interval, so it survives loss of the coordinator and cold boots. Autonomous
 results enter a three-record NVS outbox. A trusted collector can read and
 acknowledge those records later; deterministic record IDs make repeated reads
-safe during interrupted synchronisation.
+safe during interrupted synchronisation. Record identity includes the boot
+challenge plus a monotonic NVS sequence, avoiding collisions across cold boots.
 
 The current fleet build embeds a unique key for each authorised coordinator.
 It authenticates the desktop primary at priority 100 and Cardputer secondary at

@@ -105,7 +105,8 @@ class AutomationEngine:
                         project_id = str(record.get("project_id", ""))
                         if not any(item.get("id") == project_id for item in snapshot["projects"]):
                             continue
-                        evidence_id = f"outbox-{node['device_id']}-{int(record['sequence'])}"
+                        boot_id = str(record.get("boot_id", "legacy"))
+                        evidence_id = f"outbox-{node['device_id']}-{boot_id}-{int(record['sequence'])}"
                         self.workspace.add_evidence({
                             "id": evidence_id, "project_id": project_id,
                             "job_id": f"rule-{record.get('rule_id', '')}",

@@ -32,7 +32,7 @@
 #include "ping/ping_sock.h"
 #include "generated_trust.h"
 
-#define RC_FIRMWARE_VERSION "0.3.0"
+#define RC_FIRMWARE_VERSION "0.3.1"
 #define RC_PROTOCOL "reconclave/1"
 #define RC_HOSTNAME "reconclave-poe-p4"
 #define RC_INSTANCE "Reconclave Unit PoE-P4"
@@ -63,6 +63,7 @@
 #define RC_AUTOMATION_NAMESPACE "rc_auto"
 #define RC_AUTOMATION_RULES_KEY "rules"
 #define RC_AUTOMATION_OUTBOX_KEY "outbox"
+#define RC_AUTOMATION_SEQUENCE_KEY "out_seq"
 #define RC_MAX_RULES 4
 #define RC_MAX_OUTBOX 3
 #define RC_LEASE_MIN_MS 1000
@@ -141,6 +142,7 @@ typedef struct {
     char project_id[64];
     char kind[24];
     char ip[16];
+    char boot_id[33];
     char hosts[RC_SCAN_MAX_RESULTS][16];
 } outbox_record_t;
 static automation_rule_t s_rules[RC_MAX_RULES];
@@ -274,6 +276,7 @@ static void load_automation_state(void)
     length = sizeof(s_outbox);
     if (nvs_get_blob(handle, RC_AUTOMATION_OUTBOX_KEY, s_outbox, &length) != ESP_OK ||
         length != sizeof(s_outbox)) memset(s_outbox, 0, sizeof(s_outbox));
+    nvs_get_u32(handle, RC_AUTOMATION_SEQUENCE_KEY, &s_outbox_sequence);
     for (size_t index = 0; index < RC_MAX_OUTBOX; ++index) {
         if (s_outbox[index].sequence > s_outbox_sequence) s_outbox_sequence = s_outbox[index].sequence;
     }
@@ -290,6 +293,16 @@ static bool save_automation_blob(const char *key, const void *value, size_t leng
     return result == ESP_OK;
 }
 
+static bool save_outbox_sequence(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(RC_AUTOMATION_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) return false;
+    esp_err_t result = nvs_set_u32(handle, RC_AUTOMATION_SEQUENCE_KEY, s_outbox_sequence);
+    if (result == ESP_OK) result = nvs_commit(handle);
+    nvs_close(handle);
+    return result == ESP_OK;
+}
+
 static void queue_evidence(const char *rule_id, const char *project_id, const char *kind,
                            uint32_t run_count, char hosts[][16], uint8_t host_count)
 {
@@ -300,11 +313,13 @@ static void queue_evidence(const char *rule_id, const char *project_id, const ch
     strlcpy(record.project_id, project_id, sizeof(record.project_id));
     strlcpy(record.kind, kind, sizeof(record.kind));
     strlcpy(record.ip, s_network.ip, sizeof(record.ip));
+    strlcpy(record.boot_id, s_boot_nonce_hex, sizeof(record.boot_id));
     for (size_t index = 0; index < record.host_count; ++index) {
         strlcpy(record.hosts[index], hosts[index], sizeof(record.hosts[index]));
     }
     memmove(&s_outbox[0], &s_outbox[1], sizeof(s_outbox[0]) * (RC_MAX_OUTBOX - 1));
     s_outbox[RC_MAX_OUTBOX - 1] = record;
+    save_outbox_sequence();
     save_automation_blob(RC_AUTOMATION_OUTBOX_KEY, s_outbox, sizeof(s_outbox));
 }
 
@@ -1024,6 +1039,7 @@ static cJSON *outbox_response(const char *destination, const char *request_id,
         cJSON_AddStringToObject(item, "project_id", record->project_id);
         cJSON_AddStringToObject(item, "kind", record->kind);
         cJSON_AddStringToObject(item, "ip", record->ip);
+        cJSON_AddStringToObject(item, "boot_id", record->boot_id);
         cJSON_AddNumberToObject(item, "run_count", record->run_count);
         cJSON *hosts = cJSON_AddArrayToObject(item, "hosts");
         for (size_t host = 0; host < record->host_count; ++host) {
