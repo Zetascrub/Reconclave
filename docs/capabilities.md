@@ -33,6 +33,7 @@ new capability contract.
 | `tool.tcpdump.capture` | Desktop | Assessment (not signed-scope enforced — see below) | Implemented |
 | `tool.job.status` | Desktop | Read-only, non-sensitive | Implemented |
 | `tool.job.cancel` | Desktop | Assessment | Implemented |
+| `fleet.ota.apply` | Cardputer, PoE-P4 | Trusted, two-phase (see below) | Implemented |
 
 `net.discovery.scan` accepts an optional bounded scope with `network`,
 `start_ip`, and `end_ip`. Coordinators use these fields to allocate
@@ -149,6 +150,57 @@ have no wall-clock time, so they check `issued_at_ms`/`expires_at_ms` only for
 internal consistency (a valid, ≤5-minute lifetime) rather than against the current
 time; the desktop coordinator's own key custody and the request's boot-nonce-bound
 replay protection are what keeps an old token from being usefully replayed there.
+
+## Fleet OTA delivery
+
+`fleet.ota.apply` (`FleetManager._apply_release_to_device`, `tools/desktop-node/
+fleet_manager.py`) is deliberately two-phase rather than a single authenticated
+call like the capabilities above, because a firmware image is a few hundred KB
+to a couple MB and neither ESP32 target can safely hold a base64-inflated copy
+of that in RAM (poe-p4 has no PSRAM configured; cardputer-adv's 8MB PSRAM could
+technically fit one, but the same code path serves both targets):
+
+1. **Arm** — an ordinary authenticated request like any other trusted
+   capability above (signed, replay-checked, carries the coordinator's lease).
+   Its arguments are only the release descriptor (`device_type`, `version`,
+   `artifact_sha256`, `signature`) and a fresh coordinator-minted
+   `upload_token` — no artifact bytes. On success the device has opened its
+   *inactive* OTA partition for writing and remembers the token and the
+   claimed SHA-256; nothing has been written to flash yet beyond that.
+2. **Upload** — a second, raw (non-JSON, non-multipart) POST straight to a
+   dedicated path (`/reconclave/v1/ota-upload` on both targets) carrying the
+   artifact bytes and the token as a query parameter. The token — already
+   covered by phase 1's signature — is the only credential this request
+   presents; there is no per-chunk auth overhead. The device streams each
+   chunk directly into the flash write API (`esp_ota_write` / Arduino
+   `Update.write`) while feeding a running SHA-256, so it never buffers the
+   whole image. Only once the finished hash matches the value phase 1 signed
+   does the device call `esp_ota_set_boot_partition` / rely on `Update.end`'s
+   equivalent and reboot; a mismatch, an oversized transfer, or a transport
+   error aborts the write and leaves the previously running partition as the
+   boot target. The device's JSON reply back is itself authenticated the same
+   way a trusted-capability response is: an HMAC tag over
+   `device_id|coordinator_id|upload_token|status|artifact_sha256`, verified by
+   `Coordinator.upload_artifact` with the same key `invoke()` would have used.
+
+`poe-p4`'s partition table was previously single-app (no OTA slot at all) and
+now carries `ota_0`/`ota_1` plus `otadata` (`devices/poe-p4/partitions.csv`),
+with `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` + `CONFIG_APP_ROLLBACK_ENABLE` set
+in `sdkconfig.defaults` so a new image that never reaches a working network
+(and therefore never calls `esp_ota_mark_app_valid_cancel_rollback`, done once
+in `got_ip_event`) is reverted automatically by the bootloader. `cardputer-adv`
+already shipped with a two-OTA-slot table (`default_8MB.csv`) and gets the same
+`esp_ota_mark_app_valid_cancel_rollback` call once its network services start —
+but as a PlatformIO Arduino build against a precompiled framework bootloader,
+whether that bootloader itself was built with rollback support isn't something
+this firmware controls; the call is harmless either way.
+
+`FleetManager.create_release` takes the artifact as `artifact_base64` in
+addition to its previously-required `artifact_sha256`, re-hashes the decoded
+bytes, and rejects a mismatch. The bytes themselves are stored outside the
+workspace's JSON snapshot (`WorkspaceStore.store_ota_artifact`/
+`read_ota_artifact`, one file per SHA-256 under `ota_artifacts/`) since that
+snapshot is rewritten in full on every unrelated write.
 
 ## Recurring jobs
 

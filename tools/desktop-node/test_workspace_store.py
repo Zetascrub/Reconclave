@@ -399,6 +399,37 @@ class WorkspaceStoreTests(unittest.TestCase):
                                          sort_keys=True, separators=(",", ":")).encode()).hexdigest()
             self.assertNotEqual(recomputed_digest, tampered["bundle_sha256"])
 
+    # -- OTA artifact blob storage (fleet_manager.create_release) -----------
+
+    def test_store_ota_artifact_rejects_hash_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = WorkspaceStore(pathlib.Path(directory) / "workspace.json")
+            with self.assertRaisesRegex(ValueError, "do not match"):
+                store.store_ota_artifact("a" * 64, b"these bytes do not hash to a"*64)
+
+    def test_store_and_read_ota_artifact_round_trips_and_survives_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "workspace.json"
+            store = WorkspaceStore(path)
+            data = b"\x00\x01firmware-bytes\x02\x03" * 100
+            digest = __import__("hashlib").sha256(data).hexdigest()
+            store.store_ota_artifact(digest, data)
+            self.assertEqual(store.read_ota_artifact(digest), data)
+            self.assertIsNone(store.read_ota_artifact("0" * 64))
+            # The blob lives outside the JSON snapshot -- restarting the store must not
+            # lose it, and the snapshot itself must not have grown to contain it.
+            restored = WorkspaceStore(path)
+            self.assertEqual(restored.read_ota_artifact(digest), data)
+            self.assertNotIn(data.decode("latin-1"), __import__("json").dumps(store.snapshot()))
+
+    def test_ota_artifact_path_rejects_non_hex_identifiers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = WorkspaceStore(pathlib.Path(directory) / "workspace.json")
+            with self.assertRaises(ValueError):
+                store.read_ota_artifact("../../etc/passwd")
+            with self.assertRaises(ValueError):
+                store.store_ota_artifact("not-hex", b"data")
+
 
 if __name__ == "__main__":
     unittest.main()

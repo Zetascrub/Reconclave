@@ -33,6 +33,12 @@ WEB_ROOT = pathlib.Path(__file__).parent / "web" / "dist"
 DEFAULT_TRUST_STORE = pathlib.Path(__file__).resolve().parents[2] / ".reconclave-provisioning" / "fleet.json"
 DEFAULT_WORKSPACE_STORE = pathlib.Path(__file__).resolve().parents[2] / ".reconclave-data" / "workspace.json"
 MAX_BODY_BYTES = 2 * 1024 * 1024
+# /api/fleet/releases carries a whole firmware image as base64 (~1.34x inflation) plus a
+# little JSON overhead; FleetManager.MAX_ARTIFACT_BYTES bounds the decoded artifact itself,
+# this bounds the encoded request body reaching it. Kept as its own constant rather than
+# raising MAX_BODY_BYTES globally, since every other route has no business accepting
+# anything near this size.
+MAX_RELEASE_BODY_BYTES = 11 * 1024 * 1024
 MAX_INSPECTION_HOSTS = 16
 MAX_INSPECTION_PORTS = 128
 
@@ -387,8 +393,9 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_json(403, {"error": "untrusted_browser_request"})
             return
         try:
+            max_length = MAX_RELEASE_BODY_BYTES if path == "/api/fleet/releases" else MAX_BODY_BYTES
             length = int(self.headers.get("Content-Length", "0"))
-            if length <= 0 or length > MAX_BODY_BYTES:
+            if length <= 0 or length > max_length:
                 raise ValueError("invalid body length")
             body = json.loads(self.rfile.read(length))
             if not isinstance(body, dict):

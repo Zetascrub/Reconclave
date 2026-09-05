@@ -33,6 +33,7 @@ PROTOCOL = "reconclave/1"
 FIRMWARE = "0.1.0"
 ANNOUNCE_PATH = "/reconclave/v1/announce"
 MESSAGE_PATH = "/reconclave/v1/message"
+OTA_UPLOAD_PATH = "/reconclave/v1/ota-upload"
 MAX_EVIDENCE_RECORD_BYTES = 16 * 1024
 EVIDENCE_REQUIRED_FIELDS = ("job_id", "source_node", "target", "timestamp_ms", "observation")
 # Assessment, persistent writes, and job control all cross a trust boundary. A node

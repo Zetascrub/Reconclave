@@ -7,6 +7,24 @@ const FINDING_STATUSES: FindingStatus[] = ['open', 'candidate', 'confirmed-obser
 
 function stamp(value: number) { return new Date(value).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }) }
 
+// Hashes and base64-encodes a firmware artifact client-side so the operator never has to
+// compute a SHA-256 by hand: fleet_manager.create_release re-hashes the decoded bytes
+// server-side and rejects a mismatch regardless, this just gets it right the first time.
+// Chunked to avoid String.fromCharCode's argument-count ceiling on a multi-hundred-KB-to-
+// multi-MB image.
+async function readArtifactFile(file: File): Promise<{ base64: string; sha256: string }> {
+  const buffer = await file.arrayBuffer()
+  const digest = await crypto.subtle.digest('SHA-256', buffer)
+  const sha256 = Array.from(new Uint8Array(digest)).map((byte) => byte.toString(16).padStart(2, '0')).join('')
+  const bytes = new Uint8Array(buffer)
+  let binary = ''
+  const chunkSize = 0x8000
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize))
+  }
+  return { base64: btoa(binary), sha256 }
+}
+
 export default function WorkspaceViews({ view, workspace, nodes, projectId, onProject, onCreate, onInspect, onCreateAutomation, onUpdateAutomation, onDeleteAutomation, onCreateWorkflow, onRunWorkflow, onCancelWorkflow, onUpdateWorkflow, onDeleteWorkflow, onCreateScope, onImportFindings, onCorrelateFindings, onSetFindingStatus, onSetFindingSuppression, onCreateRelease, onCreateRollout, onAdvanceRollout, onRollbackRollout }:
   { view: View; workspace: WorkspaceData; nodes: ReconNode[]; projectId: string; onProject: (id: string) => void; onCreate: (name: string, description: string) => Promise<void>; onInspect: (hosts: string[], ports: number[]) => Promise<unknown>; onCreateAutomation: (body: Record<string, unknown>) => Promise<void>; onUpdateAutomation: (id: string, body: Record<string, unknown>) => Promise<void>; onDeleteAutomation: (id: string) => Promise<void>; onCreateWorkflow: (body: Record<string, unknown>) => Promise<void>; onRunWorkflow: (id: string) => Promise<void>; onCancelWorkflow: (id: string) => Promise<void>; onUpdateWorkflow: (id: string, body: Record<string, unknown>) => Promise<void>; onDeleteWorkflow: (id: string) => Promise<void>; onCreateScope: (body: Record<string, unknown>) => Promise<void>; onImportFindings: (body: Record<string, unknown>) => Promise<void>; onCorrelateFindings: () => Promise<unknown>; onSetFindingStatus: (id: string, status: FindingStatus) => Promise<void>; onSetFindingSuppression: (id: string, suppressed: boolean, reason: string) => Promise<void>; onCreateRelease: (body: Record<string, unknown>) => Promise<void>; onCreateRollout: (body: Record<string, unknown>) => Promise<void>; onAdvanceRollout: (id: string) => Promise<void>; onRollbackRollout: (id: string) => Promise<void> }) {
   const [query, setQuery] = useState('')
@@ -136,6 +154,8 @@ function FleetView({ nodes, releases, rollouts, onCreateRelease, onCreateRollout
   const [deviceType, setDeviceType] = useState('')
   const [version, setVersion] = useState('')
   const [artifactSha, setArtifactSha] = useState('')
+  const [artifactBase64, setArtifactBase64] = useState('')
+  const [artifactFileName, setArtifactFileName] = useState('')
   const [releaseError, setReleaseError] = useState('')
   const [selectedRelease, setSelectedRelease] = useState('')
   const [batchSize, setBatchSize] = useState(2)
@@ -153,9 +173,18 @@ function FleetView({ nodes, releases, rollouts, onCreateRelease, onCreateRollout
       <span className="kicker">SIGNED RELEASE</span><h2>Publish OTA artifact</h2>
       <label className="field"><span>DEVICE TYPE</span><input value={deviceType} onChange={(event) => setDeviceType(event.target.value)} placeholder="poe-p4" /></label>
       <label className="field"><span>VERSION</span><input value={version} onChange={(event) => setVersion(event.target.value)} placeholder="0.2.0" /></label>
-      <label className="field"><span>ARTIFACT SHA-256</span><input value={artifactSha} onChange={(event) => setArtifactSha(event.target.value.trim())} placeholder="64 hex characters" /></label>
+      <label className="field"><span>FIRMWARE ARTIFACT</span><input type="file" onChange={async (event) => {
+        setReleaseError(''); setArtifactSha(''); setArtifactBase64(''); setArtifactFileName('')
+        const file = event.target.files?.[0]
+        if (!file) return
+        try {
+          const { base64, sha256 } = await readArtifactFile(file)
+          setArtifactBase64(base64); setArtifactSha(sha256); setArtifactFileName(file.name)
+        } catch { setReleaseError('Could not read the selected firmware file') }
+      }} /></label>
+      {artifactFileName && <p>{artifactFileName} · sha256 {artifactSha.slice(0, 16)}…</p>}
       {releaseError && <div className="inspection-error">{releaseError}</div>}
-      <button className="primary-action" disabled={!deviceType.trim() || !version.trim() || !/^[0-9a-fA-F]{64}$/.test(artifactSha)} onClick={async () => { setReleaseError(''); try { await onCreateRelease({ device_type: deviceType.trim(), version: version.trim(), artifact_sha256: artifactSha }); setVersion(''); setArtifactSha('') } catch (error) { setReleaseError(error instanceof Error ? error.message : 'Could not sign release') } }}>SIGN RELEASE</button>
+      <button className="primary-action" disabled={!deviceType.trim() || !version.trim() || !artifactBase64} onClick={async () => { setReleaseError(''); try { await onCreateRelease({ device_type: deviceType.trim(), version: version.trim(), artifact_sha256: artifactSha, artifact_base64: artifactBase64 }); setVersion(''); setArtifactSha(''); setArtifactBase64(''); setArtifactFileName('') } catch (error) { setReleaseError(error instanceof Error ? error.message : 'Could not sign release') } }}>SIGN RELEASE</button>
       <RecordGrid empty="No releases signed yet.">{releases.map((release) => <article className={`record-card ${selectedRelease === release.id ? 'selected-record' : ''}`} key={release.id}><span className="record-icon">✎</span><div><span className="kicker">{release.device_type.toUpperCase()}</span><h3>{release.version}</h3><p>{release.artifact_sha256.slice(0, 16)}…</p><small>Signed {stamp(release.created_at_ms)}</small></div><div className="rule-actions"><button onClick={() => setSelectedRelease(release.id)}>{selectedRelease === release.id ? 'SELECTED' : 'SELECT FOR ROLLOUT'}</button></div></article>)}</RecordGrid>
     </div>
     <div className="panel create-card">

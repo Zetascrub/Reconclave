@@ -734,6 +734,39 @@ class WorkspaceStore:
             self._commit()
             return json.loads(json.dumps(release))
 
+    def _ota_artifact_path(self, artifact_sha256: str) -> pathlib.Path:
+        # Raw firmware bytes live as sibling files, not inside the JSON document itself --
+        # the workspace snapshot is a single JSON blob rewritten in full on every commit,
+        # and a multi-hundred-KB-to-multi-MB image (base64-inflated in JSON) has no
+        # business being reserialised on every unrelated write. Filename is the artifact's
+        # own claimed identity, already validated as 64 lowercase hex by FleetManager.
+        if not re.fullmatch(r"[0-9a-f]{64}", artifact_sha256):
+            raise ValueError("artifact_sha256 must be 64 lowercase hex characters")
+        return self.path.parent / "ota_artifacts" / f"{artifact_sha256}.bin"
+
+    def store_ota_artifact(self, artifact_sha256: str, data: bytes) -> None:
+        """Persists a release's firmware bytes, keyed by their own claimed SHA-256.
+
+        Rejects a mismatch between the claimed digest and the bytes actually supplied --
+        this is the one place that ever needs to check that, since every later read (a
+        rollout advancing, a rollback) trusts the filename it already validated here.
+        """
+        if hashlib.sha256(data).hexdigest() != artifact_sha256:
+            raise ValueError("artifact bytes do not match the claimed artifact_sha256")
+        with self.lock:
+            destination = self._ota_artifact_path(artifact_sha256)
+            destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            temporary = destination.with_suffix(".tmp")
+            temporary.write_bytes(data)
+            temporary.chmod(0o600)
+            os.replace(temporary, destination)
+
+    def read_ota_artifact(self, artifact_sha256: str) -> bytes | None:
+        path = self._ota_artifact_path(artifact_sha256)
+        if not path.is_file():
+            return None
+        return path.read_bytes()
+
     def add_ota_rollout(self, rollout: dict) -> dict:
         with self.lock:
             self.data["ota_rollouts"].append(json.loads(json.dumps(rollout)))

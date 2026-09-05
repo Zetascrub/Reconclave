@@ -7,8 +7,10 @@
 #include <Preferences.h>
 #include <SD.h>
 #include <SPI.h>
+#include <Update.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <esp_ota_ops.h>
 #include <esp_system.h>
 #include <mbedtls/md.h>
 #include <algorithm>
@@ -29,6 +31,8 @@ constexpr char kService[] = "reconclave";
 constexpr char kTransport[] = "tcp";
 constexpr char kAnnouncePath[] = "/reconclave/v1/announce";
 constexpr char kMessagePath[] = "/reconclave/v1/message";
+constexpr char kOtaUploadPath[] = "/reconclave/v1/ota-upload";
+constexpr uint32_t kOtaArmTimeoutMs = 60000;
 constexpr uint16_t kServerPort = 8766;
 constexpr uint16_t kP4FallbackPort = 8765;
 constexpr unsigned long kConnectTimeoutMs = 15000;
@@ -334,6 +338,34 @@ bool evidenceKeyValid;
 uint8_t executionKey[kPeerKeyBytes];
 bool executionKeyValid;
 bool provisioningExecutionKey{false};
+
+// Two-phase OTA session mirroring poe-p4's main.c: `fleet.ota.apply` (handleMessage, fully
+// authenticated by executionRequestAuthenticated like net.discovery.scan) arms a session
+// bound to one release's claimed SHA-256 and a fresh single-use token; the artifact bytes
+// travel separately over kOtaUploadPath's raw-body WebServer route (see OtaUploadHandler)
+// so this device never buffers a multi-hundred-KB-to-multi-MB base64 blob in RAM. The boot
+// partition only switches once the streamed bytes' own SHA-256 matches what phase 1 signed.
+struct OtaSession {
+  bool armed = false;
+  bool inProgress = false;
+  bool committed = false;
+  String token;
+  String expectedSha256;
+  String resultSha256Hex;
+  String resultTagHex;
+  size_t bytesWritten = 0;
+  size_t maxBytes = 0;
+  uint32_t armedAtMs = 0;
+  mbedtls_md_context_t md;
+  bool mdActive = false;
+};
+OtaSession otaSession;
+// Set only while handling one /ota-upload request whose token didn't match a live armed
+// session -- kept separate from OtaSession so a bogus/unauthenticated probe can never
+// disturb a real armed session that a legitimate coordinator is about to upload against.
+bool otaUploadRejectedAtStart = false;
+const char* otaUploadRejectCode = nullptr;
+uint32_t pendingRebootAtMs = 0;
 // Nonces this Cardputer has itself accepted on storage.evidence.write, so a captured
 // request can't be replayed against it. Small and bounded; no persistence needed.
 std::vector<String> recentEvidenceNonces;
@@ -2239,6 +2271,7 @@ void fillAnnouncement(JsonDocument& document) {
     capabilities.add("net.discovery.scan");
     capabilities.add("coordination.job.status");
     capabilities.add("coordination.job.cancel");
+    if (capabilityEnabled(deviceId, "fleet.ota.apply")) capabilities.add("fleet.ota.apply");
   }
   JsonArray descriptors = payload["capability_descriptors"].to<JsonArray>();
   for (JsonVariant capability : capabilities) {
@@ -2247,7 +2280,8 @@ void fillAnnouncement(JsonDocument& document) {
     descriptor["id"] = id;
     descriptor["version"] = 1;
     const bool trusted = id == "net.discovery.scan" || id == "storage.evidence.write" ||
-        id == "coordination.job.status" || id == "coordination.job.cancel";
+        id == "coordination.job.status" || id == "coordination.job.cancel" ||
+        id == "fleet.ota.apply";
     descriptor["permission"] = trusted ? "trusted" : "public";
     JsonArray features = descriptor["features"].to<JsonArray>();
     if (id == "net.discovery.scan") {
@@ -2390,6 +2424,145 @@ void addRemoteScanResult(JsonObject payload, const String& requestId) {
   for (const auto& host : remoteNodeScanHosts) hosts.add(host);
 }
 
+bool sha256HexValid(const String& value) {
+  if (value.length() != 64) return false;
+  for (size_t i = 0; i < value.length(); ++i) {
+    if (hexNibble(value[i]) < 0) return false;
+  }
+  return true;
+}
+
+// Tears down whichever live resources an OTA attempt is holding (a flash write in
+// progress, a streaming hash context) without disturbing the higher-level bookkeeping
+// (armed/token/expected digest) -- callers that still need those for a response, notably
+// the success path in OtaUploadHandler::raw, call this alone; otaSessionReset below
+// additionally clears that bookkeeping once nothing more needs it.
+void otaAbortResources() {
+  if (otaSession.mdActive) {
+    mbedtls_md_free(&otaSession.md);
+    otaSession.mdActive = false;
+  }
+  if (Update.isRunning()) Update.abort();
+}
+
+void otaSessionReset() {
+  otaAbortResources();
+  otaSession = OtaSession();
+}
+
+// Phase 2 of fleet.ota.apply: a raw (non-multipart, non-JSON) POST body registered via
+// WebServer's RequestHandler::raw() hook rather than the usual on()/lambda pair, since that
+// hook is what lets WebServer stream the body straight through instead of buffering the
+// whole request in one std::string first. canRaw/raw() run synchronously inside
+// _parseRequest while the body is still arriving; handle() runs once immediately after, to
+// actually send the response -- see arduino-esp32's WebServer/src/Parsing.cpp.
+class OtaUploadHandler : public RequestHandler {
+ public:
+  bool canHandle(HTTPMethod method, String uri) override {
+    return method == HTTP_POST && uri == kOtaUploadPath;
+  }
+  bool canRaw(String uri) override { return uri == kOtaUploadPath; }
+
+  void raw(WebServer& srv, String uri, HTTPRaw& raw) override {
+    (void)uri;
+    switch (raw.status) {
+      case RAW_START: {
+        otaUploadRejectedAtStart = false;
+        otaUploadRejectCode = nullptr;
+        const String token = srv.arg("token");
+        const uint32_t now = millis();
+        const bool expired = !otaSession.armed || (now - otaSession.armedAtMs) > kOtaArmTimeoutMs;
+        if (expired || token.isEmpty() || token != otaSession.token) {
+          // Deliberately does not touch otaSession: a bogus or replayed request must not be
+          // able to cancel a session the real coordinator is still about to upload against.
+          otaUploadRejectedAtStart = true;
+          otaUploadRejectCode = "OTA_NOT_ARMED";
+          return;
+        }
+        otaSession.armed = false;
+        otaSession.inProgress = true;
+        break;
+      }
+      case RAW_WRITE: {
+        if (otaUploadRejectedAtStart || !otaSession.inProgress) return;
+        if (otaSession.bytesWritten + raw.currentSize > otaSession.maxBytes) {
+          otaUploadRejectedAtStart = true;
+          otaUploadRejectCode = "OTA_TOO_LARGE";
+          otaSessionReset();
+          return;
+        }
+        if (mbedtls_md_update(&otaSession.md, raw.buf, raw.currentSize) != 0 ||
+            Update.write(raw.buf, raw.currentSize) != raw.currentSize) {
+          otaUploadRejectedAtStart = true;
+          otaUploadRejectCode = "OTA_WRITE_FAILED";
+          otaSessionReset();
+          return;
+        }
+        otaSession.bytesWritten += raw.currentSize;
+        break;
+      }
+      case RAW_END: {
+        if (otaUploadRejectedAtStart || !otaSession.inProgress) return;
+        uint8_t digest[32];
+        const bool hashed = mbedtls_md_finish(&otaSession.md, digest) == 0;
+        char digestHex[65] = {0};
+        if (hashed) hexEncode(digestHex, digest, sizeof(digest));
+        otaAbortResources(); // frees the (now-finished) md context; leaves Update alone
+        if (!hashed) {
+          otaUploadRejectCode = "OTA_WRITE_FAILED";
+        } else if (String(digestHex) != otaSession.expectedSha256) {
+          otaUploadRejectCode = "HASH_MISMATCH";
+        } else if (!Update.end(true)) {
+          otaUploadRejectCode = "OTA_END_FAILED";
+        }
+        if (otaUploadRejectCode != nullptr) {
+          otaUploadRejectedAtStart = true;
+          otaSessionReset();
+          return;
+        }
+        otaSession.committed = true;
+        otaSession.resultSha256Hex = digestHex;
+        const String canonical = String(deviceId) + "|" + RC_PROVISIONED_PRIMARY_ID + "|" +
+            otaSession.token + "|ok|" + otaSession.resultSha256Hex;
+        uint8_t tag[kTagBytes];
+        if (computeExecutionTag(canonical, tag)) {
+          char tagHex[kTagBytes * 2 + 1];
+          hexEncode(tagHex, tag, sizeof(tag));
+          otaSession.resultTagHex = tagHex;
+        }
+        break;
+      }
+      case RAW_ABORTED: {
+        // The client disconnected mid-transfer; nobody is left to send a response to, so
+        // clean up here rather than deferring to handle() (which never runs for this case).
+        otaSessionReset();
+        break;
+      }
+    }
+  }
+
+  bool handle(WebServer& srv, HTTPMethod method, String uri) override {
+    if (method != HTTP_POST || uri != kOtaUploadPath) return false;
+    if (otaSession.committed) {
+      const String body = String("{\"status\":\"ok\",\"artifact_sha256\":\"") +
+          otaSession.resultSha256Hex + "\",\"tag\":\"" + otaSession.resultTagHex + "\"}";
+      srv.send(200, "application/json", body);
+      otaSessionReset();
+      pendingRebootAtMs = millis() + 800;
+      return true;
+    }
+    const char* code = otaUploadRejectedAtStart && otaUploadRejectCode != nullptr
+        ? otaUploadRejectCode : "OTA_NOT_ARMED";
+    const int status = strcmp(code, "OTA_TOO_LARGE") == 0 ? 413 :
+        strcmp(code, "OTA_NOT_ARMED") == 0 ? 403 : 400;
+    srv.send(status, "application/json",
+            String("{\"status\":\"rejected\",\"error\":{\"code\":\"") + code +
+            "\",\"message\":\"OTA artifact upload failed\"}}");
+    return true;
+  }
+};
+OtaUploadHandler otaUploadHandler;
+
 void handleMessage() {
   if (server.arg("plain").length() > reconclave::kMaxPayloadBytes) {
     JsonDocument response;
@@ -2518,6 +2691,58 @@ void handleMessage() {
         addErrorPayload(response, requestId, "STORAGE_UNAVAILABLE", storeError.c_str(), "error");
       }
     }
+  } else if (capability == "fleet.ota.apply") {
+    if (!executionKeyValid || !capabilityEnabled(deviceId, "fleet.ota.apply")) {
+      addErrorPayload(response, requestId, "CAPABILITY_UNAVAILABLE", "Capability is not available");
+    } else if (!(executionAuthenticated = executionRequestAuthenticated(
+                     source, deviceId, requestId, capability.c_str(),
+                     request["payload"]["arguments"], request["payload"]["auth"], executionNonce))) {
+      addErrorPayload(response, requestId, "UNAUTHENTICATED", "request is not signed or was replayed");
+    } else {
+      JsonVariantConst arguments = request["payload"]["arguments"];
+      JsonVariantConst release = arguments["release"];
+      const String releaseDeviceType = release["device_type"] | "";
+      const String artifactSha256 = release["artifact_sha256"] | "";
+      const String uploadToken = arguments["upload_token"] | "";
+      const uint32_t now = millis();
+      const bool stale = (otaSession.armed || otaSession.inProgress) &&
+          (now - otaSession.armedAtMs) > kOtaArmTimeoutMs;
+      if (releaseDeviceType != "cardputer-adv" || !sha256HexValid(artifactSha256) ||
+          uploadToken.isEmpty() || uploadToken.length() > 64) {
+        addErrorPayload(response, requestId, "RELEASE_INVALID",
+                        "release descriptor is missing or does not target this device");
+      } else if ((otaSession.armed || otaSession.inProgress) && !stale) {
+        addErrorPayload(response, requestId, "OTA_BUSY", "an OTA session is already in progress");
+      } else {
+        otaSessionReset();
+        const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+        mbedtls_md_init(&otaSession.md);
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+          addErrorPayload(response, requestId, "OTA_BEGIN_FAILED",
+                          "failed to prepare flash for writing", "error");
+        } else if (info == nullptr || mbedtls_md_setup(&otaSession.md, info, 0) != 0 ||
+                   mbedtls_md_starts(&otaSession.md) != 0) {
+          Update.abort();
+          addErrorPayload(response, requestId, "OTA_BEGIN_FAILED",
+                          "failed to initialise artifact verification", "error");
+        } else {
+          otaSession.mdActive = true;
+          otaSession.armed = true;
+          otaSession.token = uploadToken;
+          otaSession.expectedSha256 = artifactSha256;
+          otaSession.expectedSha256.toLowerCase();
+          otaSession.armedAtMs = now;
+          otaSession.bytesWritten = 0;
+          otaSession.maxBytes = Update.size();
+          JsonObject payload = response["payload"].to<JsonObject>();
+          payload["request_id"] = requestId;
+          payload["status"] = "ok";
+          JsonObject result = payload["result"].to<JsonObject>();
+          result["upload_path"] = kOtaUploadPath;
+          result["max_bytes"] = otaSession.maxBytes;
+        }
+      }
+    }
   } else if (capability != "system.info") {
     addErrorPayload(response, requestId, "CAPABILITY_UNAVAILABLE", "Capability is not available");
   } else {
@@ -2538,6 +2763,25 @@ void handleMessage() {
 }
 
 void startNodeServices() {
+  // Reaching working network services is this device's minimal self-test after an OTA
+  // update. If the running bootloader supports app rollback and left this image marked
+  // pending-verify, confirm it now; a build that crash-loops before ever getting here relies
+  // on the bootloader's own rollback logic instead. Caveat: unlike poe-p4 (an ESP-IDF
+  // project whose sdkconfig.defaults now enables CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
+  // explicitly), this is a PlatformIO Arduino build against a precompiled framework
+  // bootloader -- whether that bootloader was itself built with rollback support isn't
+  // something this sketch controls. The call is harmless either way (a no-op error return
+  // if the running partition isn't in the pending-verify state).
+  static bool otaMarkedValid = false;
+  if (!otaMarkedValid) {
+    const esp_partition_t* running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state;
+    if (running != nullptr && esp_ota_get_state_partition(running, &state) == ESP_OK &&
+        state == ESP_OTA_IMG_PENDING_VERIFY) {
+      esp_ota_mark_app_valid_cancel_rollback();
+    }
+    otaMarkedValid = true;
+  }
   if (!mdnsReady) {
     mdnsReady = MDNS.begin(("reconclave-adv-" + deviceId.substring(deviceId.length() - 6)).c_str());
     if (mdnsReady) {
@@ -2551,6 +2795,7 @@ void startNodeServices() {
   if (!serverReady) {
     server.on(kAnnouncePath, HTTP_GET, handleAnnounce);
     server.on(kMessagePath, HTTP_POST, handleMessage);
+    server.addHandler(&otaUploadHandler);
     server.onNotFound([] { server.send(404, "application/json", "{\"error\":\"not_found\"}"); });
     server.begin();
     serverReady = true;
@@ -4707,6 +4952,12 @@ void loop() {
   M5Cardputer.update();
   updateGrove();
   if (serverReady) server.handleClient();
+  // A successful fleet.ota.apply upload sets this rather than calling esp_restart()
+  // directly, so the HTTP response confirming success has already been flushed to the
+  // coordinator by the time handleClient() returns control here.
+  if (pendingRebootAtMs != 0 && (int32_t)(millis() - pendingRebootAtMs) >= 0) {
+    esp_restart();
+  }
   if (millis() - lastOutboxRetryMs >= 30000UL) {
     lastOutboxRetryMs = millis();
     retryEvidenceOutbox();

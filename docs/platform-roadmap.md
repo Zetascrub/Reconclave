@@ -49,7 +49,7 @@ capabilities require a separate, explicit approval policy and are disabled by de
 | 1 | Signed engagement scopes and policy engine | Complete | Immutable scope revisions, exclusions, expiry, rate/concurrency limits, provider enforcement |
 | 2 | Workflow and campaign engine | Initial slice complete | Durable DAG definitions/runs, dependency scheduling, retries, cancellation, resumability |
 | 3 | Capability SDK and packaged tool runners | Complete | Signed manifests, schemas, risk classes, discovery, sandboxed desktop execution |
-| 4 | Fleet management and signed OTA | In progress | Health/inventory/config drift, staged rollout, verification and rollback |
+| 4 | Fleet management and signed OTA | Complete (device firmware unverified on real hardware — see Phase 4 notes) | Health/inventory/config drift, staged rollout, verification and rollback |
 | 5 | Evidence pipeline and chain of custody | In progress | Content-addressed records, node MAC/signature, encrypted spool, receipts, export bundle |
 | 6 | Live operations timeline | Complete | Correlated campaign/job/node/evidence events with trace IDs and searchable audit history |
 | 7 | Adaptive distributed scheduling | Planned | Capability/resource/topology selection, scope sharding, failover and backpressure, consensus scanning (design doc §9.2) |
@@ -159,12 +159,30 @@ already wired to live API routes. Corrected here rather than left stale.
   form, and staged-rollout creation/advance/rollback — the one view that intentionally ignores the
   per-project filter every other tab applies, since fleet spans the whole deployment. Web build and
   lint both verified clean.
-- [ ] **Device-side `fleet.ota.apply`: not implemented on any firmware.** Grep for it across `devices/`
-  turns up nothing — no ESP32 target can currently accept or apply a signed OTA artifact. Every rollout
-  against a real device today ends up `ineligible`, not `verified`/`failed`; the orchestration above is
-  real and tested, but the loop isn't closed until firmware exists to receive it. This is genuinely
-  separate, substantial work (flash partition writes, verified-boot/rollback-safe partition switching on
-  ESP32) that wasn't attempted here — flagging rather than leaving it implied by an unqualified checkmark.
+- [x] Device-side `fleet.ota.apply`: implemented on both ESP32 targets as a two-phase capability —
+  see `docs/capabilities.md`'s "Fleet OTA delivery" section for the full design. Phase 1 arms the
+  device over the ordinary authenticated envelope (release descriptor + a fresh upload token, no
+  artifact bytes); phase 2 streams the artifact to a dedicated raw-body endpoint
+  (`/reconclave/v1/ota-upload`) straight into the inactive OTA partition (`esp_ota_write` on
+  poe-p4, Arduino `Update.write` on cardputer-adv) with a running SHA-256, so neither target ever
+  buffers a base64-inflated image in RAM (poe-p4 has no PSRAM configured). The boot partition only
+  switches once the finished hash matches what phase 1 signed. `poe-p4`'s partition table gained
+  `ota_0`/`ota_1`/`otadata` (`devices/poe-p4/partitions.csv`, previously single-app) plus
+  `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`/`CONFIG_APP_ROLLBACK_ENABLE`; `cardputer-adv` already had
+  a two-OTA-slot table. Both call `esp_ota_mark_app_valid_cancel_rollback` once network services
+  come up post-boot. `FleetManager.create_release` now takes the artifact bytes
+  (`artifact_base64`), re-hashes and rejects a mismatch, and stores them outside the workspace's
+  JSON snapshot (`WorkspaceStore.store_ota_artifact`/`read_ota_artifact`); `advance_rollout`/
+  `rollback_rollout` drive both phases via `Coordinator.invoke` + the new `Coordinator.
+  upload_artifact`. Test coverage: `test_fleet_manager.py`, `test_workspace_store.py`, and
+  `test_coordinator.py` all extended (131 desktop-node tests pass). **Verification limits, stated
+  plainly:** `cardputer-adv` (PlatformIO/Arduino, toolchain available in this environment) builds
+  clean with `-Wall -Wextra -Wformat=2` and no new warnings. `poe-p4` (ESP-IDF/CMake) could not be
+  compiled here — no `idf.py` toolchain in this environment — so its C changes were reviewed by
+  hand against the exact vendored API signatures (mbedtls 3.6.7, `esp_ota_ops.h`) rather than
+  compiled; treat it as unverified until a real `idf.py build` confirms it. **Neither target has
+  been flashed to real hardware or exercised through an actual OTA cycle** — validate on real
+  devices, starting with a bench unit, before rolling out to anything already deployed.
 
 ## Phase 9 vulnerability analysis
 

@@ -9,16 +9,21 @@ import secrets
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Callable
 
 from zeroconf import ServiceBrowser, ServiceInfo, ServiceListener, Zeroconf
 
-from reconclave_node import ANNOUNCE_PATH, AUTH_TAG_BYTES, MESSAGE_PATH, PROTOCOL, Node
+from reconclave_node import ANNOUNCE_PATH, AUTH_TAG_BYTES, MESSAGE_PATH, OTA_UPLOAD_PATH, PROTOCOL, Node
 
 NODE_TTL_SECONDS = 45.0
 REQUEST_TIMEOUT_SECONDS = 4.0
+# fleet.ota.apply's upload phase (Coordinator.upload_artifact) streams a whole firmware
+# image and the device spends real time hashing/flashing it -- REQUEST_TIMEOUT_SECONDS is
+# sized for lightweight capability calls and would false-positive on this one.
+OTA_UPLOAD_TIMEOUT_SECONDS = 60.0
 REFRESH_INTERVAL_SECONDS = 12.0
 COORDINATOR_PRIORITY = 100
 COORDINATOR_LEASE_MS = 15000
@@ -335,4 +340,58 @@ class Coordinator(ServiceListener):
                 current = self.peers.get(device_id)
                 if current is not None:
                     current.last_seen = self.clock()
+        return result
+
+    def upload_artifact(self, device_id: str, upload_token: str, artifact: bytes) -> dict:
+        """Streams a previously-armed OTA artifact to a node's dedicated upload endpoint.
+
+        This is phase 2 of `fleet.ota.apply` (see FleetManager.advance_rollout): phase 1 is
+        an ordinary authenticated invoke() that arms the node with a claimed artifact
+        SHA-256 and mints `upload_token`. This call bypasses the generic JSON envelope
+        entirely and POSTs the raw artifact bytes -- the whole point is to never require
+        the *device* to hold a base64-inflated copy of a multi-hundred-KB-to-multi-MB image
+        in RAM. The token itself, already covered by phase 1's signature, is the only
+        credential the device checks on this request; the device independently verifies the
+        streamed bytes' own SHA-256 against that same covered digest before it ever
+        switches its boot partition. The device's JSON reply is authenticated the same way
+        a "trusted" envelope response is -- a truncated HMAC tag over the outcome, verified
+        here with the same key invoke() would have used for this device.
+        """
+        if device_id == self.node.node_id:
+            raise ValueError("cannot upload an OTA artifact to the local coordinator node")
+        with self.lock:
+            peer = self.peers.get(device_id)
+        if peer is None:
+            raise KeyError("node is no longer available")
+        advertised = peer.announcement.get("payload", {})
+        if "fleet.ota.apply" not in advertised.get("capabilities", []):
+            raise ValueError("capability is not advertised by this node")
+        key = self.trust_keys.get(device_id, self.execution_key)
+        if key is None:
+            raise PermissionError("the required trust-domain key is not configured")
+        url = (f"http://{peer.address}:{peer.port}{OTA_UPLOAD_PATH}"
+               f"?token={urllib.parse.quote(upload_token, safe='')}")
+        http_request = urllib.request.Request(
+            url, data=artifact, headers={"Content-Type": "application/octet-stream"}, method="POST")
+        try:
+            with urllib.request.urlopen(http_request, timeout=OTA_UPLOAD_TIMEOUT_SECONDS) as response:
+                result = json.load(response)
+        except urllib.error.HTTPError as error:
+            try:
+                result = json.load(error)
+            except (ValueError, OSError) as parse_error:
+                raise ConnectionError(f"node returned HTTP {error.code}") from parse_error
+        except (OSError, ValueError, urllib.error.URLError) as error:
+            raise ConnectionError("artifact upload failed") from error
+        if result.get("status") != "ok":
+            raise ValueError(str(result.get("error", {}).get("message", "artifact upload was rejected")))
+        digest = str(result.get("artifact_sha256", ""))
+        canonical = f"{device_id}|{self.node.node_id}|{upload_token}|ok|{digest}".encode()
+        expected_tag = hmac.new(key, canonical, hashlib.sha256).digest()[:AUTH_TAG_BYTES].hex()
+        if not hmac.compare_digest(str(result.get("tag", "")), expected_tag):
+            raise ConnectionError("node returned an unauthenticated OTA result")
+        with self.changed:
+            current = self.peers.get(device_id)
+            if current is not None:
+                current.last_seen = self.clock()
         return result

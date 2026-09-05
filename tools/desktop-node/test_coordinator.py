@@ -272,6 +272,78 @@ class CoordinatorTests(unittest.TestCase):
             result = self.coordinator.invoke("rc-peer", "system.info", {}, trace_id="trace-abc123")
         self.assertEqual(result["payload"]["status"], "ok")
 
+    # -- upload_artifact (fleet.ota.apply phase 2) --------------------------
+
+    def test_upload_artifact_rejects_unadvertised_capability_without_network_request(self):
+        self.coordinator.peers["rc-peer"] = coordinator_module.Peer(
+            "rc-peer", "192.0.2.8", 8767, self.announcement(), self.now)
+        with mock.patch.object(coordinator_module.urllib.request, "urlopen") as opener:
+            with self.assertRaisesRegex(ValueError, "not advertised"):
+                self.coordinator.upload_artifact("rc-peer", "tok", b"firmware-bytes")
+            opener.assert_not_called()
+
+    def test_upload_artifact_posts_raw_bytes_and_verifies_authenticated_result(self):
+        announcement = self.announcement(capabilities=["fleet.ota.apply"])
+        self.coordinator.peers["rc-peer"] = coordinator_module.Peer(
+            "rc-peer", "192.0.2.8", 8767, announcement, self.now)
+        artifact = b"\x01\x02firmware-image-bytes\x03\x04"
+        digest = "d" * 64
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        captured = {}
+
+        def open_request(request, timeout):
+            captured["request"] = request
+            return response
+
+        def result_document(_response):
+            request = captured["request"]
+            canonical = f"rc-peer|rc-local|tok|ok|{digest}".encode()
+            tag = coordinator_module.hmac.new(
+                self.coordinator.execution_key, canonical,
+                coordinator_module.hashlib.sha256).digest()[:16].hex()
+            return {"status": "ok", "artifact_sha256": digest, "tag": tag}
+
+        with mock.patch.object(coordinator_module.urllib.request, "urlopen",
+                               side_effect=open_request) as opener, \
+             mock.patch.object(coordinator_module.json, "load", side_effect=result_document):
+            result = self.coordinator.upload_artifact("rc-peer", "tok", artifact)
+        self.assertEqual(result["artifact_sha256"], digest)
+        request = captured["request"]
+        self.assertEqual(request.data, artifact)
+        self.assertIn("/ota-upload?token=tok", request.full_url)
+        self.assertEqual(request.get_header("Content-type"), "application/octet-stream")
+        opener.assert_called_once()
+        self.assertEqual(opener.call_args.kwargs.get("timeout") or opener.call_args.args[1],
+                         coordinator_module.OTA_UPLOAD_TIMEOUT_SECONDS)
+
+    def test_upload_artifact_rejects_result_with_wrong_tag(self):
+        announcement = self.announcement(capabilities=["fleet.ota.apply"])
+        self.coordinator.peers["rc-peer"] = coordinator_module.Peer(
+            "rc-peer", "192.0.2.8", 8767, announcement, self.now)
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        with mock.patch.object(coordinator_module.urllib.request, "urlopen", return_value=response), \
+             mock.patch.object(coordinator_module.json, "load",
+                               return_value={"status": "ok", "artifact_sha256": "d" * 64, "tag": "00" * 16}):
+            with self.assertRaises(ConnectionError):
+                self.coordinator.upload_artifact("rc-peer", "tok", b"firmware")
+
+    def test_upload_artifact_surfaces_device_rejection_message(self):
+        announcement = self.announcement(capabilities=["fleet.ota.apply"])
+        self.coordinator.peers["rc-peer"] = coordinator_module.Peer(
+            "rc-peer", "192.0.2.8", 8767, announcement, self.now)
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        with mock.patch.object(coordinator_module.urllib.request, "urlopen", return_value=response), \
+             mock.patch.object(coordinator_module.json, "load", return_value={
+                 "status": "rejected", "error": {"code": "HASH_MISMATCH", "message": "digest did not match"}}):
+            with self.assertRaisesRegex(ValueError, "digest did not match"):
+                self.coordinator.upload_artifact("rc-peer", "tok", b"firmware")
+
     def test_signed_json_rejects_ambiguous_float_representation(self):
         with self.assertRaisesRegex(ValueError, "signed JSON"):
             coordinator_module.canonical_digest({"interval_ms": 1000.0})

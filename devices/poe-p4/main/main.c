@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -16,6 +17,7 @@
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_netif_net_stack.h"
+#include "esp_ota_ops.h"
 #include "esp_random.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -23,6 +25,7 @@
 #include "freertos/task.h"
 #include "mdns.h"
 #include "mbedtls/md.h"
+#include "mbedtls/sha256.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "lwip/ip_addr.h"
@@ -38,6 +41,10 @@
 #define RC_INSTANCE "Reconclave Unit PoE-P4"
 #define RC_HTTP_PORT 8765
 #define RC_MAX_REQUEST_BYTES 4096
+#define RC_OTA_UPLOAD_PATH "/reconclave/v1/ota-upload"
+#define RC_OTA_ARM_TIMEOUT_MS 60000
+#define RC_OTA_TOKEN_MAX_LEN 64
+#define RC_OTA_CHUNK_BYTES 1536
 
 #define POE_P4_PHY_ADDR 1
 #define POE_P4_PHY_RESET_GPIO 51
@@ -94,6 +101,33 @@ static size_t s_recent_nonce_cursor;
 static char s_lease_owner_id[32];
 static uint8_t s_lease_priority;
 static uint32_t s_lease_expires_ms;
+static bool s_ota_marked_valid;
+
+// Two-phase OTA session: `fleet.ota.apply` (message_handler, fully authenticated by the
+// same envelope as every other capability) arms a session bound to one release's claimed
+// SHA-256 and a fresh single-use token; the artifact bytes themselves then travel over a
+// dedicated raw-body endpoint (RC_OTA_UPLOAD_PATH) so the device never needs to buffer a
+// multi-hundred-KB base64 blob in RAM (this board has no PSRAM configured) or its
+// equivalent decoded binary -- each chunk streams straight into the inactive partition via
+// esp_ota_write while a running SHA-256 hashes it, and nothing is committed to the boot
+// partition unless the finished digest matches the value that was inside the signed
+// arm request.
+typedef struct {
+    bool armed;
+    bool in_progress;
+    bool handle_open;
+    char token[RC_OTA_TOKEN_MAX_LEN + 1];
+    char expected_sha256[65];
+    char armer_peer_id[32];
+    uint8_t armer_key[RC_KEY_BYTES];
+    uint32_t armed_at_ms;
+    esp_ota_handle_t handle;
+    const esp_partition_t *partition;
+    mbedtls_sha256_context sha;
+    size_t bytes_written;
+    size_t max_bytes;
+} ota_session_t;
+static ota_session_t s_ota;
 
 typedef enum {
     RC_SCAN_IDLE,
@@ -1151,11 +1185,13 @@ static cJSON *announcement(void)
     cJSON_AddItemToArray(capabilities, cJSON_CreateString("automation.rule.delete"));
     cJSON_AddItemToArray(capabilities, cJSON_CreateString("evidence.outbox.read"));
     cJSON_AddItemToArray(capabilities, cJSON_CreateString("evidence.outbox.ack"));
+    cJSON_AddItemToArray(capabilities, cJSON_CreateString("fleet.ota.apply"));
     cJSON *descriptors = cJSON_AddArrayToObject(payload, "capability_descriptors");
     const char *ids[] = {"system.info", "net.discovery.scan", "coordination.job.status",
                          "coordination.job.cancel", "net.connectivity.check",
                          "net.arp.snapshot", "automation.rule.put", "automation.rule.list",
-                         "automation.rule.delete", "evidence.outbox.read", "evidence.outbox.ack"};
+                         "automation.rule.delete", "evidence.outbox.read", "evidence.outbox.ack",
+                         "fleet.ota.apply"};
     for (size_t index = 0; index < sizeof(ids) / sizeof(ids[0]); ++index) {
         cJSON *descriptor = cJSON_CreateObject();
         cJSON_AddStringToObject(descriptor, "id", ids[index]);
@@ -1590,6 +1626,203 @@ static bool scope_delegation_valid(const cJSON *arguments, const char *capabilit
     return true;
 }
 
+static bool sha256_hex_is_valid(const char *value)
+{
+    if (value == NULL || strlen(value) != 64) return false;
+    for (size_t i = 0; i < 64; ++i) {
+        if (hex_nibble(value[i]) < 0) return false;
+    }
+    return true;
+}
+
+// Releases and aborts whatever OTA state is currently held (a not-yet-uploaded arm, a
+// partly-streamed upload, or nothing at all) and zeroes the session. Safe to call from any
+// state, including after a caller already finished the handle itself (handle_open tracks
+// that rather than trusting the handle value, since esp_ota_handle_t has no reserved
+// "invalid" sentinel of its own).
+static void ota_session_reset(void)
+{
+    if (s_ota.handle_open) {
+        esp_ota_abort(s_ota.handle);
+    }
+    if (s_ota.armed || s_ota.in_progress) {
+        mbedtls_sha256_free(&s_ota.sha);
+    }
+    memset(&s_ota, 0, sizeof(s_ota));
+}
+
+static void ota_reboot_callback(void *argument)
+{
+    (void)argument;
+    esp_restart();
+}
+
+// Reboots shortly after a successful apply rather than immediately, so the HTTP response
+// confirming success has a chance to actually reach the coordinator first.
+static void ota_schedule_reboot(uint32_t delay_ms)
+{
+    const esp_timer_create_args_t args = {.callback = ota_reboot_callback, .name = "rc_ota_reboot"};
+    esp_timer_handle_t timer;
+    if (esp_timer_create(&args, &timer) == ESP_OK) {
+        esp_timer_start_once(timer, (uint64_t)delay_ms * 1000ULL);
+    }
+}
+
+// Phase 1 of `fleet.ota.apply`: authenticated exactly like every other capability (the
+// caller has already passed authenticate_request/coordinator_lease_accept by the time this
+// runs), this only commits the release's claimed device_type/artifact_sha256 and a
+// coordinator-chosen upload token to memory and opens the inactive OTA partition for
+// writing. No artifact bytes are exchanged here -- see RC_OTA_UPLOAD_PATH.
+static cJSON *ota_apply_response(const char *destination, const char *request_id,
+                                 const rc_provisioned_peer_t *peer, const cJSON *arguments)
+{
+    const cJSON *release = cJSON_GetObjectItemCaseSensitive(arguments, "release");
+    const cJSON *device_type = cJSON_GetObjectItemCaseSensitive(release, "device_type");
+    const cJSON *sha_json = cJSON_GetObjectItemCaseSensitive(release, "artifact_sha256");
+    const cJSON *token_json = cJSON_GetObjectItemCaseSensitive(arguments, "upload_token");
+    if (!cJSON_IsObject(release) || !json_string_equals(device_type, "poe-p4") ||
+        !cJSON_IsString(sha_json) || !sha256_hex_is_valid(sha_json->valuestring) ||
+        !cJSON_IsString(token_json) || token_json->valuestring[0] == '\0' ||
+        strlen(token_json->valuestring) > RC_OTA_TOKEN_MAX_LEN) {
+        return error_response(destination, request_id, "RELEASE_INVALID",
+                              "release descriptor is missing or does not target this device");
+    }
+    const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    const bool stale = (s_ota.armed || s_ota.in_progress) &&
+                       (now - s_ota.armed_at_ms) > RC_OTA_ARM_TIMEOUT_MS;
+    if ((s_ota.armed || s_ota.in_progress) && !stale) {
+        return error_response(destination, request_id, "OTA_BUSY",
+                              "an OTA session is already in progress");
+    }
+    ota_session_reset();
+    const esp_partition_t *partition = esp_ota_get_next_update_partition(NULL);
+    if (partition == NULL) {
+        return error_response(destination, request_id, "OTA_UNAVAILABLE",
+                              "no inactive OTA partition is available on this device");
+    }
+    esp_ota_handle_t handle;
+    if (esp_ota_begin(partition, OTA_SIZE_UNKNOWN, &handle) != ESP_OK) {
+        return error_response(destination, request_id, "OTA_BEGIN_FAILED",
+                              "failed to prepare the inactive partition for writing");
+    }
+    mbedtls_sha256_init(&s_ota.sha);
+    if (mbedtls_sha256_starts(&s_ota.sha, 0) != 0) {
+        mbedtls_sha256_free(&s_ota.sha);
+        esp_ota_abort(handle);
+        return error_response(destination, request_id, "OTA_BEGIN_FAILED",
+                              "failed to initialise artifact verification");
+    }
+    strlcpy(s_ota.token, token_json->valuestring, sizeof(s_ota.token));
+    for (size_t i = 0; i < 64; ++i) {
+        s_ota.expected_sha256[i] = (char)tolower((unsigned char)sha_json->valuestring[i]);
+    }
+    s_ota.expected_sha256[64] = '\0';
+    strlcpy(s_ota.armer_peer_id, peer->peer_id, sizeof(s_ota.armer_peer_id));
+    memcpy(s_ota.armer_key, peer->key, sizeof(s_ota.armer_key));
+    s_ota.armed_at_ms = now;
+    s_ota.handle = handle;
+    s_ota.handle_open = true;
+    s_ota.partition = partition;
+    s_ota.bytes_written = 0;
+    s_ota.max_bytes = partition->size;
+    s_ota.armed = true;
+
+    cJSON *root = new_envelope("response", destination);
+    cJSON *payload = cJSON_AddObjectToObject(root, "payload");
+    cJSON_AddStringToObject(payload, "request_id", request_id);
+    cJSON_AddStringToObject(payload, "status", "ok");
+    cJSON *result = cJSON_AddObjectToObject(payload, "result");
+    cJSON_AddStringToObject(result, "upload_path", RC_OTA_UPLOAD_PATH);
+    cJSON_AddNumberToObject(result, "max_bytes", (double)s_ota.max_bytes);
+    return root;
+}
+
+static esp_err_t ota_upload_reject(httpd_req_t *request, const char *http_status, const char *code)
+{
+    ota_session_reset();
+    httpd_resp_set_status(request, http_status);
+    httpd_resp_set_type(request, "application/json");
+    char body[160];
+    snprintf(body, sizeof(body),
+            "{\"status\":\"rejected\",\"error\":{\"code\":\"%s\",\"message\":\"OTA artifact upload failed\"}}",
+            code);
+    return httpd_resp_sendstr(request, body);
+}
+
+// Phase 2 of `fleet.ota.apply`: a raw-body POST, not a `reconclave/1` JSON envelope, since
+// the whole point is to avoid ever holding the full base64-inflated artifact in RAM. The
+// only credential is the single-use token phase 1 minted inside an already-authenticated
+// request; possession of it authorises writing to the (already-opened, already-scoped)
+// inactive partition and nothing else. The boot partition only switches once the streamed
+// bytes' own SHA-256 matches the digest that was itself covered by phase 1's signature.
+static esp_err_t ota_upload_handler(httpd_req_t *request)
+{
+    char query[160];
+    char token[RC_OTA_TOKEN_MAX_LEN + 1] = {0};
+    if (httpd_req_get_url_query_str(request, query, sizeof(query)) == ESP_OK) {
+        httpd_query_key_value(query, "token", token, sizeof(token));
+    }
+    const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    const bool expired = !s_ota.armed || (now - s_ota.armed_at_ms) > RC_OTA_ARM_TIMEOUT_MS;
+    if (expired || token[0] == '\0' || strcmp(token, s_ota.token) != 0 || request->content_len <= 0) {
+        return ota_upload_reject(request, "403 Forbidden", "OTA_NOT_ARMED");
+    }
+    s_ota.armed = false;
+    s_ota.in_progress = true;
+
+    uint8_t buffer[RC_OTA_CHUNK_BYTES];
+    int remaining = (int)request->content_len;
+    while (remaining > 0) {
+        const int want = remaining < (int)sizeof(buffer) ? remaining : (int)sizeof(buffer);
+        const int got = httpd_req_recv(request, (char *)buffer, (size_t)want);
+        if (got <= 0) return ota_upload_reject(request, "400 Bad Request", "OTA_TRANSPORT_ERROR");
+        if (s_ota.bytes_written + (size_t)got > s_ota.max_bytes) {
+            return ota_upload_reject(request, "413 Payload Too Large", "OTA_TOO_LARGE");
+        }
+        if (esp_ota_write(s_ota.handle, buffer, (size_t)got) != ESP_OK) {
+            return ota_upload_reject(request, "500 Internal Server Error", "OTA_WRITE_FAILED");
+        }
+        if (mbedtls_sha256_update(&s_ota.sha, buffer, (size_t)got) != 0) {
+            return ota_upload_reject(request, "500 Internal Server Error", "OTA_WRITE_FAILED");
+        }
+        s_ota.bytes_written += (size_t)got;
+        remaining -= got;
+    }
+
+    uint8_t digest[32];
+    if (mbedtls_sha256_finish(&s_ota.sha, digest) != 0) {
+        return ota_upload_reject(request, "500 Internal Server Error", "OTA_WRITE_FAILED");
+    }
+    char digest_hex[65];
+    hex_encode(digest_hex, digest, sizeof(digest));
+    if (strcmp(digest_hex, s_ota.expected_sha256) != 0) {
+        return ota_upload_reject(request, "400 Bad Request", "HASH_MISMATCH");
+    }
+    if (esp_ota_end(s_ota.handle) != ESP_OK) {
+        s_ota.handle_open = false; // esp_ota_end releases the handle regardless of outcome
+        return ota_upload_reject(request, "400 Bad Request", "OTA_END_FAILED");
+    }
+    s_ota.handle_open = false;
+    if (esp_ota_set_boot_partition(s_ota.partition) != ESP_OK) {
+        return ota_upload_reject(request, "500 Internal Server Error", "OTA_SET_BOOT_FAILED");
+    }
+
+    char canonical[220];
+    snprintf(canonical, sizeof(canonical), "%s|%s|%s|ok|%s", s_device_id,
+             s_ota.armer_peer_id, s_ota.token, digest_hex);
+    uint8_t tag[RC_TAG_BYTES];
+    char tag_hex[RC_TAG_BYTES * 2 + 1] = {0};
+    if (compute_tag_with_key(s_ota.armer_key, canonical, tag)) hex_encode(tag_hex, tag, sizeof(tag));
+    char body[256];
+    snprintf(body, sizeof(body), "{\"status\":\"ok\",\"artifact_sha256\":\"%s\",\"tag\":\"%s\"}",
+            digest_hex, tag_hex);
+    ota_session_reset();
+    httpd_resp_set_type(request, "application/json");
+    const esp_err_t sent = httpd_resp_sendstr(request, body);
+    ota_schedule_reboot(800);
+    return sent;
+}
+
 static esp_err_t message_handler(httpd_req_t *request)
 {
     if (request->content_len <= 0 || request->content_len > RC_MAX_REQUEST_BYTES) {
@@ -1678,6 +1911,8 @@ static esp_err_t message_handler(httpd_req_t *request)
         response = outbox_response(source_id, id, false, arguments);
     } else if (json_string_equals(capability, "evidence.outbox.ack")) {
         response = outbox_response(source_id, id, true, arguments);
+    } else if (json_string_equals(capability, "fleet.ota.apply")) {
+        response = ota_apply_response(source_id, id, authenticated_peer, arguments);
     } else {
         response = error_response(source_id, id, "CAPABILITY_UNAVAILABLE", "Capability is not available");
     }
@@ -1715,8 +1950,13 @@ static void start_server(void)
         .uri = "/reconclave/v1/message", .method = HTTP_POST,
         .handler = message_handler,
     };
+    const httpd_uri_t ota_upload_uri = {
+        .uri = RC_OTA_UPLOAD_PATH, .method = HTTP_POST,
+        .handler = ota_upload_handler,
+    };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &announce_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &message_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &ota_upload_uri));
     ESP_ERROR_CHECK(httpd_register_err_handler(server, HTTPD_404_NOT_FOUND, not_found_handler));
 }
 
@@ -1767,6 +2007,19 @@ static void got_ip_event(void *argument, esp_event_base_t base,
     snprintf(s_network.gateway, sizeof(s_network.gateway), IPSTR, IP2STR(&event->ip_info.gw));
     s_network.has_ip = true;
     portEXIT_CRITICAL(&s_lock);
+    // Reaching a working IP is this device's minimal self-test after an OTA update: if the
+    // bootloader has this image marked pending-verify (CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE),
+    // confirm it now. An image that instead crash-loops before ever getting here is reverted
+    // to the previous partition automatically by the bootloader's own rollback logic.
+    if (!s_ota_marked_valid) {
+        const esp_partition_t *running = esp_ota_get_running_partition();
+        esp_ota_img_states_t state;
+        if (esp_ota_get_state_partition(running, &state) == ESP_OK &&
+            state == ESP_OTA_IMG_PENDING_VERIFY) {
+            esp_ota_mark_app_valid_cancel_rollback();
+        }
+        s_ota_marked_valid = true;
+    }
     start_mdns();
     ESP_LOGI(TAG, "Ready at http://%s:%d", s_network.ip, RC_HTTP_PORT);
 }
