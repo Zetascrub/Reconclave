@@ -9,13 +9,31 @@ tightly coupled product.
 > Only use Reconclave on systems and networks you own or are explicitly
 > authorised to assess.
 
+## Architecture at a glance
+
+The desktop coordinator is the permanent hub: it holds signed engagement
+scopes, dispatches workflows, and owns evidence custody. Devices are
+capability-rich nodes, not dumb sensors — each announces itself over mDNS and
+advertises the capabilities it supports (`system.info`, `net.discovery.scan`,
+etc.). All coordinator↔node traffic is a JSON envelope, HMAC-authenticated
+with per-peer provisioned keys and bound to a boot nonce to resist replay.
+Nothing is master/slave: a K230 node, once added, is just another capable
+node rather than a required brain for the fleet.
+
 ## Components
 
 | Component | What it is |
 |---|---|
 | [`tools/desktop-node/`](tools/desktop-node/README.md) | The permanent coordinator: web UI, workflow engine, fleet management, evidence store |
-| [`devices/poe-p4/`](devices/poe-p4/) | ESP-IDF firmware for the M5Stack Unit PoE-P4 — an Ethernet-attached node |
-| [`devices/cardputer-adv/`](devices/cardputer-adv/) | PlatformIO/Arduino firmware for the M5Stack Cardputer ADV — a handheld node/console |
+| [`devices/poe-p4/`](devices/poe-p4/) | ESP-IDF (C) firmware for the M5Stack Unit PoE-P4 — an Ethernet-attached node |
+| [`devices/cardputer-adv/`](devices/cardputer-adv/) | PlatformIO/Arduino (C++) firmware for the M5Stack Cardputer ADV — a handheld node/console |
+
+## Requirements
+
+- Python 3.11+ and Node 22 for the desktop coordinator and its web UI
+- ESP-IDF v5.4.x to build/flash `devices/poe-p4/`
+- PlatformIO to build/flash `devices/cardputer-adv/`
+- CMake and a C++17 toolchain for the shared protocol library and its tests
 
 ## Features
 
@@ -36,9 +54,15 @@ tightly coupled product.
   approval for sensitive actions.
 - **Live operations timeline** — a searchable, correlated audit history across
   campaigns, jobs, nodes, and evidence.
+- **Capability SDK** — packaged tool runners with signed manifests, schemas,
+  and risk classes; availability is discovered per node, never assumed.
 
+Most of the platform above is complete and running on real hardware today.
+Still on the roadmap: secure relay/gateway nodes for VPN and internet-relayed
+deployments, the rest of Phase 10 (notes, report exports, ATT&CK/STIX/OCSF
+mappings), and a K230 edge-AI tier, which is gated on that hardware arriving.
 See [docs/platform-roadmap.md](docs/platform-roadmap.md) for the full delivery
-roadmap and current phase status.
+roadmap and current phase-by-phase status.
 
 ## How to use it
 
