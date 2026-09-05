@@ -63,3 +63,32 @@ main { margin-left: 76px; padding: 34px clamp(22px,4vw,58px) 50px; position: rel
 @media(max-width:760px){.notif-dropdown{position:fixed;top:72px;right:8px;left:8px;width:auto}}
 .finding-card.suppressed-record{opacity:.55}.finding-actions{min-width:118px}.finding-actions select{border:1px solid var(--line);background:rgba(4,10,8,.6);color:#bed0cb;padding:6px 8px;font:500 7px DM Mono;text-transform:capitalize}.finding-reason{border:1px solid var(--line);background:rgba(4,10,8,.6);color:#bed0cb;padding:6px 8px;font:400 7px DM Mono;width:100%}.finding-list-error{margin-bottom:10px}
 .field textarea{border:1px solid var(--line);background:#050c0a;color:#cce0da;padding:10px 12px;outline:0;font:400 9px/1.5 DM Mono;resize:vertical}
+
+/* Workflow visual builder (Phase 2's deferred item) - a plain-pixel-coordinate SVG+HTML
+   canvas rather than a graph library: absolutely-positioned .workflow-node divs and an
+   SVG of the same pixel size drawn behind them, so pointer math never needs a viewBox
+   scale factor. See WorkflowBuilder.tsx. */
+.workflow-builder{width:min(1100px,96vw);max-height:min(860px,calc(100vh - 40px));overflow:auto}
+.workflow-builder-body{display:grid;grid-template-columns:1fr 300px;gap:14px;margin-top:4px}
+.workflow-canvas-wrap{display:grid;gap:8px;min-width:0}
+.workflow-toolbar{display:flex;align-items:center;gap:12px}.workflow-toolbar small{font:500 8px DM Mono;color:var(--muted)}
+.workflow-canvas{position:relative;border:1px solid var(--line);background:radial-gradient(rgba(98,230,194,.05) 1px,transparent 1px) 0 0/16px 16px,#040908;min-height:320px;max-height:520px;overflow:auto}
+.workflow-edges{position:absolute;top:0;left:0;pointer-events:none}
+.workflow-edge path{pointer-events:stroke;cursor:pointer}
+.workflow-edge path:hover+path,.workflow-edge:hover path:last-child{stroke:var(--amber)!important}
+.workflow-edge-preview{stroke:var(--cyan);stroke-width:1.4;stroke-dasharray:4 3}
+.workflow-node{position:absolute;border:1px solid var(--line);background:linear-gradient(145deg,rgba(13,29,25,.92),rgba(7,15,13,.95));padding:9px 10px;cursor:grab;display:grid;gap:4px;align-content:start;user-select:none;touch-action:none}
+.workflow-node:active{cursor:grabbing}
+.workflow-node strong{font:500 10px DM Mono;color:#d7e8e3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.workflow-node span{font:400 8px DM Mono;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.workflow-node.selected{border-color:var(--cyan-dim);box-shadow:0 0 0 1px var(--cyan-dim),0 0 22px rgba(98,230,194,.12)}
+.workflow-node.invalid{border-color:rgba(241,180,91,.55)}
+.workflow-node-remove{position:absolute;top:-8px;right:-8px;width:16px;height:16px;border:1px solid var(--line);background:#0b1714;color:#8eb5aa;font:11px DM Mono;line-height:1;cursor:pointer;display:grid;place-items:center}
+.workflow-node-remove:hover{color:var(--amber);border-color:rgba(241,180,91,.4)}
+.workflow-node-handle{position:absolute;right:-6px;top:50%;transform:translateY(-50%);width:11px;height:11px;border-radius:50%;background:#0b1714;border:1px solid var(--cyan-dim);cursor:crosshair}
+.workflow-node-handle:hover{background:var(--cyan);box-shadow:0 0 8px var(--cyan)}
+.workflow-step-editor{border-left:1px solid var(--line);padding-left:14px;display:grid;gap:10px;align-content:start;min-width:0}
+.workflow-dependency-list{display:grid;gap:6px;max-height:120px;overflow-y:auto;border:1px solid var(--line);background:rgba(4,10,8,.4);padding:8px}
+.workflow-dependency-option{display:flex;align-items:center;gap:8px;font:400 9px DM Mono;color:#bed0cb}
+.workflow-dependency-option input{accent-color:var(--cyan)}
+@media(max-width:900px){.workflow-builder-body{grid-template-columns:1fr}.workflow-step-editor{border-left:0;border-top:1px solid var(--line);padding-left:0;padding-top:14px}}

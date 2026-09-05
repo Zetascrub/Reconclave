@@ -47,7 +47,7 @@ capabilities require a separate, explicit approval policy and are disabled by de
 |---|---|---|---|
 | 0 | Protocol integrity and reliable P4 evidence | Complete | Authenticated arguments/results; cold-boot rule triggers; live evidence import |
 | 1 | Signed engagement scopes and policy engine | Complete | Immutable scope revisions, exclusions, expiry, rate/concurrency limits, provider enforcement |
-| 2 | Workflow and campaign engine | Initial slice complete | Durable DAG definitions/runs, dependency scheduling, retries, cancellation, resumability |
+| 2 | Workflow and campaign engine | Complete | Durable DAG definitions/runs, dependency scheduling, retries, cancellation, resumability |
 | 3 | Capability SDK and packaged tool runners | Complete | Signed manifests, schemas, risk classes, discovery, sandboxed desktop execution |
 | 4 | Fleet management and signed OTA | Complete (device firmware unverified on real hardware — see Phase 4 notes) | Health/inventory/config drift, staged rollout, verification and rollback |
 | 5 | Evidence pipeline and chain of custody | Complete (relay half of ESP32/relay item blocked on Phase 8/11; device firmware unverified on real hardware — see Phase 5 notes) | Content-addressed records, node MAC/signature, encrypted spool, receipts, export bundle |
@@ -59,7 +59,7 @@ capabilities require a separate, explicit approval policy and are disabled by de
 | 11 | Secure relay/gateway nodes | Planned | Explicit routes, per-hop authority, store-and-forward, route visibility, emergency stop |
 | 12 | Edge AI and local analysis tier | Planned, gated on K230 hardware | K230 vision/OCR/classification capabilities, local AI analysis gateway (Ollama/llama.cpp/approved provider), RAG over security knowledge, enforced per-engagement AI privacy policy |
 
-## Phase 2 initial vertical slice
+## Phase 2 workflow and campaign engine
 
 - [x] Persist workflow definitions, workflow runs, and per-step state in the workspace store.
 - [x] Validate acyclic dependencies and capability-shaped step types.
@@ -79,9 +79,22 @@ capabilities require a separate, explicit approval policy and are disabled by de
   a run is queued/running so an in-flight run's step-id/definition matching can't be corrupted out from
   under it), `POST`/`DELETE /api/workflows/<id>`, and a minimal reachable UI (rename + remove per
   workflow card, `web/src/WorkspaceViews.tsx`) — web build verified (`npm run build`).
-- [ ] Add a general visual builder. Editing today is name/description/steps via a JSON body — there is
-  no drag-and-drop or graphical DAG editor for step definitions; that remains a real, separate,
-  larger frontend feature.
+- [x] Add a general visual builder: `web/src/WorkflowBuilder.tsx`, replacing the old fixed-template
+  create button and rename-only edit. A plain pixel-coordinate SVG-plus-HTML canvas (no graph library
+  dependency — this project has none, and adding one for one feature wasn't worth it): steps are
+  draggable, absolutely-positioned boxes auto-laid-out left-to-right by dependency depth; dragging from
+  a step's right-edge handle onto another step adds a dependency (clicking the resulting edge removes
+  it), mirroring the existing `.network-graph`/`.graph-node` SVG idiom already used for the host network
+  map rather than inventing a new visual language. A side panel edits the selected step's id, capability
+  (with a `<datalist>` of capabilities live nodes actually advertise), preferred node, retries, timeout,
+  dependencies, and arguments (JSON textarea). Client-side validation mirrors
+  `WorkspaceStore._validate_workflow_steps` exactly (id/capability patterns, retries 0-3, timeout
+  1s-1h, 1-32 steps, cycle detection) so an invalid graph is caught before it ever reaches the API, not
+  after a rejected request. Both "new workflow" and "edit workflow" opening the same builder. Web
+  build and lint verified clean (a `react-hooks/set-state-in-effect` and a `react-hooks/refs` violation
+  the newer eslint-plugin-react-hooks rules caught during development were fixed by moving the
+  arguments-draft reset into the selection-changing event handlers themselves and by promoting the
+  drag-to-connect source from a ref to state, respectively, rather than suppressing the lint).
 
 ## Phase 1 scope boundary
 
