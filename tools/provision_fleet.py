@@ -46,26 +46,45 @@ def main() -> None:
                 f"{args.desktop_id}|{args.cardputer_id}": secrets.token_hex(32),
             },
         }
-        STORE.write_text(json.dumps(fleet, indent=2) + "\n")
-        STORE.chmod(0o600)
+    # Per-device at-rest storage key: unlike the pairwise links above, this protects a
+    # device's own local evidence storage (poe-p4's NVS outbox blob, cardputer-adv's SD
+    # card evidence log) and so must stay stable across re-pairing with any coordinator,
+    # never derived from or tied to a specific link. Backfilled on an ordinary
+    # (non---rotate) run against an older store that predates this field, so upgrading
+    # doesn't force re-pairing every device.
+    storage_keys = fleet.setdefault("storage_keys", {})
+    for device_id in (args.p4_id, args.cardputer_id):
+        storage_keys.setdefault(device_id, secrets.token_hex(32))
+    STORE.write_text(json.dumps(fleet, indent=2) + "\n")
+    STORE.chmod(0o600)
     links = fleet["links"]
     desktop_p4 = links[f"{args.desktop_id}|{args.p4_id}"]
     card_p4 = links[f"{args.cardputer_id}|{args.p4_id}"]
     desktop_card = links[f"{args.desktop_id}|{args.cardputer_id}"]
+    p4_storage = storage_keys[args.p4_id]
+    card_storage = storage_keys[args.cardputer_id]
     P4_HEADER.write_text(
         "#pragma once\n#include <stdint.h>\n"
         "typedef struct { const char *peer_id; uint8_t priority; uint8_t key[32]; } rc_provisioned_peer_t;\n"
         "static const rc_provisioned_peer_t RC_PROVISIONED_PEERS[] = {\n"
         f'  {{"{args.desktop_id}", 100, {{{key_bytes(desktop_p4)}}}}},\n'
         f'  {{"{args.cardputer_id}", 50, {{{key_bytes(card_p4)}}}}},\n'
-        "};\n")
+        "};\n"
+        "// At-rest AES-256-GCM key for this device's own local evidence storage --\n"
+        "// independent of any coordinator pairing above. See encrypted_spool.py's\n"
+        "// EncryptedSpool(key=...) for the matching desktop-side reader.\n"
+        f"static const uint8_t RC_STORAGE_KEY[32] = {{{key_bytes(p4_storage)}}};\n")
     CARD_HEADER.write_text(
         "#pragma once\n#include <stdint.h>\n"
         f'static constexpr char RC_PROVISIONED_P4_ID[] = "{args.p4_id}";\n'
         f"static constexpr uint8_t RC_PROVISIONED_P4_KEY[32] = {{{key_bytes(card_p4)}}};\n"
         f'static constexpr char RC_PROVISIONED_PRIMARY_ID[] = "{args.desktop_id}";\n'
         f"static constexpr uint8_t RC_PROVISIONED_PRIMARY_KEY[32] = {{{key_bytes(desktop_card)}}};\n"
-        "static constexpr uint8_t RC_COORDINATOR_PRIORITY = 50;\n")
+        "static constexpr uint8_t RC_COORDINATOR_PRIORITY = 50;\n"
+        "// At-rest AES-256-GCM key for this device's own local evidence storage --\n"
+        "// independent of any coordinator pairing above. See encrypted_spool.py's\n"
+        "// EncryptedSpool(key=...) for the matching desktop-side reader.\n"
+        f"static constexpr uint8_t RC_STORAGE_KEY[32] = {{{key_bytes(card_storage)}}};\n")
     print(f"Trust store: {STORE}")
     print(f"P4 header: {P4_HEADER}")
     print(f"Cardputer header: {CARD_HEADER}")

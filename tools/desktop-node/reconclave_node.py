@@ -477,6 +477,18 @@ class Node:
         record = arguments.get("evidence")
         if not isinstance(record, dict) or any(field not in record for field in EVIDENCE_REQUIRED_FIELDS):
             raise CapabilityError("INVALID_REQUEST", "evidence record missing a required field")
+        provenance = arguments.get("_provenance")
+        if isinstance(provenance, dict) and str(provenance.get("source_node", "")):
+            # Note this is distinct from (and doesn't overwrite) the record's own
+            # "source_node" field above, which is self-reported content describing what
+            # the evidence is about, not who authenticated the request that delivered it.
+            record = {**record, "provenance": {
+                "source_node": str(provenance.get("source_node", ""))[:80],
+                "verified": bool(provenance.get("verified", False)),
+                "request_nonce": str(provenance.get("request_nonce", ""))[:64],
+                "request_tag": str(provenance.get("request_tag", ""))[:64],
+                "algorithm": str(provenance.get("algorithm", ""))[:40],
+            }}
         encoded = json.dumps(record, separators=(",", ":"))
         if len(encoded.encode()) > MAX_EVIDENCE_RECORD_BYTES:
             raise CapabilityError("INVALID_REQUEST", "evidence record exceeds size limit")
@@ -584,6 +596,23 @@ class Node:
                     destination = str(request.get("destination_node", ""))
                     response_key, response_nonce = self.verify_auth(source, destination, request_id,
                                                                      capability, arguments, payload.get("auth"))
+                    if capability == "storage.evidence.write":
+                        # verify_auth just proved this exact request was signed with the
+                        # evidence key -- carry that proof into the stored record instead
+                        # of discarding it once the check passes, mirroring the
+                        # outbox-pull path's provenance (desktop_app.py
+                        # AutomationEngine._sync_outbox) for this separate push-in path
+                        # into ReconclaveNode's own encrypted spool (platform-roadmap.md
+                        # Phase 5). Injected as a reserved argument rather than a new
+                        # write_evidence() parameter, matching _scope_delegation's
+                        # existing convention elsewhere.
+                        request_auth = payload.get("auth") if isinstance(payload.get("auth"), dict) else {}
+                        arguments = {**arguments, "_provenance": {
+                            "source_node": source, "verified": True,
+                            "request_nonce": str(request_auth.get("nonce", "")),
+                            "request_tag": str(request_auth.get("tag", "")),
+                            "algorithm": "hmac-sha256-truncated16",
+                        }}
                 if capability in SCOPE_REQUIRED_CAPABILITIES:
                     self.verify_scope_delegation(capability, arguments)
                 result = self.capability_handlers[capability](arguments)

@@ -116,16 +116,23 @@ class DesktopNodeTests(unittest.TestCase):
             }
             nonce = "0011223344556677"
             arguments = {"evidence": evidence}
-            request = self.make_request(node, "storage.evidence.write", arguments,
-                                        self.signed_auth(node, "storage.evidence.write", arguments,
-                                                         passphrase, nonce))
+            auth = self.signed_auth(node, "storage.evidence.write", arguments, passphrase, nonce)
+            request = self.make_request(node, "storage.evidence.write", arguments, auth)
             _, response = node.respond(request)
             self.assertEqual(response["payload"]["status"], "ok")
             self.assertEqual(response["payload"]["result"]["evidence_id"], "evidence-1")
             records = list(pathlib.Path(directory).glob("evidence-*.rcspool"))
             self.assertEqual(len(records), 1)
             self.assertNotIn("192.0.2.10", records[0].read_text())
-            self.assertEqual(node.encrypted_spool.read(records[0]), [evidence])
+            # respond() carries the just-verified request signature into the stored
+            # record as provenance (platform-roadmap.md Phase 5's push-in gap) rather
+            # than only trusting the envelope's unauthenticated source_node string.
+            [stored] = node.encrypted_spool.read(records[0])
+            self.assertEqual(stored, {**evidence, "provenance": {
+                "source_node": "rc-test-coordinator", "verified": True,
+                "request_nonce": nonce, "request_tag": auth["tag"],
+                "algorithm": "hmac-sha256-truncated16",
+            }})
             _, replay = node.respond(request)
             self.assertEqual(replay["payload"]["error"]["code"], "UNAUTHENTICATED")
 

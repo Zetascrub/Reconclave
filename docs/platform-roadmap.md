@@ -50,7 +50,7 @@ capabilities require a separate, explicit approval policy and are disabled by de
 | 2 | Workflow and campaign engine | Initial slice complete | Durable DAG definitions/runs, dependency scheduling, retries, cancellation, resumability |
 | 3 | Capability SDK and packaged tool runners | Complete | Signed manifests, schemas, risk classes, discovery, sandboxed desktop execution |
 | 4 | Fleet management and signed OTA | Complete (device firmware unverified on real hardware — see Phase 4 notes) | Health/inventory/config drift, staged rollout, verification and rollback |
-| 5 | Evidence pipeline and chain of custody | In progress | Content-addressed records, node MAC/signature, encrypted spool, receipts, export bundle |
+| 5 | Evidence pipeline and chain of custody | Complete (relay half of ESP32/relay item blocked on Phase 8/11; device firmware unverified on real hardware — see Phase 5 notes) | Content-addressed records, node MAC/signature, encrypted spool, receipts, export bundle |
 | 6 | Live operations timeline | Complete | Correlated campaign/job/node/evidence events with trace IDs and searchable audit history |
 | 7 | Adaptive distributed scheduling | Planned | Capability/resource/topology selection, scope sharding, failover and backpressure, consensus scanning (design doc §9.2) |
 | 8 | VPN and internet relay | Planned | Mutually authenticated relay, expiring delegation, offline queue, no implicit transitive trust |
@@ -219,17 +219,35 @@ already wired to live API routes. Corrected here rather than left stale.
 - [x] Detect content, order, chain, and receipt tampering while preserving explicit legacy-record status.
 - [x] Export signed JSON evidence bundles with verification results.
 - [x] Encrypt desktop-node evidence spools at rest with per-record AES-256-GCM and node-bound AAD.
-- [ ] Apply the authenticated encrypted-spool format to relay and ESP32 storage.
+- [x] Apply the authenticated encrypted-spool format to relay and ESP32 storage. **ESP32 half done,
+  relay half blocked on Phase 8/11 (no relay node exists yet to apply anything to).** `poe-p4`'s
+  evidence outbox (an NVS blob, previously plaintext) and `cardputer-adv`'s microSD evidence log
+  (previously plaintext JSONL, and the more exposed of the two given a microSD card is trivially
+  removable) are now AES-256-GCM encrypted with a per-device `RC_STORAGE_KEY` — a third provisioned
+  secret (`tools/provision_fleet.py`, backfilled into an existing trust store without touching
+  pairing links, so upgrading doesn't force re-pairing) independent of any coordinator pairing, since
+  at-rest protection must survive re-pairing with a different-priority coordinator. `poe-p4` wraps its
+  whole fixed-size outbox blob as one `[nonce][tag][ciphertext]` frame (falling back through the
+  existing plaintext-format migration chain for anything written before this, same idiom already used
+  for the v1→v2 record shape change). `cardputer-adv` encrypts each JSONL line independently in the
+  exact frame shape `encrypted_spool.py`'s `EncryptedSpool` already reads (`{v, node, nonce,
+  ciphertext}`, tag appended to the ciphertext bytes the way Python's `AESGCM.encrypt` concatenates
+  them) — `EncryptedSpool` gained an optional `key=` constructor param so a coordinator can decrypt an
+  extracted microSD card or NVS dump with the device's own raw provisioned key, no new tool needed.
+  Both AAD-bind a frame to `reconclave-spool/v1|<device_id>`, so a frame copied onto different
+  hardware fails authentication rather than silently decrypting. Verification: cardputer-adv builds
+  clean; poe-p4 not compiled (no `idf.py` here, same caveat as Phase 4's OTA work) and neither target
+  has been exercised on real hardware — validate on a bench unit before relying on this.
 - [x] Carry provider signatures through ingestion rather than replacing them with coordinator-only
   custody: the outbox-pull path (`AutomationEngine._sync_outbox`) now carries the already-verified
   response signature from `evidence.outbox.read` forward as a `provenance` field on every evidence
   record it ingests, folded into the record's content hash rather than being discarded once the
-  transport check passes. **Scope note:** this covers the outbox-pull path into the coordinator's own
-  evidence ledger, which is where the gap was concretely identified. The separate push-in path
-  (`storage.evidence.write` requests landing in `ReconclaveNode.write_evidence`'s AES-256-GCM spool,
-  a different subsystem from the workspace-store ledger this covers) still only relies on outer
-  request-auth without preserving it alongside the stored record — a narrower, separate follow-up if
-  that spool's own provenance story needs the same treatment.
+  transport check passes. The separate push-in path (`storage.evidence.write` requests landing in
+  `ReconclaveNode.write_evidence`'s AES-256-GCM spool, a different subsystem from the workspace-store
+  ledger the outbox-pull path covers) now gets the same treatment: `respond()` carries the just-verified
+  request signature forward as a reserved `_provenance` argument (mirroring `_scope_delegation`'s
+  existing convention) and `write_evidence` folds it into the stored record as `provenance`, distinct
+  from the record's own self-reported `source_node` field.
 
 ## Phase 6 operations timeline
 

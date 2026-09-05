@@ -10,8 +10,10 @@
 #include <Update.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <base64.h>
 #include <esp_ota_ops.h>
 #include <esp_system.h>
+#include <mbedtls/gcm.h>
 #include <mbedtls/md.h>
 #include <algorithm>
 #include <string>
@@ -4000,6 +4002,44 @@ void saveScoutBaseline() {
   file.close();
 }
 
+// At-rest AES-256-GCM encryption for evidence written to the (removable) microSD card --
+// RC_STORAGE_KEY is provisioned per-device by tools/provision_fleet.py, independent of any
+// coordinator pairing so it survives re-pairing. Written in the exact frame format
+// tools/desktop-node/encrypted_spool.py's EncryptedSpool reads (one JSON object per line:
+// v, node, nonce, ciphertext -- ciphertext already carries its GCM tag appended, matching
+// how Python's AESGCM.encrypt concatenates them), so an operator who pulls the card can
+// decrypt it with EncryptedSpool(directory, node_id=deviceId,
+// key=bytes.fromhex(<the provisioned hex key>)). Per platform-roadmap.md Phase 5.
+bool appendEncryptedEvidenceLine(File& file, const String& plaintext) {
+  constexpr size_t kNonceBytes = 12;
+  constexpr size_t kTagBytes = 16;
+  uint8_t nonce[kNonceBytes];
+  esp_fill_random(nonce, sizeof(nonce));
+  std::vector<uint8_t> combined(plaintext.length() + kTagBytes);
+  const String aad = String("reconclave-spool/v1|") + deviceId;
+  mbedtls_gcm_context ctx;
+  mbedtls_gcm_init(&ctx);
+  bool ok = mbedtls_gcm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, RC_STORAGE_KEY, 256) == 0;
+  if (ok) {
+    ok = mbedtls_gcm_crypt_and_tag(
+        &ctx, MBEDTLS_GCM_ENCRYPT, plaintext.length(), nonce, sizeof(nonce),
+        reinterpret_cast<const uint8_t*>(aad.c_str()), aad.length(),
+        reinterpret_cast<const uint8_t*>(plaintext.c_str()),
+        combined.data(), kTagBytes, combined.data() + plaintext.length()) == 0;
+  }
+  mbedtls_gcm_free(&ctx);
+  if (!ok) return false;
+  JsonDocument frame;
+  frame["v"] = 1;
+  frame["node"] = deviceId;
+  frame["nonce"] = base64::encode(nonce, sizeof(nonce));
+  frame["ciphertext"] = base64::encode(combined.data(), combined.size());
+  String line;
+  serializeJson(frame, line);
+  file.println(line);
+  return true;
+}
+
 // Evidence Collector sink: append-only, never overwrites or deduplicates. Records
 // pushed here may originate from any node's job, not just this device's own scans.
 bool writeEvidenceRecord(JsonVariantConst evidence, String& errorMessage) {
@@ -4016,14 +4056,18 @@ bool writeEvidenceRecord(JsonVariantConst evidence, String& errorMessage) {
   }
   String encoded;
   serializeJson(evidence, encoded);
-  file.println(encoded);
+  const bool encrypted = appendEncryptedEvidenceLine(file, encoded);
   file.close();
+  if (!encrypted) {
+    errorMessage = "evidence encryption failed";
+    return false;
+  }
   const String projectId = evidence["project_id"] | "";
   if (validProjectId(projectId) && SD.exists("/reconclave/projects/" + projectId)) {
     File projectEvidence = SD.open("/reconclave/projects/" + projectId +
                                    "/evidence.jsonl", FILE_APPEND);
     if (projectEvidence) {
-      projectEvidence.println(encoded);
+      appendEncryptedEvidenceLine(projectEvidence, encoded);
       projectEvidence.close();
     }
   }

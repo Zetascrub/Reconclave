@@ -24,6 +24,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "mdns.h"
+#include "mbedtls/gcm.h"
 #include "mbedtls/md.h"
 #include "mbedtls/sha256.h"
 #include "nvs.h"
@@ -45,6 +46,8 @@
 #define RC_OTA_ARM_TIMEOUT_MS 60000
 #define RC_OTA_TOKEN_MAX_LEN 64
 #define RC_OTA_CHUNK_BYTES 1536
+#define RC_STORAGE_NONCE_BYTES 12
+#define RC_STORAGE_TAG_BYTES 16
 
 #define POE_P4_PHY_ADDR 1
 #define POE_P4_PHY_RESET_GPIO 51
@@ -330,6 +333,63 @@ static bool store_pairing(const char *peer_id, const uint8_t key[RC_KEY_BYTES])
     return true;
 }
 
+// At-rest AES-256-GCM encryption for the evidence outbox NVS blob (RC_STORAGE_KEY,
+// provisioned per-device by tools/provision_fleet.py, independent of any coordinator
+// pairing so it survives re-pairing with a different-priority coordinator). Automation
+// *rules* (policy, not observed data) are left in plain NVS -- this covers the same
+// evidence-confidentiality concern the desktop's EncryptedSpool covers for its own spool,
+// per platform-roadmap.md Phase 5. AAD binds a frame to this exact device identity, same
+// as EncryptedSpool's `reconclave-spool/v1|<node_id>`, so a frame copied onto a different
+// device's flash fails authentication rather than silently decrypting.
+static bool storage_aad(char *out, size_t out_size, int *out_len)
+{
+    const int written = snprintf(out, out_size, "reconclave-spool/v1|%s", s_device_id);
+    if (written <= 0 || (size_t)written >= out_size) return false;
+    *out_len = written;
+    return true;
+}
+
+static bool storage_encrypt_blob(const uint8_t *plaintext, size_t length,
+                                 uint8_t nonce_out[RC_STORAGE_NONCE_BYTES],
+                                 uint8_t tag_out[RC_STORAGE_TAG_BYTES], uint8_t *ciphertext_out)
+{
+    char aad[48];
+    int aad_len = 0;
+    if (!storage_aad(aad, sizeof(aad), &aad_len)) return false;
+    mbedtls_gcm_context ctx;
+    mbedtls_gcm_init(&ctx);
+    bool ok = mbedtls_gcm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, RC_STORAGE_KEY, 256) == 0;
+    if (ok) {
+        esp_fill_random(nonce_out, RC_STORAGE_NONCE_BYTES);
+        ok = mbedtls_gcm_crypt_and_tag(&ctx, MBEDTLS_GCM_ENCRYPT, length,
+                                       nonce_out, RC_STORAGE_NONCE_BYTES,
+                                       (const uint8_t *)aad, (size_t)aad_len,
+                                       plaintext, ciphertext_out,
+                                       RC_STORAGE_TAG_BYTES, tag_out) == 0;
+    }
+    mbedtls_gcm_free(&ctx);
+    return ok;
+}
+
+static bool storage_decrypt_blob(const uint8_t *ciphertext, size_t length,
+                                 const uint8_t nonce[RC_STORAGE_NONCE_BYTES],
+                                 const uint8_t tag[RC_STORAGE_TAG_BYTES], uint8_t *plaintext_out)
+{
+    char aad[48];
+    int aad_len = 0;
+    if (!storage_aad(aad, sizeof(aad), &aad_len)) return false;
+    mbedtls_gcm_context ctx;
+    mbedtls_gcm_init(&ctx);
+    bool ok = mbedtls_gcm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, RC_STORAGE_KEY, 256) == 0;
+    if (ok) {
+        ok = mbedtls_gcm_auth_decrypt(&ctx, length, nonce, RC_STORAGE_NONCE_BYTES,
+                                      (const uint8_t *)aad, (size_t)aad_len,
+                                      tag, RC_STORAGE_TAG_BYTES, ciphertext, plaintext_out) == 0;
+    }
+    mbedtls_gcm_free(&ctx);
+    return ok;
+}
+
 static void load_automation_state(void)
 {
     nvs_handle_t handle;
@@ -337,26 +397,43 @@ static void load_automation_state(void)
     size_t length = sizeof(s_rules);
     if (nvs_get_blob(handle, RC_AUTOMATION_RULES_KEY, s_rules, &length) != ESP_OK ||
         length != sizeof(s_rules)) memset(s_rules, 0, sizeof(s_rules));
-    length = sizeof(s_outbox);
-    if (nvs_get_blob(handle, RC_AUTOMATION_OUTBOX_KEY, s_outbox, &length) != ESP_OK ||
-        length != sizeof(s_outbox)) {
-        outbox_record_v1_t legacy[RC_MAX_OUTBOX] = {0};
-        length = sizeof(legacy);
-        memset(s_outbox, 0, sizeof(s_outbox));
-        if (nvs_get_blob(handle, RC_AUTOMATION_OUTBOX_KEY, legacy, &length) == ESP_OK &&
-            length == sizeof(legacy)) {
-            for (size_t index = 0; index < RC_MAX_OUTBOX; ++index) {
-                if (legacy[index].version != 1) continue;
-                s_outbox[index].version = 1;
-                s_outbox[index].sequence = legacy[index].sequence;
-                s_outbox[index].run_count = legacy[index].run_count;
-                s_outbox[index].host_count = legacy[index].host_count;
-                strlcpy(s_outbox[index].rule_id, legacy[index].rule_id, sizeof(s_outbox[index].rule_id));
-                strlcpy(s_outbox[index].project_id, legacy[index].project_id, sizeof(s_outbox[index].project_id));
-                strlcpy(s_outbox[index].kind, legacy[index].kind, sizeof(s_outbox[index].kind));
-                strlcpy(s_outbox[index].ip, legacy[index].ip, sizeof(s_outbox[index].ip));
-                strlcpy(s_outbox[index].boot_id, legacy[index].boot_id, sizeof(s_outbox[index].boot_id));
-                memcpy(s_outbox[index].hosts, legacy[index].hosts, sizeof(s_outbox[index].hosts));
+    const size_t plain_len = sizeof(s_outbox);
+    const size_t frame_len = RC_STORAGE_NONCE_BYTES + RC_STORAGE_TAG_BYTES + plain_len;
+    uint8_t *frame = malloc(frame_len);
+    memset(s_outbox, 0, sizeof(s_outbox));
+    length = frame_len;
+    const bool decrypted = frame != NULL &&
+        nvs_get_blob(handle, RC_AUTOMATION_OUTBOX_KEY, frame, &length) == ESP_OK &&
+        length == frame_len &&
+        storage_decrypt_blob(frame + RC_STORAGE_NONCE_BYTES + RC_STORAGE_TAG_BYTES, plain_len,
+                             frame, frame + RC_STORAGE_NONCE_BYTES, (uint8_t *)s_outbox);
+    free(frame);
+    if (!decrypted) {
+        // Not (yet) an encrypted frame -- either this device predates at-rest outbox
+        // encryption (Phase 5) or its NVS blob is corrupt/foreign. Fall back through the
+        // plaintext formats older firmware could have left behind; either one gets
+        // re-saved encrypted the next time a scan appends a record.
+        length = sizeof(s_outbox);
+        if (nvs_get_blob(handle, RC_AUTOMATION_OUTBOX_KEY, s_outbox, &length) != ESP_OK ||
+            length != sizeof(s_outbox)) {
+            outbox_record_v1_t legacy[RC_MAX_OUTBOX] = {0};
+            length = sizeof(legacy);
+            memset(s_outbox, 0, sizeof(s_outbox));
+            if (nvs_get_blob(handle, RC_AUTOMATION_OUTBOX_KEY, legacy, &length) == ESP_OK &&
+                length == sizeof(legacy)) {
+                for (size_t index = 0; index < RC_MAX_OUTBOX; ++index) {
+                    if (legacy[index].version != 1) continue;
+                    s_outbox[index].version = 1;
+                    s_outbox[index].sequence = legacy[index].sequence;
+                    s_outbox[index].run_count = legacy[index].run_count;
+                    s_outbox[index].host_count = legacy[index].host_count;
+                    strlcpy(s_outbox[index].rule_id, legacy[index].rule_id, sizeof(s_outbox[index].rule_id));
+                    strlcpy(s_outbox[index].project_id, legacy[index].project_id, sizeof(s_outbox[index].project_id));
+                    strlcpy(s_outbox[index].kind, legacy[index].kind, sizeof(s_outbox[index].kind));
+                    strlcpy(s_outbox[index].ip, legacy[index].ip, sizeof(s_outbox[index].ip));
+                    strlcpy(s_outbox[index].boot_id, legacy[index].boot_id, sizeof(s_outbox[index].boot_id));
+                    memcpy(s_outbox[index].hosts, legacy[index].hosts, sizeof(s_outbox[index].hosts));
+                }
             }
         }
     }
@@ -385,6 +462,28 @@ static bool save_outbox_sequence(void)
     if (result == ESP_OK) result = nvs_commit(handle);
     nvs_close(handle);
     return result == ESP_OK;
+}
+
+// Persists s_outbox as one AES-256-GCM frame -- [nonce][tag][ciphertext] concatenated
+// into a single NVS blob under RC_AUTOMATION_OUTBOX_KEY, the same key the plaintext
+// format previously used. The frame's distinct length is what lets load_automation_state
+// tell it apart from a still-plaintext blob left over from older firmware, the same way
+// it already distinguishes the v1 and v2 plaintext record shapes.
+static bool save_encrypted_outbox(void)
+{
+    const size_t plain_len = sizeof(s_outbox);
+    uint8_t *frame = malloc(RC_STORAGE_NONCE_BYTES + RC_STORAGE_TAG_BYTES + plain_len);
+    if (frame == NULL) return false;
+    uint8_t *nonce = frame;
+    uint8_t *tag = frame + RC_STORAGE_NONCE_BYTES;
+    uint8_t *ciphertext = tag + RC_STORAGE_TAG_BYTES;
+    bool ok = storage_encrypt_blob((const uint8_t *)s_outbox, plain_len, nonce, tag, ciphertext);
+    if (ok) {
+        ok = save_automation_blob(RC_AUTOMATION_OUTBOX_KEY, frame,
+                                  RC_STORAGE_NONCE_BYTES + RC_STORAGE_TAG_BYTES + plain_len);
+    }
+    free(frame);
+    return ok;
 }
 
 static bool queue_evidence(const char *rule_id, const char *project_id, const char *kind,
@@ -417,7 +516,7 @@ static bool queue_evidence(const char *rule_id, const char *project_id, const ch
         strlcpy(record.hosts[index], hosts[index], sizeof(record.hosts[index]));
     }
     s_outbox[slot] = record;
-    if (!save_automation_blob(RC_AUTOMATION_OUTBOX_KEY, s_outbox, sizeof(s_outbox))) {
+    if (!save_encrypted_outbox()) {
         memset(&s_outbox[slot], 0, sizeof(s_outbox[slot]));
         return false;
     }
@@ -1126,7 +1225,7 @@ static cJSON *outbox_response(const char *destination, const char *request_id,
                     memset(&s_outbox[index], 0, sizeof(s_outbox[index]));
                 }
             }
-            save_automation_blob(RC_AUTOMATION_OUTBOX_KEY, s_outbox, sizeof(s_outbox));
+            save_encrypted_outbox();
         }
     }
     cJSON *root = new_envelope("response", destination);

@@ -276,6 +276,18 @@ mounted) returns `error` with a stable `error_code`. Collectors append,
 they never overwrite or deduplicate — conflicting or repeated evidence is a
 fact for correlation, not something to silently discard (design doc §10).
 
+On the desktop provider (`ReconclaveNode.write_evidence`), a successful write's
+just-verified request signature is carried into the stored record as a
+`provenance` field (`source_node`, `verified`, `request_nonce`, `request_tag`,
+`algorithm`) — distinct from the record's own self-reported `source_node`
+above, which is unauthenticated content describing what the evidence is
+about, not who the coordinator cryptographically verified sent the request.
+The record itself is stored AES-256-GCM-encrypted at rest
+(`encrypted_spool.py` on desktop; `RC_STORAGE_KEY`-based encryption in
+firmware on `poe-p4`'s NVS evidence outbox and `cardputer-adv`'s microSD
+evidence log — see `docs/platform-roadmap.md` Phase 5), keyed per-device
+independent of any coordinator pairing.
+
 ## Deterministic change detection
 
 A coordinator compares each completed run's host set against the previous

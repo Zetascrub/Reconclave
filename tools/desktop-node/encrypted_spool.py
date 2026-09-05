@@ -12,10 +12,24 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
 class EncryptedSpool:
-    def __init__(self, directory: str, passphrase: str, node_id: str) -> None:
+    def __init__(self, directory: str, passphrase: str = "", node_id: str = "", *,
+                 key: bytes | None = None) -> None:
+        """`key`, when given, is used directly instead of deriving one from `passphrase`.
+
+        This is what lets this same reader/format decode an ESP32 device's own spool
+        (poe-p4's NVS outbox blob, cardputer-adv's SD evidence log): those devices are
+        provisioned with an already-random 32-byte RC_STORAGE_KEY (tools/provision_fleet.py)
+        used as the AES key directly, the same way provisioned peer/link keys are used
+        directly rather than re-derived from a typed passphrase.
+        """
         self.directory = pathlib.Path(directory)
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self.key = hashlib.sha256(("reconclave-spool-v1|" + passphrase).encode()).digest()
+        if key is not None:
+            if len(key) != 32:
+                raise ValueError("a raw spool key must be exactly 32 bytes")
+            self.key = key
+        else:
+            self.key = hashlib.sha256(("reconclave-spool-v1|" + passphrase).encode()).digest()
         self.node_id = node_id
 
     def append(self, record: dict, day: str) -> pathlib.Path:
