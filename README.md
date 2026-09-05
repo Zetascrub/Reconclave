@@ -66,6 +66,19 @@ roadmap and current phase-by-phase status.
 
 ## How to use it
 
+The quickest way to get the coordinator running:
+
+```sh
+./start-desktop.sh
+```
+
+This creates the Python virtualenv and installs web dependencies on first
+run, rebuilds the web UI only when its source has changed, then starts
+`desktop_app.py --mode both`. Any arguments are passed straight through, e.g.
+`./start-desktop.sh --enable-network-scan --evidence-dir ./evidence`. Then
+open <http://127.0.0.1:8767>. See the [desktop node guide](tools/desktop-node/README.md)
+for the full set of options, including environment-based secrets.
+
 Build and test the shared protocol library:
 
 ```sh
@@ -73,16 +86,6 @@ cmake -S . -B build
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
-
-Run the desktop coordinator (see the [desktop node guide](tools/desktop-node/README.md)
-for the full setup, including environment-based secrets and network-scan options):
-
-```sh
-cd tools/desktop-node/web && npm install && npm run build && cd ..
-../../.venv-desktop-node/bin/python desktop_app.py --mode both
-```
-
-Then open <http://127.0.0.1:8767>.
 
 Flash a device by following its own README/build instructions under
 [`devices/poe-p4/`](devices/poe-p4/) or [`devices/cardputer-adv/`](devices/cardputer-adv/),
