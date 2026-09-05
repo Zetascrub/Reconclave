@@ -112,8 +112,15 @@ class ToolRunnerTests(unittest.TestCase):
         self.assertEqual(manifest["isolation"], "bubblewrap-ro-root-v1")
         self.assertIn("resource_limits", manifest)
 
+    @mock.patch.object(ToolRunner, "_file_digest", return_value="a" * 64)
     @mock.patch("tool_runner.shutil.which")
-    def test_available_is_gated_on_bwrap_and_each_executable_individually(self, which):
+    def test_available_is_gated_on_bwrap_and_each_executable_individually(self, which, _digest):
+        # _file_digest is mocked too: manifest() (called by available() for every
+        # capability) hashes whatever real file sits at the "which"-reported path for
+        # a capability it considers present, and unlike test_manifest_is_signed_and_
+        # binds_executable_identity above, this test's whole point is exercising
+        # several capabilities' availability at once, on a machine that may not
+        # actually have nmap installed at this hardcoded path (e.g. CI).
         def _which(name: str) -> str | None:
             return f"/usr/bin/{name}" if name in ("bwrap", "nmap") else None
         which.side_effect = _which
