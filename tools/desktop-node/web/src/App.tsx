@@ -1,15 +1,27 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { Activity, AppState, CapabilityDescriptor, Project, ReconNode, ScanJob, WorkspaceData } from './types'
+import type { Activity, AppState, CapabilityDescriptor, FindingStatus, Project, ReconNode, ScanJob, WorkspaceData } from './types'
 import WorkspaceViews from './WorkspaceViews'
 
 const emptyState: AppState = { revision: 0, nodes: [], coordinator_id: '', updated_at_ms: 0 }
-const emptyWorkspace: WorkspaceData = { revision: 0, projects: [], jobs: [], evidence: [], automations: [] }
+const emptyWorkspace: WorkspaceData = { revision: 0, projects: [], jobs: [], evidence: [], automations: [], workflows: [], workflow_runs: [], scopes: [], audit_events: [], findings: [], fleet_nodes: [], fleet_configs: [], ota_releases: [], ota_rollouts: [] }
+
+const ACTIVITY_LIMIT = 20
 
 function savedActivity(): Activity[] {
   try {
     const value = JSON.parse(localStorage.getItem('reconclave.activity') ?? '[]') as Array<Omit<Activity, 'time'> & { time: string }>
-    return value.slice(0, 8).map((item) => ({ ...item, time: new Date(item.time) }))
+    return value.slice(0, ACTIVITY_LIMIT).map((item) => ({ ...item, time: new Date(item.time) }))
   } catch { return [] }
+}
+
+// Human label for a job's capability, for notification titles ("Scout scan
+// started" reads better than "net.discovery.scan started").
+function jobLabel(capability?: string) {
+  if (!capability) return 'Job'
+  if (capability === 'net.discovery.scan') return 'Scout scan'
+  if (capability === 'net.tcp.inspect') return 'TCP inspection'
+  if (capability.startsWith('tool.')) return capability.slice(5).replace(/\./g, ' ')
+  return capability
 }
 
 function savedJob(): ScanJob | null {
@@ -54,7 +66,7 @@ function defaultScope(address: string) {
 }
 
 function App() {
-  const [view, setView] = useState<'network' | 'map' | 'jobs' | 'projects' | 'evidence' | 'automations'>('network')
+  const [view, setView] = useState<'network' | 'map' | 'jobs' | 'projects' | 'evidence' | 'automations' | 'workflows' | 'scopes' | 'findings' | 'timeline' | 'fleet'>('network')
   const [state, setState] = useState<AppState>(emptyState)
   const [workspace, setWorkspace] = useState<WorkspaceData>(emptyWorkspace)
   const [projectId, setProjectId] = useState(() => localStorage.getItem('reconclave.project') ?? '')
@@ -63,6 +75,11 @@ function App() {
   const [busyCapability, setBusyCapability] = useState('')
   const [result, setResult] = useState<Record<string, unknown> | null>(null)
   const [activity, setActivity] = useState<Activity[]>(savedActivity)
+  const [unreadCount, setUnreadCount] = useState(0)
+  const [notifOpen, setNotifOpen] = useState(false)
+  const notifRef = useRef<HTMLDivElement>(null)
+  const seenAuditIds = useRef<Set<string> | null>(null)
+  const lastJobStatus = useRef<Map<string, string>>(new Map())
   const [filter, setFilter] = useState('')
   const [scoutOpen, setScoutOpen] = useState(false)
   const [scope, setScope] = useState({ network: '', start: '', end: '' })
@@ -75,6 +92,10 @@ function App() {
   useEffect(() => {
     fetch('/api/state').then((response) => response.json()).then(setState).catch(() => setConnected(false))
     refreshWorkspace()
+    // Workspace mutations also happen in the background when autonomous nodes
+    // upload their durable outboxes. Node-state SSE revisions do not cover
+    // those writes, so keep the project/evidence view live independently.
+    const workspaceTimer = window.setInterval(refreshWorkspace, 2000)
     const events = new EventSource('/api/events')
     events.addEventListener('state', (event) => {
       setState(JSON.parse((event as MessageEvent).data))
@@ -82,10 +103,83 @@ function App() {
     })
     events.onopen = () => setConnected(true)
     events.onerror = () => setConnected(false)
-    return () => events.close()
+    return () => { events.close(); window.clearInterval(workspaceTimer) }
   }, [])
 
   useEffect(() => { localStorage.setItem('reconclave.project', projectId) }, [projectId])
+
+  // The Network view's own Scout dispatch/poll flow below already posts its
+  // own richer notifications ("Scout dispatched", "Scout complete" with a
+  // host count) for jobs it started - and those same status changes also
+  // land in job.updated audit events. Call this wherever that flow already
+  // notifies, so the generic audit-derived detector below recognises the
+  // status as already surfaced and doesn't post a second, blander duplicate.
+  function markJobNotified(jobId: string | undefined, status: string | undefined) {
+    if (jobId && status) lastJobStatus.current.set(jobId, status)
+  }
+
+  // Derives notifications from the server's own audit trail rather than only
+  // from actions the browser itself initiated - this is what actually covers
+  // background/autonomous events (an automation rule firing at 3am, a
+  // recurring scan completing while the operator is on a different tab) that
+  // have no client-side call site to hook. audit_events arrives via the same
+  // 2s workspace poll every view already depends on, so this runs regardless
+  // of which page is open.
+  useEffect(() => {
+    const seen = seenAuditIds.current
+    const firstLoad = seen === null
+    const nextSeen = seen ?? new Set<string>()
+    for (const event of workspace.audit_events) {
+      if (nextSeen.has(event.id)) continue
+      nextSeen.add(event.id)
+      if (firstLoad) continue // don't replay pre-existing history as new notifications
+      if (event.action === 'automation.triggered') {
+        const context = [event.node_id, event.condition].filter(Boolean).join(' · ')
+        addActivity({ title: 'Rule triggered', detail: `${context ? context + ' → ' : ''}${event.outcome}`, tone: 'info' })
+      } else if (event.action === 'job.updated') {
+        // upsert_job audits on every poll tick, not just on a real status
+        // change - only notify when this job's status actually moved, or a
+        // still-"running" scan would spam a notification every couple seconds.
+        if (lastJobStatus.current.get(event.subject_id) === event.outcome) continue
+        lastJobStatus.current.set(event.subject_id, event.outcome)
+        const job = workspace.jobs.find((item) => item.id === event.subject_id)
+        const label = jobLabel(job?.capability)
+        const detail = job?.provider_id ?? event.subject_id
+        if (event.outcome === 'running' || event.outcome === 'waiting') {
+          addActivity({ title: `${label} started`, detail, tone: 'info' })
+        } else if (event.outcome === 'complete') {
+          addActivity({ title: `${label} complete`, detail: job?.hosts?.length ? `${job.hosts.length} host${job.hosts.length === 1 ? '' : 's'} · ${detail}` : detail, tone: 'ok' })
+        } else if (event.outcome === 'failed') {
+          addActivity({ title: `${label} failed`, detail: job?.error || detail, tone: 'warn' })
+        } else if (event.outcome === 'cancelled') {
+          addActivity({ title: `${label} cancelled`, detail, tone: 'info' })
+        }
+      } else if (event.action === 'evidence.captured') {
+        // A rule pushed to a capable device (device_managed: true) is
+        // evaluated and fired entirely on-device - the desktop never calls
+        // its own trigger path, so "automation.triggered" above never fires
+        // for it. The desktop only learns about it once outbox sync pulls
+        // the resulting evidence back, tagged with the rule that produced
+        // it; that is this platform's only signal that an autonomous rule
+        // fired, so notify from it directly rather than missing the event.
+        const record = workspace.evidence.find((item) => item.id === event.subject_id)
+        const ruleId = record?.data?.rule_id
+        if (typeof ruleId === 'string' && ruleId) {
+          addActivity({ title: 'Rule fired', detail: record?.summary || ruleId, tone: 'ok' })
+        }
+      }
+    }
+    seenAuditIds.current = nextSeen
+  }, [workspace.audit_events, workspace.jobs])
+
+  useEffect(() => {
+    if (!notifOpen) return
+    function onOutsideClick(event: MouseEvent) {
+      if (notifRef.current && !notifRef.current.contains(event.target as Node)) setNotifOpen(false)
+    }
+    document.addEventListener('mousedown', onOutsideClick)
+    return () => document.removeEventListener('mousedown', onOutsideClick)
+  }, [notifOpen])
 
   async function refreshWorkspace() {
     const response = await fetch('/api/workspace')
@@ -106,16 +200,19 @@ function App() {
   }
 
   async function inspectSelectedHosts(hosts: string[], ports: number[]) {
-    const response = await fetch('/api/inspect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hosts, ports, project_id: projectId, operator_authorised: true }) })
+    const scopeId = workspace.scopes.filter((item) => item.project_id === projectId && item.expires_at_ms > Date.now()).sort((a, b) => b.revision - a.revision)[0]?.id
+    const response = await fetch('/api/inspect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hosts, ports, project_id: projectId, scope_id: scopeId, operator_authorised: true }) })
     const result = await response.json()
     if (!response.ok) throw new Error(result.message ?? result.error ?? 'Host inspection failed')
     await refreshWorkspace()
+    markJobNotified(result.job_id, 'complete')
     addActivity({ title: 'TCP inspection complete', detail: `${hosts.length} host${hosts.length === 1 ? '' : 's'} · ${ports.length} ports`, tone: 'ok' })
     return result
   }
 
   async function createAutomation(body: Record<string, unknown>) {
-    await postWorkspace('/api/automations', { ...body, project_id: projectId, operator_authorised: true })
+    const scopeId = workspace.scopes.filter((item) => item.project_id === projectId && item.expires_at_ms > Date.now()).sort((a, b) => b.revision - a.revision)[0]?.id
+    await postWorkspace('/api/automations', { ...body, project_id: projectId, scope_id: scopeId, operator_authorised: true })
     addActivity({ title: 'Automation armed', detail: `${body.condition} → ${body.playbook}`, tone: 'info' })
   }
 
@@ -127,6 +224,78 @@ function App() {
     const response = await fetch(`/api/automations/${encodeURIComponent(id)}`, { method: 'DELETE' })
     if (!response.ok) throw new Error('Could not delete automation')
     await refreshWorkspace()
+  }
+
+  async function createWorkflow(body: Record<string, unknown>) {
+    await postWorkspace('/api/workflows', { ...body, project_id: projectId })
+    addActivity({ title: 'Workflow created', detail: String(body.name ?? 'Workflow'), tone: 'info' })
+  }
+
+  async function runWorkflow(id: string) {
+    const scopeId = workspace.scopes.filter((item) => item.project_id === projectId && item.expires_at_ms > Date.now()).sort((a, b) => b.revision - a.revision)[0]?.id
+    await postWorkspace(`/api/workflows/${encodeURIComponent(id)}/runs`, { scope_id: scopeId })
+    addActivity({ title: 'Workflow queued', detail: id, tone: 'info' })
+  }
+
+  async function cancelWorkflow(id: string) {
+    await postWorkspace(`/api/workflow-runs/${encodeURIComponent(id)}/cancel`, {})
+  }
+
+  async function updateWorkflow(id: string, body: Record<string, unknown>) {
+    await postWorkspace(`/api/workflows/${encodeURIComponent(id)}`, body)
+    addActivity({ title: 'Workflow updated', detail: id, tone: 'info' })
+  }
+
+  async function deleteWorkflow(id: string) {
+    const response = await fetch(`/api/workflows/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    if (!response.ok) throw new Error('Could not delete workflow (an active run may still be in progress)')
+    await refreshWorkspace()
+  }
+
+  async function createScope(body: Record<string, unknown>) {
+    await postWorkspace('/api/scopes', { ...body, project_id: projectId, operator_authorised: true })
+    addActivity({ title: 'Scope approved', detail: String(body.included_networks), tone: 'ok' })
+  }
+
+  async function importFindings(body: Record<string, unknown>) {
+    await postWorkspace('/api/findings/import', { ...body, project_id: projectId, operator_authorised: true })
+    addActivity({ title: 'Vulnerability data imported', detail: String(body.format), tone: 'info' })
+  }
+
+  async function correlateFindings() {
+    const result = await postWorkspace('/api/findings/correlate', { project_id: projectId }) as
+      { confirmed_count: number; new_candidate_count: number }
+    addActivity({ title: 'Correlation complete', detail: `${result.confirmed_count} confirmed · ${result.new_candidate_count} new candidate(s)`, tone: 'info' })
+    return result
+  }
+
+  async function setFindingStatus(id: string, status: FindingStatus) {
+    await postWorkspace(`/api/findings/${encodeURIComponent(id)}/status`, { status })
+    addActivity({ title: 'Finding status updated', detail: `${id} → ${status}`, tone: 'info' })
+  }
+
+  async function setFindingSuppression(id: string, suppressed: boolean, reason: string) {
+    await postWorkspace(`/api/findings/${encodeURIComponent(id)}/suppress`, { suppressed, reason })
+    addActivity({ title: suppressed ? 'Finding suppressed' : 'Finding unsuppressed', detail: id, tone: 'info' })
+  }
+
+  async function createRelease(body: Record<string, unknown>) {
+    await postWorkspace('/api/fleet/releases', { ...body, operator_authorised: true })
+    addActivity({ title: 'OTA release signed', detail: `${body.device_type} ${body.version}`, tone: 'info' })
+  }
+
+  async function createRollout(body: Record<string, unknown>) {
+    await postWorkspace('/api/fleet/rollouts', { ...body, operator_authorised: true })
+    addActivity({ title: 'Rollout staged', detail: String(body.release_id), tone: 'info' })
+  }
+
+  async function advanceRollout(id: string) {
+    await postWorkspace(`/api/fleet/${encodeURIComponent(id)}/advance`, {})
+  }
+
+  async function rollbackRollout(id: string) {
+    await postWorkspace(`/api/fleet/${encodeURIComponent(id)}/rollback`, { operator_authorised: true })
+    addActivity({ title: 'Rollout rolled back', detail: id, tone: 'warn' })
   }
 
   useEffect(() => {
@@ -148,7 +317,8 @@ function App() {
   const coordinatorCount = state.nodes.filter((node) => node.roles.includes('coordinator')).length
 
   function addActivity(entry: Omit<Activity, 'id' | 'time'>) {
-    setActivity((items) => [{ ...entry, id: crypto.randomUUID(), time: new Date() }, ...items].slice(0, 8))
+    setActivity((items) => [{ ...entry, id: crypto.randomUUID(), time: new Date() }, ...items].slice(0, ACTIVITY_LIMIT))
+    setUnreadCount((count) => count + 1)
   }
 
   async function requestCapability(node: ReconNode, capability: string, arguments_: Record<string, unknown> = {}, operatorAuthorised = false) {
@@ -156,7 +326,8 @@ function App() {
     try {
       const response = await fetch(`/api/nodes/${encodeURIComponent(node.device_id)}/invoke`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ capability, arguments: arguments_, operator_authorised: operatorAuthorised }),
+        body: JSON.stringify({ capability, arguments: arguments_, operator_authorised: operatorAuthorised,
+          project_id: projectId, scope_id: workspace.scopes.filter((item) => item.project_id === projectId && item.expires_at_ms > Date.now()).sort((a, b) => b.revision - a.revision)[0]?.id }),
       })
       const body = await response.json()
       if (!response.ok) throw new Error(body.message ?? body.error ?? 'Request failed')
@@ -205,6 +376,7 @@ function App() {
       const archived = { providerId: selected.device_id, projectId, archiveId: `${selected.device_id}-${next.job_id}-${Date.now()}`, scope: { ...scope }, ...next }
       setScanJob(archived)
       if (projectId) await postWorkspace('/api/jobs', { id: archived.archiveId, project_id: projectId, provider_id: selected.device_id, capability: 'net.discovery.scan', status: next.job_status, checked: next.checked, total: next.total, hosts: next.hosts, scope })
+      markJobNotified(archived.archiveId, next.job_status)
       setScoutOpen(false)
       addActivity({ title: 'Scout dispatched', detail: `${scope.start} → ${scope.end} via ${selected.device_id}`, tone: 'info' })
     } catch (error) {
@@ -226,6 +398,7 @@ function App() {
         statusFailures.current = 0
         setScanJob(next)
         if (next.archiveId && next.projectId) await postWorkspace('/api/jobs', { id: next.archiveId, project_id: next.projectId, provider_id: next.providerId, capability: 'net.discovery.scan', status: next.job_status, checked: next.checked, total: next.total, hosts: next.hosts, scope: next.scope, error: next.error })
+        markJobNotified(next.archiveId, next.job_status)
         if (next.recurring && (next.run_count ?? 0) > (scanJob.run_count ?? 0)) {
           if (next.archiveId && next.projectId) await postWorkspace('/api/evidence', { id: `${next.archiveId}-run-${next.run_count}`, project_id: next.projectId, job_id: next.archiveId, kind: 'network-hosts', title: `Recurring Scout run ${next.run_count}`, summary: `${next.hosts.length} responsive hosts observed by ${next.providerId}`, data: { hosts: next.hosts, scope: next.scope, provider_id: next.providerId, run_count: next.run_count } })
           addActivity({ title: `Scout run ${next.run_count} complete`, detail: `${next.hosts.length} responsive hosts observed`, tone: 'ok' })
@@ -267,6 +440,20 @@ function App() {
         <div className="brand"><strong>RECONCLAVE</strong><span>OPERATIONS DECK</span></div>
         <div className="topbar-spacer" />
         <div className={`link-state ${connected ? 'online' : ''}`}><i />{connected ? 'LIVE LINK' : 'RECONNECTING'}</div>
+        <div className="notif-wrap" ref={notifRef}>
+          <button className={`notif-bell ${notifOpen ? 'active' : ''}`} title="Notifications"
+            onClick={() => { setNotifOpen((open) => !open); if (!notifOpen) setUnreadCount(0) }}>
+            <span>⚑</span>
+            {unreadCount > 0 && <i className="notif-badge">{unreadCount > 9 ? '9+' : unreadCount}</i>}
+          </button>
+          {notifOpen && <div className="notif-dropdown panel">
+            <div className="panel-head"><div><span className="kicker">NOTIFICATIONS</span><h2>Recent operations</h2></div><span className="live-tag"><i />LIVE</span></div>
+            <div className="timeline">
+              {activity.map((item) => <article key={item.id}><i className={item.tone} /><div><strong>{item.title}</strong><p>{item.detail}</p></div><time>{item.time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</time></article>)}
+              {!activity.length && <div className="empty"><span>∿</span><strong>Channel is quiet</strong><small>Rule triggers, scan lifecycle, and operator actions will appear here.</small></div>}
+            </div>
+          </div>}
+        </div>
         <button className="operator"><span>LOCAL</span><strong>{state.coordinator_id || 'INITIALISING'}</strong></button>
       </header>
 
@@ -278,6 +465,11 @@ function App() {
           <button className={view === 'projects' ? 'active' : ''} title="Projects" onClick={() => setView('projects')}><span>◇</span><small>Projects</small></button>
           <button className={view === 'evidence' ? 'active' : ''} title="Evidence" onClick={() => setView('evidence')}><span>▱</span><small>Evidence</small></button>
           <button className={view === 'automations' ? 'active' : ''} title="Automations" onClick={() => setView('automations')}><span>↻</span><small>Rules</small></button>
+          <button className={view === 'workflows' ? 'active' : ''} title="Workflows" onClick={() => setView('workflows')}><span>⎇</span><small>Flows</small></button>
+          <button className={view === 'scopes' ? 'active' : ''} title="Scopes" onClick={() => setView('scopes')}><span>⌗</span><small>Scope</small></button>
+          <button className={view === 'findings' ? 'active' : ''} title="Findings" onClick={() => setView('findings')}><span>△</span><small>Risks</small></button>
+          <button className={view === 'timeline' ? 'active' : ''} title="Timeline" onClick={() => setView('timeline')}><span>≋</span><small>Audit</small></button>
+          <button className={view === 'fleet' ? 'active' : ''} title="Fleet" onClick={() => setView('fleet')}><span>▤</span><small>Fleet</small></button>
         </nav>
         <div className="rail-foot"><div className="pulse-ring" /><small>RC/01</small></div>
       </aside>
@@ -355,7 +547,7 @@ function App() {
             </div>
           </div>
         </section>
-      </> : <WorkspaceViews view={view} workspace={workspace} nodes={state.nodes} projectId={projectId} onProject={setProjectId} onCreate={createProject} onInspect={inspectSelectedHosts} onCreateAutomation={createAutomation} onUpdateAutomation={updateAutomation} onDeleteAutomation={deleteAutomation} />}</main>
+      </> : <WorkspaceViews view={view} workspace={workspace} nodes={state.nodes} projectId={projectId} onProject={setProjectId} onCreate={createProject} onInspect={inspectSelectedHosts} onCreateAutomation={createAutomation} onUpdateAutomation={updateAutomation} onDeleteAutomation={deleteAutomation} onCreateWorkflow={createWorkflow} onRunWorkflow={runWorkflow} onCancelWorkflow={cancelWorkflow} onUpdateWorkflow={updateWorkflow} onDeleteWorkflow={deleteWorkflow} onCreateScope={createScope} onImportFindings={importFindings} onCorrelateFindings={correlateFindings} onSetFindingStatus={setFindingStatus} onSetFindingSuppression={setFindingSuppression} onCreateRelease={createRelease} onCreateRollout={createRollout} onAdvanceRollout={advanceRollout} onRollbackRollout={rollbackRollout} />}</main>
       {scoutOpen && selected && <div className="modal-shade" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setScoutOpen(false) }}>
         <section className="scout-modal" role="dialog" aria-modal="true" aria-labelledby="scout-title">
           <div className="modal-head"><div><span className="kicker">SCOPED OPERATION</span><h2 id="scout-title">Configure Network Scout</h2><p>Provider: {selected.device_id}</p></div><button onClick={() => setScoutOpen(false)} aria-label="Close">×</button></div>

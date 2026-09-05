@@ -24,6 +24,29 @@ COORDINATOR_PRIORITY = 100
 COORDINATOR_LEASE_MS = 15000
 
 
+def canonical_digest(value: object) -> str:
+    def validate(item: object) -> None:
+        if item is None or isinstance(item, (bool, str)):
+            return
+        if isinstance(item, int) and not isinstance(item, bool):
+            if abs(item) > 9007199254740991:
+                raise ValueError("signed JSON integers must be within the interoperable 53-bit range")
+            return
+        if isinstance(item, list):
+            for child in item:
+                validate(child)
+            return
+        if isinstance(item, dict) and all(isinstance(key, str) for key in item):
+            for child in item.values():
+                validate(child)
+            return
+        raise ValueError("signed JSON supports objects, arrays, strings, booleans, null, and integers")
+
+    validate(value)
+    encoded = json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
 @dataclass
 class Peer:
     device_id: str
@@ -58,13 +81,19 @@ class Coordinator(ServiceListener):
                  execution_key: str | None = None,
                  evidence_key: str | None = None,
                  trust_keys: dict[str, bytes] | None = None,
-                 clock: Callable[[], float] = time.monotonic) -> None:
+                 clock: Callable[[], float] = time.monotonic,
+                 audit_sink: Callable[[dict], None] | None = None) -> None:
         self.node = node
         self.zeroconf = zeroconf
         self.clock = clock
         self.execution_key = hashlib.sha256(execution_key.encode()).digest() if execution_key else None
         self.evidence_key = hashlib.sha256(evidence_key.encode()).digest() if evidence_key else None
         self.trust_keys = trust_keys or {}
+        # Optional callback (e.g. WorkspaceStore.add_audit_event) that records a
+        # transport-level dispatch outcome under the caller's trace_id. Wired in
+        # by desktop_app.py once the workspace store exists; left unset in tests
+        # and other embedders that don't need trace correlation.
+        self.audit_sink = audit_sink
         self.peers: dict[str, Peer] = {}
         self.lock = threading.RLock()
         self.changed = threading.Condition(self.lock)
@@ -182,7 +211,51 @@ class Coordinator(ServiceListener):
                 self.changed.wait(timeout)
         return self.state()
 
-    def invoke(self, device_id: str, capability: str, arguments: dict) -> dict:
+    def invoke(self, device_id: str, capability: str, arguments: dict, trace_id: str = "") -> dict:
+        """Dispatch a capability request to a node, optionally correlated to a trace.
+
+        `trace_id` is optional so ad hoc/UI-driven invocations that have no
+        existing trace context keep working unchanged: when omitted, no
+        correlation record is produced. When provided (e.g. by a workflow run
+        or job that already has one), the dispatch attempt's outcome is
+        recorded via `audit_sink` under that trace_id, covering the transport
+        layer that job/workflow-run audit events do not.
+        """
+        outcome = "accepted"
+        try:
+            result = self._dispatch(device_id, capability, arguments)
+            status = result.get("payload", {}).get("status")
+            if status and status != "ok":
+                outcome = f"node_{status}"
+            return result
+        except KeyError:
+            outcome = "node_unavailable"
+            raise
+        except PermissionError:
+            outcome = "unauthorized"
+            raise
+        except ValueError:
+            outcome = "rejected"
+            raise
+        except ConnectionError:
+            outcome = "transport_error"
+            raise
+        finally:
+            if trace_id:
+                self._record_dispatch(trace_id, device_id, capability, outcome)
+
+    def _record_dispatch(self, trace_id: str, device_id: str, capability: str, outcome: str) -> None:
+        if self.audit_sink is None:
+            return
+        try:
+            self.audit_sink({
+                "action": "node.dispatch", "project_id": "", "subject_id": device_id,
+                "outcome": outcome, "trace_id": trace_id, "capability": capability,
+            })
+        except Exception:
+            pass  # Audit logging must never break dispatch delivery.
+
+    def _dispatch(self, device_id: str, capability: str, arguments: dict) -> dict:
         if device_id == self.node.node_id:
             target_address, target_port = self.node.address, self.node.port
             advertised = self.node.announcement()["payload"]
@@ -212,13 +285,15 @@ class Coordinator(ServiceListener):
                 raise PermissionError("the required trust-domain key is not configured")
             nonce = secrets.token_hex(8)
             boot_nonce = str(advertised.get("security", {}).get("boot_nonce", ""))
+            payload_digest = canonical_digest(arguments)
             fields = [self.node.node_id, device_id, request_id, capability]
             if boot_nonce:
                 fields.append(boot_nonce)
-            fields.extend([nonce, str(COORDINATOR_PRIORITY), str(COORDINATOR_LEASE_MS)])
+            fields.extend([payload_digest, nonce, str(COORDINATOR_PRIORITY), str(COORDINATOR_LEASE_MS)])
             canonical = "|".join(fields).encode()
             payload["auth"] = {
                 "nonce": nonce,
+                "payload_digest": payload_digest,
                 "coordinator_priority": COORDINATOR_PRIORITY,
                 "lease_ms": COORDINATOR_LEASE_MS,
                 "tag": hmac.new(key, canonical, hashlib.sha256).digest()[:AUTH_TAG_BYTES].hex(),
@@ -243,10 +318,14 @@ class Coordinator(ServiceListener):
             response_nonce = response_auth.get("nonce")
             response_tag = response_auth.get("tag")
             status = response_payload.get("status", "")
-            if response_nonce != nonce or not isinstance(response_tag, str):
+            response_body = response_payload.get("result", response_payload.get("error", {}))
+            response_digest = canonical_digest(response_body)
+            if (response_nonce != nonce or not isinstance(response_tag, str) or
+                    response_auth.get("payload_digest") != response_digest):
                 raise ConnectionError("node returned an unauthenticated response")
             response_canonical = "|".join([
-                device_id, self.node.node_id, request_id, status, boot_nonce, nonce,
+                device_id, self.node.node_id, request_id, status, boot_nonce,
+                response_digest, nonce,
             ]).encode()
             expected_tag = hmac.new(key, response_canonical, hashlib.sha256).digest()[:AUTH_TAG_BYTES].hex()
             if not hmac.compare_digest(response_tag, expected_tag):

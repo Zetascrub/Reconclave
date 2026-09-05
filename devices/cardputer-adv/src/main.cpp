@@ -464,6 +464,17 @@ bool sha256Digest(const String& input, uint8_t output[32]) {
       input.length(), output) == 0;
 }
 
+bool jsonDigestHex(JsonVariantConst value, String& output) {
+  String encoded;
+  serializeJson(value, encoded);
+  uint8_t digest[32];
+  if (!sha256Digest(encoded, digest)) return false;
+  char hex[65];
+  hexEncode(hex, digest, sizeof(digest));
+  output = hex;
+  return true;
+}
+
 bool computeTagWithKey(const uint8_t* key, size_t keyLength, const String& message,
                        uint8_t output[kTagBytes]) {
   uint8_t full[32];
@@ -487,6 +498,220 @@ bool computeEvidenceTag(const String& message, uint8_t output[kTagBytes]) {
 bool computeExecutionTag(const String& message, uint8_t output[kTagBytes]) {
   if (!executionKeyValid) return false;
   return computeTagWithKey(executionKey, sizeof(executionKey), message, output);
+}
+
+bool computeExecutionTagFull(const String& message, uint8_t output[32]) {
+  if (!executionKeyValid) return false;
+  const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  return info != nullptr && mbedtls_md_hmac(info, executionKey, sizeof(executionKey),
+      reinterpret_cast<const uint8_t*>(message.c_str()), message.length(), output) == 0;
+}
+
+// Serialises `value` as compact JSON with object keys sorted lexicographically,
+// matching the desktop coordinator's Python json.dumps(value, sort_keys=True,
+// separators=(",", ":")) canonical form used to sign scope-delegation tokens and
+// bind them to specific arguments (engagement_policy.py, reconclave_node.py; see
+// docs/capabilities.md). Only the JSON subset the protocol actually carries here
+// is supported -- null, bool, string, integer, array, string-keyed object -- and
+// anything else fails closed rather than guessing a representation. When
+// `excludeKey` is non-null and `value` is an object, that one top-level key is
+// omitted (used to canonicalise a token without its own "tag", or arguments
+// without the embedded "_scope_delegation").
+bool canonicalJson(JsonVariantConst value, String& out, const char* excludeKey = nullptr) {
+  if (value.isNull()) { out += "null"; return true; }
+  if (value.is<bool>()) { out += (value.as<bool>() ? "true" : "false"); return true; }
+  if (value.is<const char*>()) {
+    String encoded;
+    serializeJson(value, encoded);
+    out += encoded;
+    return true;
+  }
+  if (value.is<long long>()) {
+    out += String(value.as<long long>());
+    return true;
+  }
+  if (value.is<JsonArrayConst>()) {
+    out += '[';
+    bool first = true;
+    for (JsonVariantConst item : value.as<JsonArrayConst>()) {
+      if (!first) out += ',';
+      first = false;
+      if (!canonicalJson(item, out)) return false;
+    }
+    out += ']';
+    return true;
+  }
+  if (value.is<JsonObjectConst>()) {
+    JsonObjectConst object = value.as<JsonObjectConst>();
+    std::vector<String> keys;
+    for (JsonPairConst pair : object) {
+      const String key(pair.key().c_str());
+      if (excludeKey != nullptr && key == excludeKey) continue;
+      for (size_t i = 0; i < key.length(); ++i) {
+        const char c = key[i];
+        const bool safe = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '_';
+        if (!safe) return false;
+      }
+      keys.push_back(key);
+    }
+    std::sort(keys.begin(), keys.end());
+    out += '{';
+    bool first = true;
+    for (const String& key : keys) {
+      if (!first) out += ',';
+      first = false;
+      out += '"'; out += key; out += "\":";
+      if (!canonicalJson(object[key.c_str()], out)) return false;
+    }
+    out += '}';
+    return true;
+  }
+  return false;
+}
+
+bool parseCidr(const String& text, uint32_t& base, uint8_t& prefix) {
+  const int slash = text.indexOf('/');
+  if (slash <= 0) return false;
+  IPAddress address;
+  if (!address.fromString(text.substring(0, slash))) return false;
+  const int prefixValue = text.substring(slash + 1).toInt();
+  if (prefixValue < 0 || prefixValue > 32) return false;
+  base = (static_cast<uint32_t>(address[0]) << 24) | (static_cast<uint32_t>(address[1]) << 16) |
+      (static_cast<uint32_t>(address[2]) << 8) | static_cast<uint32_t>(address[3]);
+  prefix = static_cast<uint8_t>(prefixValue);
+  return true;
+}
+
+uint32_t maskForPrefix(uint8_t prefix) {
+  return prefix == 0 ? 0 : (0xffffffffu << (32 - prefix));
+}
+
+bool cidrSubnetOf(uint32_t targetBase, uint8_t targetPrefix, uint32_t otherBase, uint8_t otherPrefix) {
+  if (targetPrefix < otherPrefix) return false;
+  const uint32_t mask = maskForPrefix(otherPrefix);
+  return (targetBase & mask) == (otherBase & mask);
+}
+
+bool cidrOverlaps(uint32_t aBase, uint8_t aPrefix, uint32_t bBase, uint8_t bPrefix) {
+  const uint32_t mask = maskForPrefix(aPrefix < bPrefix ? aPrefix : bPrefix);
+  return (aBase & mask) == (bBase & mask);
+}
+
+// Checks a requested target network against a delegated token's included/excluded
+// CIDR lists the same way EngagementPolicy.authorize does on the desktop
+// coordinator: the target must be contained by at least one included network and
+// must not overlap any excluded network.
+bool scopeNetworkAuthorised(JsonVariantConst included, JsonVariantConst excluded,
+                            const String& targetText) {
+  uint32_t targetBase;
+  uint8_t targetPrefix;
+  if (targetText.isEmpty() || !parseCidr(targetText, targetBase, targetPrefix)) return false;
+  bool includedMatch = false;
+  if (included.is<JsonArrayConst>()) {
+    for (JsonVariantConst entry : included.as<JsonArrayConst>()) {
+      if (!entry.is<const char*>()) continue;
+      uint32_t base;
+      uint8_t prefix;
+      if (parseCidr(String(entry.as<const char*>()), base, prefix) &&
+          cidrSubnetOf(targetBase, targetPrefix, base, prefix)) { includedMatch = true; break; }
+    }
+  }
+  if (!includedMatch) return false;
+  if (excluded.is<JsonArrayConst>()) {
+    for (JsonVariantConst entry : excluded.as<JsonArrayConst>()) {
+      if (!entry.is<const char*>()) continue;
+      uint32_t base;
+      uint8_t prefix;
+      if (parseCidr(String(entry.as<const char*>()), base, prefix) &&
+          cidrOverlaps(targetBase, targetPrefix, base, prefix)) return false;
+    }
+  }
+  return true;
+}
+
+// Verifies a delegated engagement-scope token embedded at arguments["_scope_delegation"],
+// mirroring EngagementPolicy.delegate/ReconclaveNode.verify_scope_delegation on the
+// desktop coordinator (engagement_policy.py, reconclave_node.py). The token is signed
+// with the same execution key used to authenticate the outer request, is bound to this
+// exact capability, destination node, and argument set, and lists the networks it
+// authorises. Firmware has no wall-clock time (no NTP sync), so unlike the desktop
+// verifier this cannot check issued_at_ms/expires_at_ms against "now"; it only checks
+// the token's internal consistency (expiry strictly after issue, and within the
+// 5-minute lifetime ceiling the coordinator itself enforces when minting tokens).
+// Absolute freshness is still covered by the outer request's boot_nonce-bound replay
+// protection, which already prevents an old signed request -- token included -- from
+// being resent after this device reboots or replayed within the same boot session.
+bool scopeDelegationValid(JsonVariantConst arguments, const char* capability,
+                          const char*& errorCode, const char*& errorMessage) {
+  JsonVariantConst token = arguments["_scope_delegation"];
+  if (!executionKeyValid || !token.is<JsonObjectConst>()) {
+    errorCode = "SCOPE_REQUIRED";
+    errorMessage = "signed scope delegation is required";
+    return false;
+  }
+  const char* tagHex = token["tag"] | "";
+  uint8_t suppliedTag[32];
+  if (tagHex == nullptr || strlen(tagHex) != sizeof(suppliedTag) * 2 ||
+      !hexDecode(suppliedTag, sizeof(suppliedTag), tagHex)) {
+    errorCode = "SCOPE_INVALID";
+    errorMessage = "scope delegation signature is invalid";
+    return false;
+  }
+  String unsignedCanonical;
+  if (!canonicalJson(token, unsignedCanonical, "tag")) {
+    errorCode = "SCOPE_INVALID";
+    errorMessage = "scope delegation could not be canonicalised";
+    return false;
+  }
+  uint8_t expectedTag[32];
+  if (!computeExecutionTagFull(unsignedCanonical, expectedTag) ||
+      !constantTimeEqual(expectedTag, suppliedTag, sizeof(expectedTag))) {
+    errorCode = "SCOPE_INVALID";
+    errorMessage = "scope delegation signature is invalid";
+    return false;
+  }
+  const String tokenCapability = token["capability"] | "";
+  const String tokenDestination = token["destination_node"] | "";
+  if (tokenCapability != capability || tokenDestination != deviceId) {
+    errorCode = "SCOPE_INVALID";
+    errorMessage = "scope delegation does not match this operation";
+    return false;
+  }
+  String originalCanonical;
+  if (!canonicalJson(arguments, originalCanonical, "_scope_delegation")) {
+    errorCode = "SCOPE_INVALID";
+    errorMessage = "scope delegation could not be canonicalised";
+    return false;
+  }
+  uint8_t argumentsDigest[32];
+  char argumentsDigestHex[65];
+  if (!sha256Digest(originalCanonical, argumentsDigest)) {
+    errorCode = "SCOPE_INVALID";
+    errorMessage = "scope delegation could not be canonicalised";
+    return false;
+  }
+  hexEncode(argumentsDigestHex, argumentsDigest, sizeof(argumentsDigest));
+  const String tokenArgumentsDigest = token["arguments_digest"] | "";
+  if (tokenArgumentsDigest != argumentsDigestHex) {
+    errorCode = "SCOPE_INVALID";
+    errorMessage = "scope delegation does not match this operation";
+    return false;
+  }
+  const long long issuedAt = token["issued_at_ms"] | -1;
+  const long long expiresAt = token["expires_at_ms"] | -1;
+  if (issuedAt < 0 || expiresAt <= issuedAt || (expiresAt - issuedAt) > 300000) {
+    errorCode = "SCOPE_EXPIRED";
+    errorMessage = "scope delegation has an invalid lifetime";
+    return false;
+  }
+  if (!scopeNetworkAuthorised(token["included_networks"], token["excluded_networks"],
+                              String(arguments["network"] | ""))) {
+    errorCode = "SCOPE_DENIED";
+    errorMessage = "target is outside delegated scope";
+    return false;
+  }
+  return true;
 }
 
 bool evidenceNonceFresh(const String& nonce) {
@@ -2101,18 +2326,23 @@ bool evidenceRequestAuthenticated(const String& source, const String& destinatio
 
 bool executionRequestAuthenticated(const String& source, const String& destination,
                                    const String& requestId, const char* capability,
-                                   JsonVariantConst auth, String& nonceOut) {
+                                   JsonVariantConst arguments, JsonVariantConst auth,
+                                   String& nonceOut) {
   if (!executionKeyValid || source != RC_PROVISIONED_PRIMARY_ID) return false;
   const String nonce = auth["nonce"] | "";
   const char* tagHex = auth["tag"] | "";
   const int priority = auth["coordinator_priority"] | -1;
   const uint32_t leaseMs = auth["lease_ms"] | 0;
+  const String suppliedDigest = auth["payload_digest"] | "";
+  String payloadDigest;
   if (nonce.isEmpty() || tagHex == nullptr || strlen(tagHex) != kTagBytes * 2 ||
-      priority != 100 || leaseMs < 1000 || leaseMs > 60000) return false;
+      priority != 100 || leaseMs < 1000 || leaseMs > 60000 ||
+      !jsonDigestHex(arguments, payloadDigest) || suppliedDigest != payloadDigest) return false;
   if (std::find(recentExecutionNonces.begin(), recentExecutionNonces.end(), nonce) !=
       recentExecutionNonces.end()) return false;
   const String canonical = source + "|" + destination + "|" + requestId + "|" + capability +
-      "|" + nodeBootNonceHex + "|" + nonce + "|" + String(priority) + "|" + String(leaseMs);
+      "|" + nodeBootNonceHex + "|" + payloadDigest + "|" + nonce + "|" +
+      String(priority) + "|" + String(leaseMs);
   uint8_t expectedTag[kTagBytes];
   uint8_t suppliedTag[kTagBytes];
   if (!computeExecutionTag(canonical, expectedTag) ||
@@ -2128,14 +2358,18 @@ void authenticateExecutionResponse(JsonDocument& response, const String& destina
                                    const String& requestId, const String& nonce) {
   JsonObject payload = response["payload"];
   const String status = payload["status"] | "rejected";
+  String payloadDigest;
+  JsonVariantConst responseBody = payload[status == "ok" ? "result" : "error"];
+  if (!jsonDigestHex(responseBody, payloadDigest)) return;
   const String canonical = deviceId + "|" + destination + "|" + requestId + "|" + status +
-      "|" + nodeBootNonceHex + "|" + nonce;
+      "|" + nodeBootNonceHex + "|" + payloadDigest + "|" + nonce;
   uint8_t tag[kTagBytes];
   if (!computeExecutionTag(canonical, tag)) return;
   char tagHex[kTagBytes * 2 + 1];
   hexEncode(tagHex, tag, sizeof(tag));
   JsonObject auth = payload["auth"].to<JsonObject>();
   auth["nonce"] = nonce;
+  auth["payload_digest"] = payloadDigest;
   auth["tag"] = tagHex;
 }
 
@@ -2185,7 +2419,8 @@ void handleMessage() {
       addErrorPayload(response, requestId, "CAPABILITY_UNAVAILABLE", "Capability is not available");
     } else if (!(executionAuthenticated = executionRequestAuthenticated(
                      source, deviceId, requestId, capability.c_str(),
-                     request["payload"]["auth"], executionNonce))) {
+                     request["payload"]["arguments"], request["payload"]["auth"],
+                     executionNonce))) {
       addErrorPayload(response, requestId, "UNAUTHENTICATED", "request is not signed or was replayed");
     } else if (capability == "coordination.job.cancel") {
       remoteHostScan.stop();
@@ -2201,6 +2436,11 @@ void handleMessage() {
       addErrorPayload(response, requestId, "STORAGE_PRESSURE", "Durable evidence storage is unavailable");
     } else {
       JsonObject arguments = request["payload"]["arguments"];
+      const char* scopeErrorCode = nullptr;
+      const char* scopeErrorMessage = nullptr;
+      if (!scopeDelegationValid(arguments, "net.discovery.scan", scopeErrorCode, scopeErrorMessage)) {
+        addErrorPayload(response, requestId, scopeErrorCode, scopeErrorMessage);
+      } else {
       IPAddress startIp;
       IPAddress endIp;
       const String startText = arguments["start_ip"] | "";
@@ -2246,6 +2486,7 @@ void handleMessage() {
           saveRemoteTask();
           addRemoteScanResult(response["payload"].to<JsonObject>(), requestId);
         }
+      }
       }
     }
   } else if (capability == "storage.evidence.write") {
@@ -2543,6 +2784,12 @@ void requestSystemInfo(RemoteNode& provider) {
   payload["request_id"] = requestId;
   payload["capability"] = "system.info";
   payload["arguments"].to<JsonObject>();
+  String requestDigest;
+  if (!jsonDigestHex(payload["arguments"], requestDigest)) {
+    notice = "Could not hash request";
+    draw();
+    return;
+  }
   char nonceHex[17] = {};
   if (secureP4) {
     uint64_t nonce = 0;
@@ -2550,7 +2797,7 @@ void requestSystemInfo(RemoteNode& provider) {
     if (nonce == 0) nonce = 1;
     snprintf(nonceHex, sizeof(nonceHex), "%016llx", static_cast<unsigned long long>(nonce));
     const String canonical = deviceId + "|" + provider.deviceId + "|" + requestId +
-        "|system.info|" + groveBootNonce + "|" + nonceHex + "|" +
+        "|system.info|" + groveBootNonce + "|" + requestDigest + "|" + nonceHex + "|" +
         String(RC_COORDINATOR_PRIORITY) + "|" + String(kCoordinatorLeaseMs);
     uint8_t requestTag[kTagBytes];
     if (!computeTag(canonical, requestTag)) {
@@ -2562,6 +2809,7 @@ void requestSystemInfo(RemoteNode& provider) {
     hexEncode(requestTagHex, requestTag, sizeof(requestTag));
     JsonObject auth = payload["auth"].to<JsonObject>();
     auth["nonce"] = nonceHex;
+    auth["payload_digest"] = requestDigest;
     auth["coordinator_priority"] = RC_COORDINATOR_PRIORITY;
     auth["lease_ms"] = kCoordinatorLeaseMs;
     auth["tag"] = requestTagHex;
@@ -2594,11 +2842,15 @@ void requestSystemInfo(RemoteNode& provider) {
     if (secureP4) {
       const String responseNonce = response["payload"]["auth"]["nonce"] | "";
       const String responseTagHex = response["payload"]["auth"]["tag"] | "";
+      const String suppliedDigest = response["payload"]["auth"]["payload_digest"] | "";
+      String responseDigest;
+      JsonVariantConst responseBody = response["payload"][status == "ok" ? "result" : "error"];
+      const bool digestValid = jsonDigestHex(responseBody, responseDigest) && suppliedDigest == responseDigest;
       const String responseCanonical = provider.deviceId + "|" + deviceId + "|" +
-          requestId + "|" + status + "|" + groveBootNonce + "|" + responseNonce;
+          requestId + "|" + status + "|" + groveBootNonce + "|" + responseDigest + "|" + responseNonce;
       uint8_t expectedTag[kTagBytes];
       uint8_t suppliedTag[kTagBytes];
-      authenticated = responseNonce == nonceHex && computeTag(responseCanonical, expectedTag) &&
+      authenticated = digestValid && responseNonce == nonceHex && computeTag(responseCanonical, expectedTag) &&
           hexDecode(suppliedTag, sizeof(suppliedTag), responseTagHex.c_str()) &&
           constantTimeEqual(expectedTag, suppliedTag, sizeof(expectedTag));
     }
@@ -2701,6 +2953,8 @@ void requestScoutUpdate(RemoteScoutJob& job, bool start) {
       }
     }
   }
+  String requestDigest;
+  if (!jsonDigestHex(arguments, requestDigest)) return;
   char nonceHex[17] = {};
   if (secureP4) {
     uint64_t nonce = 0;
@@ -2708,7 +2962,7 @@ void requestScoutUpdate(RemoteScoutJob& job, bool start) {
     if (nonce == 0) nonce = 1;
     snprintf(nonceHex, sizeof(nonceHex), "%016llx", static_cast<unsigned long long>(nonce));
     const String canonical = deviceId + "|" + provider->deviceId + "|" + requestId + "|" +
-        capability + "|" + groveBootNonce + "|" + nonceHex + "|" +
+        capability + "|" + groveBootNonce + "|" + requestDigest + "|" + nonceHex + "|" +
         String(RC_COORDINATOR_PRIORITY) + "|" + String(kCoordinatorLeaseMs);
     uint8_t requestTag[kTagBytes];
     if (!computeTag(canonical, requestTag)) return;
@@ -2716,6 +2970,7 @@ void requestScoutUpdate(RemoteScoutJob& job, bool start) {
     hexEncode(requestTagHex, requestTag, sizeof(requestTag));
     JsonObject auth = payload["auth"].to<JsonObject>();
     auth["nonce"] = nonceHex;
+    auth["payload_digest"] = requestDigest;
     auth["coordinator_priority"] = RC_COORDINATOR_PRIORITY;
     auth["lease_ms"] = kCoordinatorLeaseMs;
     auth["tag"] = requestTagHex;
@@ -2754,11 +3009,15 @@ void requestScoutUpdate(RemoteScoutJob& job, bool start) {
   if (secureP4) {
     const String responseNonce = response["payload"]["auth"]["nonce"] | "";
     const String responseTagHex = response["payload"]["auth"]["tag"] | "";
+    const String suppliedDigest = response["payload"]["auth"]["payload_digest"] | "";
+    String responseDigest;
+    JsonVariantConst responseBody = response["payload"][status == "ok" ? "result" : "error"];
+    const bool digestValid = jsonDigestHex(responseBody, responseDigest) && suppliedDigest == responseDigest;
     const String responseCanonical = provider->deviceId + "|" + deviceId + "|" +
-        requestId + "|" + status + "|" + groveBootNonce + "|" + responseNonce;
+        requestId + "|" + status + "|" + groveBootNonce + "|" + responseDigest + "|" + responseNonce;
     uint8_t expectedTag[kTagBytes];
     uint8_t suppliedTag[kTagBytes];
-    authenticated = responseNonce == nonceHex && computeTag(responseCanonical, expectedTag) &&
+    authenticated = digestValid && responseNonce == nonceHex && computeTag(responseCanonical, expectedTag) &&
         hexDecode(suppliedTag, sizeof(suppliedTag), responseTagHex.c_str()) &&
         constantTimeEqual(expectedTag, suppliedTag, sizeof(expectedTag));
   }

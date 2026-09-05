@@ -13,6 +13,7 @@ import ipaddress
 import json
 import os
 import platform
+import secrets
 import shutil
 import signal
 import socket
@@ -25,6 +26,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from zeroconf import ServiceInfo, Zeroconf
+from tool_runner import ToolRunner
+from encrypted_spool import EncryptedSpool
 
 PROTOCOL = "reconclave/1"
 FIRMWARE = "0.1.0"
@@ -36,9 +39,36 @@ EVIDENCE_REQUIRED_FIELDS = ("job_id", "source_node", "target", "timestamp_ms", "
 # only advertises these handlers when a key is configured and verifies every call.
 AUTH_REQUIRED_CAPABILITIES = {
     "net.discovery.scan", "storage.evidence.write", "coordination.job.cancel",
+    "tool.nmap.services", "tool.dns.lookup", "tool.tcpdump.capture", "tool.job.cancel",
 }
 AUTH_TAG_BYTES = 16
 RECENT_NONCES_PER_SOURCE = 16
+# net.discovery.scan and tool.nmap.services both take explicit IP/network targets
+# that a signed scope delegation can bind to. tool.dns.lookup targets hostnames
+# (not IP networks) and tool.tcpdump.capture's target is an optional local filter,
+# so neither fits the current IP-subnet scope-delegation contract; they still
+# require the execution-key auth above. See platform-roadmap notes for follow-up.
+SCOPE_REQUIRED_CAPABILITIES = {"net.discovery.scan", "tool.nmap.services"}
+# Packaged tool adapters that use the shared async job registry in ToolRunner
+# rather than a bespoke per-capability job slot like net.discovery.scan's.
+TOOL_JOB_CAPABILITIES = ("tool.nmap.services", "tool.dns.lookup", "tool.tcpdump.capture")
+
+
+def canonical_digest(value: object) -> str:
+    def validate(item: object) -> None:
+        if item is None or isinstance(item, (bool, str)):
+            return
+        if isinstance(item, int) and not isinstance(item, bool) and abs(item) <= 9007199254740991:
+            return
+        if isinstance(item, list):
+            for child in item: validate(child)
+            return
+        if isinstance(item, dict) and all(isinstance(key, str) for key in item):
+            for child in item.values(): validate(child)
+            return
+        raise ValueError("signed JSON contains an unsupported value")
+    validate(value)
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 class CapabilityError(Exception):
@@ -66,12 +96,14 @@ def local_ip() -> str:
 class Node:
     def __init__(self, node_id: str, name: str, address: str, port: int,
                  enable_network_scan: bool = False, evidence_dir: str | None = None,
-                 evidence_key: str | None = None, execution_key: str | None = None) -> None:
+                 evidence_key: str | None = None, execution_key: str | None = None,
+                 enable_tools: bool = False) -> None:
         self.node_id = node_id
         self.name = name
         self.address = address
         self.port = port
         self.started = time.monotonic()
+        self.boot_nonce = secrets.token_hex(8)
         self.sequence = 0
         self.lock = threading.Lock()
         self.scan_lock = threading.Lock()
@@ -81,6 +113,7 @@ class Node:
             "recurring": False, "run_count": 0,
         }
         self.evidence_dir = evidence_dir
+        self.encrypted_spool = EncryptedSpool(evidence_dir, evidence_key, node_id) if evidence_dir and evidence_key else None
         if self.evidence_dir is not None:
             os.makedirs(self.evidence_dir, exist_ok=True)
         self.evidence_lock = threading.Lock()
@@ -89,6 +122,7 @@ class Node:
         # Cardputer's Grove-paired peer key is kept.
         self.evidence_key = hashlib.sha256(evidence_key.encode()).digest() if evidence_key else None
         self.execution_key = hashlib.sha256(execution_key.encode()).digest() if execution_key else None
+        self.tool_runner = ToolRunner(self.execution_key)
         self.nonce_lock = threading.Lock()
         self.recent_nonces: dict[str, collections.deque] = {}
         # Announcements are generated from this dispatcher. Adding a handler
@@ -106,6 +140,23 @@ class Node:
             self.capability_handlers["storage.evidence.write"] = self.write_evidence
         if enable_network_scan and self.execution_key is not None:
             self.restore_scan_task()
+        if enable_tools and self.execution_key is not None:
+            availability = self.tool_runner.available()
+            tool_handlers = {
+                "tool.nmap.services": self.tool_runner.nmap_services,
+                "tool.dns.lookup": self.tool_runner.dns_lookup,
+                "tool.tcpdump.capture": self.tool_runner.tcpdump_capture,
+            }
+            for capability, handler in tool_handlers.items():
+                if availability.get(capability, {}).get("available"):
+                    self.capability_handlers[capability] = handler
+            # Every packaged tool adapter shares one async job registry (ToolRunner.jobs),
+            # so a single pair of job-control capabilities covers all of them - unlike
+            # net.discovery.scan, which owns a single dedicated job slot on Node itself
+            # and is queried through coordination.job.status/coordination.job.cancel.
+            if any(capability in self.capability_handlers for capability in TOOL_JOB_CAPABILITIES):
+                self.capability_handlers["tool.job.status"] = self.tool_runner.job_status
+                self.capability_handlers["tool.job.cancel"] = self.tool_runner.job_cancel
 
     def capability_descriptor(self, capability: str) -> dict:
         descriptor = {
@@ -124,10 +175,16 @@ class Node:
             descriptor["limits"] = {"weight": 4, "max_concurrency": 1}
         elif capability == "storage.evidence.write":
             descriptor["features"] = ["jsonl"]
+        elif capability in TOOL_JOB_CAPABILITIES:
+            descriptor.update(self.tool_runner.manifest(capability))
+        elif capability == "tool.job.status":
+            descriptor["features"] = ["job-id-addressed"]
+        elif capability == "tool.job.cancel":
+            descriptor["features"] = ["job-id-addressed", "idempotent"]
         return descriptor
 
     def verify_auth(self, source_node: str, destination_node: str, request_id: str,
-                     capability: str, auth: object) -> None:
+                     capability: str, arguments: dict, auth: object) -> tuple[bytes, str]:
         """Raises CapabilityError unless `auth` is a valid, fresh signature over this
         exact request. Only called for capabilities in AUTH_REQUIRED_CAPABILITIES,
         which are registered only when their corresponding trust-domain key exists."""
@@ -137,10 +194,16 @@ class Node:
         tag_hex = str(auth.get("tag", ""))
         if not nonce or not tag_hex:
             raise CapabilityError("UNAUTHENTICATED", "request is not signed")
-        canonical = f"{source_node}|{destination_node}|{request_id}|{capability}|{nonce}".encode()
         key = self.evidence_key if capability == "storage.evidence.write" else self.execution_key
         if key is None:
             raise CapabilityError("UNAUTHENTICATED", "trust key is not configured")
+        payload_digest = canonical_digest(arguments)
+        if auth.get("payload_digest") != payload_digest:
+            raise CapabilityError("UNAUTHENTICATED", "signed arguments do not match request")
+        priority = int(auth.get("coordinator_priority", 0))
+        lease_ms = int(auth.get("lease_ms", 0))
+        canonical = "|".join([source_node, destination_node, request_id, capability,
+                              self.boot_nonce, payload_digest, nonce, str(priority), str(lease_ms)]).encode()
         expected = hmac.new(key, canonical, hashlib.sha256).digest()[:AUTH_TAG_BYTES]
         try:
             supplied = bytes.fromhex(tag_hex)
@@ -154,6 +217,7 @@ class Node:
             if nonce in seen:
                 raise CapabilityError("UNAUTHENTICATED", "replayed request")
             seen.append(nonce)
+        return key, nonce
 
     def system_info(self, _arguments: dict) -> dict:
         return {
@@ -166,6 +230,35 @@ class Node:
             "uptime_ms": int((time.monotonic() - self.started) * 1000),
             "ip": self.address,
         }
+
+    def verify_scope_delegation(self, capability: str, arguments: dict) -> None:
+        token = arguments.get("_scope_delegation")
+        if not isinstance(token, dict) or self.execution_key is None:
+            raise CapabilityError("SCOPE_REQUIRED", "signed scope delegation is required")
+        tag = str(token.get("tag", ""))
+        unsigned = {key: value for key, value in token.items() if key != "tag"}
+        expected = hmac.new(self.execution_key,
+                            json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode(),
+                            hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(tag, expected):
+            raise CapabilityError("SCOPE_INVALID", "scope delegation signature is invalid")
+        original = {key: value for key, value in arguments.items() if key != "_scope_delegation"}
+        if (token.get("capability") != capability or token.get("destination_node") != self.node_id or
+                token.get("arguments_digest") != canonical_digest(original)):
+            raise CapabilityError("SCOPE_INVALID", "scope delegation does not match this operation")
+        now = int(time.time() * 1000)
+        if not int(token.get("issued_at_ms", 0)) <= now < int(token.get("expires_at_ms", 0)):
+            raise CapabilityError("SCOPE_EXPIRED", "scope delegation has expired")
+        includes = [ipaddress.ip_network(value) for value in token.get("included_networks", [])]
+        excludes = [ipaddress.ip_network(value) for value in token.get("excluded_networks", [])]
+        targets = [original.get(key) for key in ("network", "target", "host") if original.get(key)]
+        targets += original.get("hosts", []) if isinstance(original.get("hosts"), list) else []
+        if not targets:
+            raise CapabilityError("SCOPE_INVALID", "delegation contains no explicit target")
+        for value in targets:
+            target = ipaddress.ip_network(str(value), strict=False)
+            if not any(target.subnet_of(network) for network in includes) or any(target.overlaps(network) for network in excludes):
+                raise CapabilityError("SCOPE_DENIED", f"target {value} is outside delegated scope")
 
     def desktop_resources(self, _arguments: dict) -> dict:
         disk = shutil.disk_usage("/")
@@ -395,16 +488,13 @@ class Node:
         try:
             os.makedirs(self.evidence_dir, exist_ok=True)
             day = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
-            path = os.path.join(self.evidence_dir, f"evidence-{day}.jsonl")
             with self.evidence_lock:
                 duplicate = evidence_id in self.evidence_ids
                 if not duplicate:
-                    with open(path, "a", encoding="utf-8") as handle:
-                        handle.write(encoded + "\n")
-                        handle.flush()
-                        os.fsync(handle.fileno())
+                    assert self.encrypted_spool is not None
+                    self.encrypted_spool.append(record, day)
                     self.evidence_ids.add(evidence_id)
-        except OSError as error:
+        except (OSError, ValueError) as error:
             raise CapabilityError("STORAGE_UNAVAILABLE", str(error)[:160], status="error") from error
         canonical = f"{self.node_id}|{evidence_id}|stored".encode()
         assert self.evidence_key is not None
@@ -447,6 +537,7 @@ class Node:
                 "storage_free_bytes": shutil.disk_usage(self.evidence_dir or "/").free,
             },
             "status": "ready",
+            "security": {"boot_nonce": self.boot_nonce, "mode": "hmac-sha256-128"},
         }
         return message
 
@@ -490,7 +581,10 @@ class Node:
                     raise CapabilityError("INVALID_REQUEST", "arguments must be an object")
                 if capability in AUTH_REQUIRED_CAPABILITIES:
                     destination = str(request.get("destination_node", ""))
-                    self.verify_auth(source, destination, request_id, capability, payload.get("auth"))
+                    response_key, response_nonce = self.verify_auth(source, destination, request_id,
+                                                                     capability, arguments, payload.get("auth"))
+                if capability in SCOPE_REQUIRED_CAPABILITIES:
+                    self.verify_scope_delegation(capability, arguments)
                 result = self.capability_handlers[capability](arguments)
                 response["payload"] = {"request_id": request_id, "status": "ok", "result": result}
             except CapabilityError as error:
@@ -499,6 +593,14 @@ class Node:
                     "status": error.status,
                     "error": {"code": error.code, "message": error.message},
                 }
+            if capability in AUTH_REQUIRED_CAPABILITIES and 'response_key' in locals():
+                response_body = response["payload"].get("result", response["payload"].get("error", {}))
+                digest = canonical_digest(response_body)
+                canonical = "|".join([self.node_id, source, request_id,
+                                      response["payload"]["status"], self.boot_nonce,
+                                      digest, response_nonce]).encode()
+                response["payload"]["auth"] = {"nonce": response_nonce, "payload_digest": digest,
+                                                  "tag": hmac.new(response_key, canonical, hashlib.sha256).digest()[:AUTH_TAG_BYTES].hex()}
         return 200, response
 
 
@@ -565,6 +667,8 @@ def main() -> None:
                         help="shared passphrase for evidence writes and storage receipts")
     parser.add_argument("--execution-key", default=None,
                         help="shared passphrase for trusted scan and job-control requests")
+    parser.add_argument("--enable-tools", action="store_true",
+                        help="advertise installed read-only packaged assessment adapters")
     args = parser.parse_args()
     if args.enable_network_scan and not args.execution_key:
         parser.error("--execution-key is required with --enable-network-scan")
@@ -572,7 +676,7 @@ def main() -> None:
         parser.error("--evidence-key is required with --evidence-dir")
 
     node = Node(args.node_id, args.name, args.address, args.port, args.enable_network_scan,
-                args.evidence_dir, args.evidence_key, args.execution_key)
+                args.evidence_dir, args.evidence_key, args.execution_key, args.enable_tools)
     server = NodeServer(("0.0.0.0", args.port), node)
     service = ServiceInfo(
         "_reconclave._tcp.local.",

@@ -28,6 +28,11 @@ new capability contract.
 | `vision.ocr` | K230 | Sensitive evidence processing | Reserved |
 | `coordination.job.cancel` | All job-executing nodes | Assessment | Reserved |
 | `storage.evidence.write` | Cardputer, desktop | Local evidence storage | Reserved |
+| `tool.nmap.services` | Desktop | Assessment + network scope | Implemented |
+| `tool.dns.lookup` | Desktop | Assessment (not signed-scope enforced — see below) | Implemented |
+| `tool.tcpdump.capture` | Desktop | Assessment (not signed-scope enforced — see below) | Implemented |
+| `tool.job.status` | Desktop | Read-only, non-sensitive | Implemented |
+| `tool.job.cancel` | Desktop | Assessment | Implemented |
 
 `net.discovery.scan` accepts an optional bounded scope with `network`,
 `start_ip`, and `end_ip`. Coordinators use these fields to allocate
@@ -38,6 +43,37 @@ attached IPv4 subnet or larger than a `/24`. Results use `checked`, `total`,
 
 Reserved capabilities may be advertised during development but must not accept
 remote execution until their permission and scope enforcement is implemented.
+
+## Packaged tool capabilities
+
+`tool.nmap.services`, `tool.dns.lookup`, and `tool.tcpdump.capture` are safe,
+schema-bound adapters (`tools/desktop-node/tool_runner.py`) matching the
+tool-runner safety contract in `docs/platform-roadmap.md`: fixed shell-free
+argument construction, bounded inputs, Bubblewrap process/PID isolation, and
+a best-effort CPU/memory ceiling (a cgroup v2 leaf, a user `systemd-run
+--scope`, or POSIX rlimits, tried in that order — each job reports back which
+mechanism, if any, actually applied). Each is advertised only when its
+executable and Bubblewrap are both discovered installed, matching the "tool
+availability is discovered, never assumed" principle.
+
+Unlike `net.discovery.scan`, tool execution is asynchronous: invoking any of
+the three returns a job descriptor immediately (`job_id`, `job_status`, and a
+`resource_ceiling` object) rather than blocking until the tool exits. Poll
+with `tool.job.status` (`{"job_id": ...}`) and stop a running job with
+`tool.job.cancel` — idempotent, like `coordination.job.cancel` — which
+terminates the whole sandboxed process group (SIGTERM, a grace period, then
+SIGKILL) rather than trusting the tool to honour a signal. This is a
+separate, shared job registry from `net.discovery.scan`'s single-slot scan
+state, so a node can run a tool job and a discovery scan concurrently.
+
+`tool.dns.lookup` and `tool.tcpdump.capture` target hostnames and an optional
+local capture filter respectively, neither of which fits the IP-subnet-only
+scope-delegation contract described above under "Delegated scope tokens".
+They are execution-key authenticated like every other capability in this
+section, but — unlike `net.discovery.scan`/`tool.nmap.services` — accepting a
+request does not additionally require or verify a delegated scope token yet
+(`reconclave_node.py`'s `SCOPE_REQUIRED_CAPABILITIES`). See the "Non-IP scope
+delegation" entry in `docs/platform-roadmap.md`'s open design decisions.
 
 ## Authenticated capabilities
 
@@ -60,12 +96,16 @@ envelope:
   "capability": "storage.evidence.write",
   "request_id": "evidence-42",
   "arguments": { "evidence": { "...": "..." } },
-  "auth": { "nonce": "3f9a1c2b7e4d5f60", "tag": "9b2e...c1" }
+  "auth": { "nonce": "3f9a1c2b7e4d5f60", "payload_digest": "sha256...", "tag": "9b2e...c1" }
 }
 ```
 
 `tag` is a 16-byte HMAC-SHA256, truncated, over the canonical string
-`source_node|destination_node|request_id|capability|boot_nonce|nonce`, hex-encoded.
+`source_node|destination_node|request_id|capability|boot_nonce|payload_digest|nonce`,
+hex-encoded. `payload_digest` is the lowercase SHA-256 of the compact JSON
+encoding of `arguments`. Provisioned coordinator requests append their priority
+and lease duration. Authenticated responses use the corresponding compact
+`result` or `error` digest, binding returned findings as well as status metadata.
 The `boot_nonce` is the target's 128-bit value from its current announcement, so
 a captured request cannot be replayed after the target restarts. The receiver
 verifies the tag and rejects the request with `UNAUTHENTICATED` if it's missing,
@@ -74,6 +114,41 @@ keeps a small bounded set of recently accepted nonces per source, rather than re
 on the envelope's `sequence`, which resets to 1 whenever the sender reboots). Only the
 request is authenticated this way — a forged response is a separate, smaller risk not
 covered here.
+
+### Delegated scope tokens
+
+Target-bearing dispatch of `net.discovery.scan` (and, on the desktop provider,
+`tool.nmap.services`) additionally requires a delegated scope token at
+`arguments._scope_delegation`, minted by `EngagementPolicy.delegate` against a
+signed engagement scope revision and bound to one destination node, one
+capability, and the exact argument set it accompanies:
+
+```json
+{
+  "scope_id": "scope-...", "project_id": "PR001193", "capability": "net.discovery.scan",
+  "destination_node": "rc-p4-01", "included_networks": ["192.168.8.0/24"],
+  "excluded_networks": [], "capability_classes": ["discovery"],
+  "arguments_digest": "sha256...", "lease_id": "lease-...",
+  "issued_at_ms": 1787688000000, "expires_at_ms": 1787688300000,
+  "nonce": "...", "tag": "hmac-sha256 hexdigest, 64 hex chars, untruncated"
+}
+```
+
+The token is signed with the same execution key as the request-auth `tag` above,
+but over `json.dumps(token_minus_tag, sort_keys=True, separators=(",", ":"))` —
+alphabetically sorted, not wire order — and `tag` here is the **full** 32-byte
+HMAC-SHA256 hex digest, not the 16-byte truncated form used for request/response
+auth. `arguments_digest` binds the token to the same sort-keys canonical digest of
+`arguments` (minus `_scope_delegation` itself). A provider checks the tag,
+`capability`/`destination_node`/`arguments_digest` binding, and that the request's
+target network is contained by an `included_networks` entry and does not overlap
+any `excluded_networks` entry, before accepting the job — desktop providers via
+`ReconclaveNode.verify_scope_delegation`, ESP32 providers via the equivalent
+`scopeDelegationValid`/`scope_delegation_valid` in their firmware. ESP32 providers
+have no wall-clock time, so they check `issued_at_ms`/`expires_at_ms` only for
+internal consistency (a valid, ≤5-minute lifetime) rather than against the current
+time; the desktop coordinator's own key custody and the request's boot-nonce-bound
+replay protection are what keeps an old token from being usefully replayed there.
 
 ## Recurring jobs
 
@@ -183,4 +258,16 @@ is attached to the selected project. Providers expose authenticated
 `automation.rule.put`, `automation.rule.list`, and `automation.rule.delete`.
 Autonomous evidence is retained through cold boots and synchronised using
 `evidence.outbox.read` followed by `evidence.outbox.ack`; collectors must use a
-deterministic source-node/sequence ID before acknowledging it.
+deterministic source-node/sequence ID before acknowledging it. Because
+`evidence.outbox.read` is a trusted capability, its response is already signed
+with the requesting coordinator's execution key and verified before the caller
+ever sees it (`Coordinator._dispatch`); the desktop coordinator carries that
+verified `{nonce, tag}` forward onto every evidence record ingested from the
+same read as a `provenance` field, rather than discarding it once the transport
+check passes. This is a batch-level proof (one signature covers every record in
+that read — the provider has no separate per-record evidence key independent of
+the pulling coordinator's own execution key), not a per-record one. Evidence
+captured without a signed provenance claim (every pre-existing record, and
+anything entered directly through the operator API) simply has no `provenance`
+field; `provenance`, when present, is folded into the record's content hash, so
+forging or swapping it is caught the same way any other tampering is.

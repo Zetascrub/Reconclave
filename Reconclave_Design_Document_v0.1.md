@@ -1,14 +1,24 @@
 # Reconclave --- Distributed Security Assessment Platform
 
 **Design Document:** v0.1\
-**Status:** Initial architecture\
+**Status:** Initial architecture --- superseded as living status tracker by
+[`docs/platform-roadmap.md`](docs/platform-roadmap.md)\
 **Project type:** Open-source distributed reconnaissance and assessment
 platform\
-**Origin:** Successor to Ghostwire\
+**Origin:** Successor to Ghostwire; vulnerability-analysis components
+reuse selected ideas and parsers from Icebreaker (see
+[`docs/platform-roadmap.md`](docs/platform-roadmap.md#icebreaker-reuse-assessment))\
 **Primary initial targets:** LILYGO T-Display K230 Kit, M5Stack
 Cardputer ADV, M5Stack Unit PoE-P4\
 **Optional analysis tier:** Local laptop/server running Ollama,
 llama.cpp, or another explicitly approved AI provider
+
+This document remains the origin vision and architecture rationale. It is
+no longer updated phase-by-phase; `docs/platform-roadmap.md` is the
+authoritative, currently-maintained record of what phase each capability is
+actually in. Where the two disagree, the roadmap wins. Sections below carry
+short **Status notes** where the build has materially diverged from or
+outrun what's described here.
 
 ------------------------------------------------------------------------
 
@@ -105,9 +115,20 @@ common communication and capability model between participating nodes.
                   Analysis / correlation
 ```
 
-The K230 is expected to become the primary interactive console, but is
-not a mandatory permanent master. Capable nodes may communicate directly
-where appropriate.
+The K230 is expected to become a primary interactive console option, but
+is not a mandatory permanent master. Capable nodes may communicate
+directly where appropriate.
+
+> **Status note (resolved):** the desktop node (`tools/desktop-node/`) is
+> the permanent primary coordinator — signed engagement scopes,
+> workflow/campaign dispatch, evidence custody, and fleet management all
+> live there by design, not as a placeholder for the K230. This was an
+> open design decision (`docs/platform-roadmap.md`) resolved in favour of
+> the desktop staying primary regardless of K230 hardware arriving. The
+> K230, once built, joins as a capability-rich node — touch UI, vision,
+> edge AI — like any other, rather than displacing the desktop as
+> coordinator. The paragraph above is retained as historical framing;
+> treat the resolution as authoritative where the two disagree.
 
 ------------------------------------------------------------------------
 
@@ -282,6 +303,14 @@ the first implementation.
 Later versions may introduce CBOR, MessagePack, or binary framing for
 constrained links or higher-throughput operations.
 
+Deployment topology is a separate axis from link type: Reconclave should
+support local, VPN, and internet-relay deployments (see roadmap Phases 8
+and 11). Relay transport is WireGuard-only (decided in
+`docs/platform-roadmap.md`'s Product decisions) — private addressing, no
+mutually authenticated WebSocket/QUIC fallback. A relayed deployment must
+not introduce implicit transitive trust between nodes that only share a
+relay hop.
+
 ------------------------------------------------------------------------
 
 ## 7. Node Discovery
@@ -406,6 +435,11 @@ Consensus mode can expose:
 Reconclave must distinguish **not observed** from an explicit negative
 result.
 
+> **Status note (resolved):** consensus mode is now an explicit part of
+> Phase 7's exit criteria (`docs/platform-roadmap.md`), alongside
+> capability/resource/topology-aware allocation and failover, rather than
+> a separate phase. Not yet implemented as of this note.
+
 ### 9.3 Adaptive Mode
 
 Adaptive scheduling should eventually become the preferred distributed
@@ -456,6 +490,15 @@ Conflicting evidence must never be silently discarded.
 ------------------------------------------------------------------------
 
 ## 11. Edge AI
+
+> **Status note (applies to §11–13):** none of the current roadmap's 12
+> delivery phases include edge AI, the local AI analysis gateway, RAG, or
+> AI privacy-policy enforcement. This appears to be sequencing (the K230
+> has no hardware yet, and §11's functions are K230-NPU-specific) rather
+> than a decision to drop the AI tier, but the roadmap does not currently
+> say so explicitly. Add an explicit "Planned, gated on K230 hardware"
+> phase for §11–13 to the roadmap, or note here that the AI tier is
+> deliberately deferred, so this doesn't read as abandoned.
 
 The K230 NPU should primarily provide **perception and classification**,
 not general-purpose LLM inference.
@@ -615,6 +658,16 @@ Required controls should include:
     capabilities
 -   Protocol-version validation
 
+> **Status note:** this list is the original wishlist and understates
+> what's actually implemented. The real scheme --- HMAC-SHA256 request
+> tags over a canonical field string, separate execution/evidence key
+> domains derived from a passphrase digest, `boot_nonce`-bound replay
+> protection, and an AES-256-GCM encrypted evidence spool --- is specified
+> in `docs/trust-architecture.md` and the "Authenticated capabilities"
+> section of `docs/capabilities.md`. Treat those as authoritative for the
+> current design; this section is the rationale for why authentication
+> exists, not a spec of how it works.
+
 ### 14.1 Scope Enforcement
 
 Scanning nodes must independently validate requested targets against
@@ -647,35 +700,43 @@ reconclave/
 │   ├── architecture.md
 │   ├── protocol.md
 │   ├── capabilities.md
-│   └── security.md
+│   ├── trust-architecture.md
+│   ├── reliability.md
+│   ├── ui-design.md
+│   ├── platform-roadmap.md
+│   └── ...
 ├── protocol/
 │   ├── schemas/
-│   ├── message-types/
 │   └── test-vectors/
 ├── common/
-│   ├── crypto/
-│   ├── serialization/
-│   ├── device-model/
-│   └── utilities/
+│   └── protocol/
+│       ├── include/reconclave/
+│       └── src/
 ├── devices/
 │   ├── k230/
 │   ├── cardputer-adv/
 │   └── poe-p4/
-├── server/
-│   ├── api/
-│   ├── orchestrator/
-│   ├── evidence/
-│   ├── ai/
-│   └── storage/
 ├── tools/
+│   ├── desktop-node/
 │   ├── protocol-debugger/
-│   └── provisioning/
+│   └── provision_fleet.py
+├── tests/
 └── .github/
     └── workflows/
 ```
 
 Each hardware target may use its own SDK and build system. A monorepo
 does not require one compiler.
+
+> **Status note:** this replaces the original tree, which planned a
+> `server/{api,orchestrator,evidence,ai,storage}` split and a
+> `common/{crypto,serialization,device-model,utilities}` split that were
+> never populated. In practice the coordinator lives in
+> `tools/desktop-node/` (Python) rather than a top-level `server/`, and
+> the shared C++ protocol/domain code sits under `common/protocol/`
+> rather than being split by concern. The stale empty `server/` directory
+> has been removed; if a compiled server component is added later, revive
+> this section's original split deliberately rather than by accretion.
 
 ------------------------------------------------------------------------
 

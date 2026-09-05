@@ -62,6 +62,18 @@ cold boot while every coordinator is offline. Results remain in its durable
 outbox until the desktop imports them into the assigned project and acknowledges
 receipt.
 
+The **Fleet** workspace spans the whole deployment rather than one project: live
+node inventory with desired-vs-actual config drift, signed OTA release
+publishing (`device_type`, version, artifact SHA-256, HMAC-signed locally),
+and staged batch rollout with per-target verification, a failure-threshold
+rollback trigger, and an explicit rollback action reverting already-updated
+targets to whichever release preceded the current rollout for that
+`device_type`. No shipped firmware currently implements the `fleet.ota.apply`
+side of this yet, so every rollout against a real device today reports
+`ineligible` rather than `verified`/`failed` — the orchestration, signing, and
+rollback logic are real and tested even though the loop isn't closed with
+device-side OTA application yet.
+
 Workspace metadata is written
 atomically to the ignored `.reconclave-data/workspace.json` file with owner-only
 permissions; override it with `--workspace-store` when a separate case store is
@@ -94,6 +106,14 @@ and `coordination.job.cancel`) capabilities. Its announcement is generated
 from the live capability-handler registry, preventing it from advertising
 handlers it does not provide. It does not execute commands or expose
 unrestricted assessment capabilities.
+
+`--enable-tools` opts a keyed desktop node into fixed packaged assessment
+adapters. Adapters are advertised only when their executable is installed and
+never expose a shell. The initial `tool.nmap.services` adapter accepts at most
+32 literal IP addresses and 128 ports, performs a TCP connect scan without NSE
+scripts or OS detection, and returns normalised XML-derived observations.
+Coordinator dispatch also requires a current signed engagement scope that
+contains every target.
 
 Network discovery is restricted to an IPv4 `/24` or smaller. It checks a small
 set of common TCP services and treats either a connection or an explicit refusal

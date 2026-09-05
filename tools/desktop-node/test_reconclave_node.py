@@ -3,6 +3,8 @@ import hmac
 import importlib.util
 import json
 import pathlib
+import threading
+import time
 import sys
 import tempfile
 import types
@@ -33,6 +35,15 @@ class DesktopNodeTests(unittest.TestCase):
             "destination_node": node.node_id,
             "payload": payload,
         }
+
+    def signed_auth(self, node, capability, arguments, passphrase, nonce):
+        digest = node_module.canonical_digest(arguments)
+        canonical = "|".join(["rc-test-coordinator", node.node_id, "req-1", capability,
+                              node.boot_nonce, digest, nonce, "100", "15000"]).encode()
+        key = hashlib.sha256(passphrase.encode()).digest()
+        return {"nonce": nonce, "payload_digest": digest, "coordinator_priority": 100,
+                "lease_ms": 15000,
+                "tag": hmac.new(key, canonical, hashlib.sha256).digest()[:16].hex()}
 
     def test_capabilities_follow_enabled_handlers(self):
         plain = node_module.Node("plain", "plain", "127.0.0.1", 8767)
@@ -104,28 +115,166 @@ class DesktopNodeTests(unittest.TestCase):
                 "observation": {"responsive": True},
             }
             nonce = "0011223344556677"
-            canonical = f"rc-test-coordinator|collector|req-1|storage.evidence.write|{nonce}".encode()
-            key = hashlib.sha256(passphrase.encode()).digest()
-            tag = hmac.new(key, canonical, hashlib.sha256).digest()[:16].hex()
-            request = self.make_request(node, "storage.evidence.write", {"evidence": evidence},
-                                        {"nonce": nonce, "tag": tag})
+            arguments = {"evidence": evidence}
+            request = self.make_request(node, "storage.evidence.write", arguments,
+                                        self.signed_auth(node, "storage.evidence.write", arguments,
+                                                         passphrase, nonce))
             _, response = node.respond(request)
             self.assertEqual(response["payload"]["status"], "ok")
             self.assertEqual(response["payload"]["result"]["evidence_id"], "evidence-1")
-            records = list(pathlib.Path(directory).glob("evidence-*.jsonl"))
+            records = list(pathlib.Path(directory).glob("evidence-*.rcspool"))
             self.assertEqual(len(records), 1)
-            self.assertEqual(json.loads(records[0].read_text()), evidence)
+            self.assertNotIn("192.0.2.10", records[0].read_text())
+            self.assertEqual(node.encrypted_spool.read(records[0]), [evidence])
             _, replay = node.respond(request)
             self.assertEqual(replay["payload"]["error"]["code"], "UNAUTHENTICATED")
 
             second_nonce = "0011223344556688"
-            second_canonical = (f"rc-test-coordinator|collector|req-1|storage.evidence.write|"
-                                f"{second_nonce}").encode()
-            second_tag = hmac.new(key, second_canonical, hashlib.sha256).digest()[:16].hex()
-            request["payload"]["auth"] = {"nonce": second_nonce, "tag": second_tag}
+            request["payload"]["auth"] = self.signed_auth(
+                node, "storage.evidence.write", arguments, passphrase, second_nonce)
             _, duplicate = node.respond(request)
             self.assertTrue(duplicate["payload"]["result"]["duplicate"])
             self.assertEqual(len(records[0].read_text().splitlines()), 1)
+
+    def test_provider_rejects_scope_delegation_bound_to_different_arguments(self):
+        passphrase = "execution key"
+        node = node_module.Node("runner", "runner", "127.0.0.1", 8767,
+                                execution_key=passphrase)
+        node.capability_handlers["tool.nmap.services"] = lambda arguments: {"accepted": arguments["hosts"]}
+        original = {"hosts": ["192.168.20.4"], "ports": [443]}
+        now = int(time.time() * 1000)
+        token = {"scope_id": "scope-1", "project_id": "project-1",
+                 "capability": "tool.nmap.services", "destination_node": node.node_id,
+                 "included_networks": ["192.168.20.0/24"], "excluded_networks": [],
+                 "capability_classes": ["discovery"],
+                 "arguments_digest": node_module.canonical_digest(original),
+                 "lease_id": "lease-1", "issued_at_ms": now,
+                 "expires_at_ms": now + 60000, "nonce": "delegation-1"}
+        key = hashlib.sha256(passphrase.encode()).digest()
+        token["tag"] = hmac.new(key, json.dumps(token, sort_keys=True, separators=(",", ":")).encode(),
+                                hashlib.sha256).hexdigest()
+        delegated = {**original, "_scope_delegation": token}
+        request = self.make_request(node, "tool.nmap.services", delegated,
+                                    self.signed_auth(node, "tool.nmap.services", delegated,
+                                                     passphrase, "outer-1"))
+        _, response = node.respond(request)
+        self.assertEqual(response["payload"]["status"], "ok")
+
+        tampered = {**delegated, "hosts": ["192.168.20.5"]}
+        request = self.make_request(node, "tool.nmap.services", tampered,
+                                    self.signed_auth(node, "tool.nmap.services", tampered,
+                                                     passphrase, "outer-2"))
+        _, response = node.respond(request)
+        self.assertEqual(response["payload"]["error"]["code"], "SCOPE_INVALID")
+
+    def test_tool_capabilities_and_shared_job_control_registered_when_available(self):
+        with mock.patch("tool_runner.shutil.which", return_value="/usr/bin/true"):
+            node = node_module.Node("runner", "runner", "127.0.0.1", 8767,
+                                    execution_key="exec key", enable_tools=True)
+        capabilities = node.announcement()["payload"]["capabilities"]
+        for capability in ("tool.nmap.services", "tool.dns.lookup", "tool.tcpdump.capture",
+                           "tool.job.status", "tool.job.cancel"):
+            self.assertIn(capability, capabilities)
+        descriptors = {item["id"]: item for item in node.announcement()["payload"]["capability_descriptors"]}
+        # Job status polling is public like coordination.job.status; job control
+        # that changes state (cancel) and the tool adapters themselves are trusted.
+        self.assertEqual(descriptors["tool.job.status"]["permission"], "public")
+        self.assertEqual(descriptors["tool.job.cancel"]["permission"], "trusted")
+        self.assertEqual(descriptors["tool.dns.lookup"]["permission"], "trusted")
+        self.assertEqual(descriptors["tool.tcpdump.capture"]["permission"], "trusted")
+        self.assertIn("isolation", descriptors["tool.dns.lookup"])
+
+    def test_tool_capabilities_and_job_control_absent_when_no_tool_is_installed(self):
+        with mock.patch("tool_runner.shutil.which", return_value=None):
+            node = node_module.Node("runner", "runner", "127.0.0.1", 8767,
+                                    execution_key="exec key", enable_tools=True)
+        capabilities = node.announcement()["payload"]["capabilities"]
+        for capability in ("tool.nmap.services", "tool.dns.lookup", "tool.tcpdump.capture",
+                           "tool.job.status", "tool.job.cancel"):
+            self.assertNotIn(capability, capabilities)
+
+    def test_dns_lookup_and_tcpdump_capture_require_signed_requests(self):
+        with mock.patch("tool_runner.shutil.which", return_value="/usr/bin/true"):
+            node = node_module.Node("runner", "runner", "127.0.0.1", 8767,
+                                    execution_key="exec key", enable_tools=True)
+        for capability, arguments in (("tool.dns.lookup", {"names": ["example.com"]}),
+                                      ("tool.tcpdump.capture", {"interface": "lo", "count": 1})):
+            _, response = node.respond(self.make_request(node, capability, arguments))
+            self.assertEqual(response["payload"]["error"]["code"], "UNAUTHENTICATED")
+
+    def test_tool_job_dispatch_status_and_idempotent_cancel_round_trip_through_respond(self):
+        passphrase = "execution key"
+        with mock.patch("tool_runner.shutil.which", return_value="/usr/bin/true"):
+            node = node_module.Node("runner", "runner", "127.0.0.1", 8767,
+                                    execution_key=passphrase, enable_tools=True)
+        release = threading.Event()
+        process = mock.MagicMock()
+        process.pid = 5150
+        process.returncode = 0
+
+        def _communicate(timeout=None):
+            release.wait(timeout=5)
+            return ('<nmaprun><host><address addr="192.168.20.4" addrtype="ipv4"/>'
+                    '<ports></ports></host></nmaprun>', "")
+
+        process.communicate.side_effect = _communicate
+        original = {"hosts": ["192.168.20.4"], "ports": [443]}
+        now = int(time.time() * 1000)
+        token = {"scope_id": "scope-1", "project_id": "project-1",
+                 "capability": "tool.nmap.services", "destination_node": node.node_id,
+                 "included_networks": ["192.168.20.0/24"], "excluded_networks": [],
+                 "capability_classes": ["discovery"],
+                 "arguments_digest": node_module.canonical_digest(original),
+                 "lease_id": "lease-1", "issued_at_ms": now,
+                 "expires_at_ms": now + 60000, "nonce": "delegation-1"}
+        key = hashlib.sha256(passphrase.encode()).digest()
+        token["tag"] = hmac.new(key, json.dumps(token, sort_keys=True, separators=(",", ":")).encode(),
+                                hashlib.sha256).hexdigest()
+        delegated = {**original, "_scope_delegation": token}
+
+        with mock.patch("tool_runner.shutil.which", return_value="/usr/bin/true"), \
+             mock.patch("tool_runner.subprocess.Popen", return_value=process):
+            request = self.make_request(node, "tool.nmap.services", delegated,
+                                        self.signed_auth(node, "tool.nmap.services", delegated,
+                                                         passphrase, "outer-1"))
+            _, response = node.respond(request)
+            self.assertEqual(response["payload"]["status"], "ok")
+            job_id = response["payload"]["result"]["job_id"]
+            self.assertEqual(response["payload"]["result"]["job_status"], "running")
+
+            # tool.job.status is public read-only polling, like coordination.job.status:
+            # no auth object is required.
+            status_request = self.make_request(node, "tool.job.status", {"job_id": job_id})
+            _, status_response = node.respond(status_request)
+            self.assertEqual(status_response["payload"]["status"], "ok")
+            self.assertEqual(status_response["payload"]["result"]["job_status"], "running")
+
+            release.set()
+            deadline = time.monotonic() + 2
+            result = None
+            while time.monotonic() < deadline:
+                _, status_response = node.respond(status_request)
+                result = status_response["payload"]["result"]
+                if result["job_status"] == "complete":
+                    break
+                time.sleep(0.01)
+            self.assertEqual(result["job_status"], "complete")
+            self.assertEqual(result["result"]["hosts"][0]["address"], "192.168.20.4")
+
+            # Cancelling a finished job is still an "ok" no-op (idempotent, like
+            # coordination.job.cancel), but the request must still be signed.
+            cancel_arguments = {"job_id": job_id}
+            unauth_cancel = self.make_request(node, "tool.job.cancel", cancel_arguments)
+            _, unauth_response = node.respond(unauth_cancel)
+            self.assertEqual(unauth_response["payload"]["error"]["code"], "UNAUTHENTICATED")
+
+            cancel_request = self.make_request(node, "tool.job.cancel", cancel_arguments,
+                                               self.signed_auth(node, "tool.job.cancel", cancel_arguments,
+                                                                passphrase, "cancel-1"))
+            _, cancel_response = node.respond(cancel_request)
+            self.assertEqual(cancel_response["payload"]["status"], "ok")
+            self.assertTrue(cancel_response["payload"]["result"]["ok"])
+            self.assertFalse(cancel_response["payload"]["result"]["cancelled"])
 
 
 if __name__ == "__main__":

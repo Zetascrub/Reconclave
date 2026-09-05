@@ -32,7 +32,7 @@
 #include "ping/ping_sock.h"
 #include "generated_trust.h"
 
-#define RC_FIRMWARE_VERSION "0.3.1"
+#define RC_FIRMWARE_VERSION "0.4.0"
 #define RC_PROTOCOL "reconclave/1"
 #define RC_HOSTNAME "reconclave-poe-p4"
 #define RC_INSTANCE "Reconclave Unit PoE-P4"
@@ -144,6 +144,22 @@ typedef struct {
     char ip[16];
     char boot_id[33];
     char hosts[RC_SCAN_MAX_RESULTS][16];
+} outbox_record_v1_t;
+typedef struct {
+    uint8_t version;
+    uint32_t sequence;
+    uint32_t run_count;
+    uint8_t host_count;
+    char rule_id[32];
+    char project_id[64];
+    char kind[24];
+    char ip[16];
+    char boot_id[33];
+    char hosts[RC_SCAN_MAX_RESULTS][16];
+    char firmware[16];
+    uint32_t uptime_ms;
+    uint32_t free_memory_bytes;
+    bool ethernet_link;
 } outbox_record_t;
 static automation_rule_t s_rules[RC_MAX_RULES];
 static bool s_rule_matched[RC_MAX_RULES];
@@ -213,6 +229,20 @@ static bool compute_tag_with_key(const uint8_t key[RC_KEY_BYTES], const char *me
     return true;
 }
 
+static bool json_digest_hex(const cJSON *value, char output[65])
+{
+    if (value == NULL) return false;
+    char *encoded = cJSON_PrintUnformatted(value);
+    if (encoded == NULL) return false;
+    uint8_t digest[32];
+    const int result = mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
+                                  (const uint8_t *)encoded, strlen(encoded), digest);
+    cJSON_free(encoded);
+    if (result != 0) return false;
+    hex_encode(output, digest, sizeof(digest));
+    return true;
+}
+
 static const rc_provisioned_peer_t *provisioned_peer(const char *peer_id)
 {
     if (peer_id == NULL) return NULL;
@@ -275,7 +305,27 @@ static void load_automation_state(void)
         length != sizeof(s_rules)) memset(s_rules, 0, sizeof(s_rules));
     length = sizeof(s_outbox);
     if (nvs_get_blob(handle, RC_AUTOMATION_OUTBOX_KEY, s_outbox, &length) != ESP_OK ||
-        length != sizeof(s_outbox)) memset(s_outbox, 0, sizeof(s_outbox));
+        length != sizeof(s_outbox)) {
+        outbox_record_v1_t legacy[RC_MAX_OUTBOX] = {0};
+        length = sizeof(legacy);
+        memset(s_outbox, 0, sizeof(s_outbox));
+        if (nvs_get_blob(handle, RC_AUTOMATION_OUTBOX_KEY, legacy, &length) == ESP_OK &&
+            length == sizeof(legacy)) {
+            for (size_t index = 0; index < RC_MAX_OUTBOX; ++index) {
+                if (legacy[index].version != 1) continue;
+                s_outbox[index].version = 1;
+                s_outbox[index].sequence = legacy[index].sequence;
+                s_outbox[index].run_count = legacy[index].run_count;
+                s_outbox[index].host_count = legacy[index].host_count;
+                strlcpy(s_outbox[index].rule_id, legacy[index].rule_id, sizeof(s_outbox[index].rule_id));
+                strlcpy(s_outbox[index].project_id, legacy[index].project_id, sizeof(s_outbox[index].project_id));
+                strlcpy(s_outbox[index].kind, legacy[index].kind, sizeof(s_outbox[index].kind));
+                strlcpy(s_outbox[index].ip, legacy[index].ip, sizeof(s_outbox[index].ip));
+                strlcpy(s_outbox[index].boot_id, legacy[index].boot_id, sizeof(s_outbox[index].boot_id));
+                memcpy(s_outbox[index].hosts, legacy[index].hosts, sizeof(s_outbox[index].hosts));
+            }
+        }
+    }
     nvs_get_u32(handle, RC_AUTOMATION_SEQUENCE_KEY, &s_outbox_sequence);
     for (size_t index = 0; index < RC_MAX_OUTBOX; ++index) {
         if (s_outbox[index].sequence > s_outbox_sequence) s_outbox_sequence = s_outbox[index].sequence;
@@ -303,24 +353,45 @@ static bool save_outbox_sequence(void)
     return result == ESP_OK;
 }
 
-static void queue_evidence(const char *rule_id, const char *project_id, const char *kind,
+static bool queue_evidence(const char *rule_id, const char *project_id, const char *kind,
                            uint32_t run_count, char hosts[][16], uint8_t host_count)
 {
-    outbox_record_t record = {.version = 1, .sequence = ++s_outbox_sequence,
+    size_t slot = RC_MAX_OUTBOX;
+    for (size_t index = 0; index < RC_MAX_OUTBOX; ++index) {
+        if (s_outbox[index].version == 0) {
+            slot = index;
+            break;
+        }
+    }
+    if (slot == RC_MAX_OUTBOX) {
+        ESP_LOGW(TAG, "Evidence outbox full; retaining existing records");
+        return false;
+    }
+    outbox_record_t record = {.version = 2, .sequence = s_outbox_sequence + 1,
                               .run_count = run_count,
-                              .host_count = host_count > RC_SCAN_MAX_RESULTS ? RC_SCAN_MAX_RESULTS : host_count};
+                              .host_count = host_count > RC_SCAN_MAX_RESULTS ? RC_SCAN_MAX_RESULTS : host_count,
+                              .uptime_ms = (uint32_t)(esp_timer_get_time() / 1000),
+                              .free_memory_bytes = esp_get_free_heap_size(),
+                              .ethernet_link = s_network.link_up};
     strlcpy(record.rule_id, rule_id, sizeof(record.rule_id));
     strlcpy(record.project_id, project_id, sizeof(record.project_id));
     strlcpy(record.kind, kind, sizeof(record.kind));
     strlcpy(record.ip, s_network.ip, sizeof(record.ip));
     strlcpy(record.boot_id, s_boot_nonce_hex, sizeof(record.boot_id));
+    strlcpy(record.firmware, RC_FIRMWARE_VERSION, sizeof(record.firmware));
     for (size_t index = 0; index < record.host_count; ++index) {
         strlcpy(record.hosts[index], hosts[index], sizeof(record.hosts[index]));
     }
-    memmove(&s_outbox[0], &s_outbox[1], sizeof(s_outbox[0]) * (RC_MAX_OUTBOX - 1));
-    s_outbox[RC_MAX_OUTBOX - 1] = record;
-    save_outbox_sequence();
-    save_automation_blob(RC_AUTOMATION_OUTBOX_KEY, s_outbox, sizeof(s_outbox));
+    s_outbox[slot] = record;
+    if (!save_automation_blob(RC_AUTOMATION_OUTBOX_KEY, s_outbox, sizeof(s_outbox))) {
+        memset(&s_outbox[slot], 0, sizeof(s_outbox[slot]));
+        return false;
+    }
+    s_outbox_sequence = record.sequence;
+    if (!save_outbox_sequence()) {
+        ESP_LOGW(TAG, "Evidence saved but outbox sequence commit failed");
+    }
+    return true;
 }
 
 static uint64_t timestamp_ms(void)
@@ -915,9 +986,9 @@ static void automation_task(void *argument)
             if (s_rule_matched[index]) continue;
             if (rule->playbook == RC_PLAYBOOK_SNAPSHOT) {
                 char empty_hosts[RC_SCAN_MAX_RESULTS][16] = {{0}};
-                queue_evidence(rule->id, rule->project_id, "system-snapshot", 1,
-                               empty_hosts, 0);
-                s_rule_matched[index] = true;
+                s_rule_matched[index] = queue_evidence(rule->id, rule->project_id,
+                                                       "system-snapshot", 1,
+                                                       empty_hosts, 0);
             } else if (start_rule_scout(rule)) {
                 s_rule_matched[index] = true;
             }
@@ -1032,7 +1103,7 @@ static cJSON *outbox_response(const char *destination, const char *request_id,
     cJSON *records = cJSON_AddArrayToObject(result, "records");
     for (size_t index = 0; index < RC_MAX_OUTBOX; ++index) {
         const outbox_record_t *record = &s_outbox[index];
-        if (record->version != 1) continue;
+        if (record->version != 1 && record->version != 2) continue;
         cJSON *item = cJSON_CreateObject();
         cJSON_AddNumberToObject(item, "sequence", record->sequence);
         cJSON_AddStringToObject(item, "rule_id", record->rule_id);
@@ -1041,6 +1112,15 @@ static cJSON *outbox_response(const char *destination, const char *request_id,
         cJSON_AddStringToObject(item, "ip", record->ip);
         cJSON_AddStringToObject(item, "boot_id", record->boot_id);
         cJSON_AddNumberToObject(item, "run_count", record->run_count);
+        if (record->version >= 2) {
+            cJSON *system = cJSON_AddObjectToObject(item, "system");
+            cJSON_AddStringToObject(system, "device_type", "poe-p4");
+            cJSON_AddStringToObject(system, "firmware", record->firmware);
+            cJSON_AddNumberToObject(system, "uptime_ms", record->uptime_ms);
+            cJSON_AddNumberToObject(system, "free_memory_bytes", record->free_memory_bytes);
+            cJSON_AddBoolToObject(system, "ethernet_link", record->ethernet_link);
+            cJSON_AddStringToObject(system, "ip", record->ip);
+        }
         cJSON *hosts = cJSON_AddArrayToObject(item, "hosts");
         for (size_t host = 0; host < record->host_count; ++host) {
             cJSON_AddItemToArray(hosts, cJSON_CreateString(record->hosts[host]));
@@ -1095,7 +1175,7 @@ static cJSON *announcement(void)
     }
     cJSON *resources = cJSON_AddObjectToObject(payload, "resources");
     cJSON_AddNumberToObject(resources, "network_mbps", 100);
-    cJSON_AddBoolToObject(resources, "persistent_storage", false);
+    cJSON_AddBoolToObject(resources, "persistent_storage", true);
     cJSON_AddNumberToObject(resources, "storage_free_bytes", 0);
     cJSON_AddStringToObject(payload, "status", "ready");
     cJSON *security = cJSON_AddObjectToObject(payload, "security");
@@ -1177,9 +1257,12 @@ static bool authenticate_request(const cJSON *input, const char *source_id,
     const cJSON *tag_json = cJSON_GetObjectItemCaseSensitive(auth, "tag");
     const cJSON *priority_json = cJSON_GetObjectItemCaseSensitive(auth, "coordinator_priority");
     const cJSON *lease_json = cJSON_GetObjectItemCaseSensitive(auth, "lease_ms");
+    const cJSON *digest_json = cJSON_GetObjectItemCaseSensitive(auth, "payload_digest");
+    const cJSON *arguments = cJSON_GetObjectItemCaseSensitive(payload, "arguments");
     if (!cJSON_IsObject(auth) || !cJSON_IsString(nonce_json) ||
         !cJSON_IsString(tag_json) || !cJSON_IsNumber(priority_json) ||
-        !cJSON_IsNumber(lease_json) || strlen(nonce_json->valuestring) != 16 ||
+        !cJSON_IsNumber(lease_json) || !cJSON_IsString(digest_json) ||
+        strlen(digest_json->valuestring) != 64 || strlen(nonce_json->valuestring) != 16 ||
         priority_json->valueint != peer->priority ||
         lease_json->valueint < RC_LEASE_MIN_MS || lease_json->valueint > RC_LEASE_MAX_MS) return false;
     char *nonce_end = NULL;
@@ -1187,10 +1270,13 @@ static bool authenticate_request(const cJSON *input, const char *source_id,
     if (nonce_end == nonce_json->valuestring || *nonce_end != '\0') {
         return false;
     }
-    char canonical[320];
-    snprintf(canonical, sizeof(canonical), "%s|%s|%s|%s|%s|%s|%d|%d", source_id,
+    char computed_digest[65];
+    if (!json_digest_hex(arguments, computed_digest) ||
+        strcmp(computed_digest, digest_json->valuestring) != 0) return false;
+    char canonical[400];
+    snprintf(canonical, sizeof(canonical), "%s|%s|%s|%s|%s|%s|%s|%d|%d", source_id,
              s_device_id, request_id, capability, s_boot_nonce_hex,
-             nonce_json->valuestring, priority_json->valueint, lease_json->valueint);
+             computed_digest, nonce_json->valuestring, priority_json->valueint, lease_json->valueint);
     uint8_t expected[RC_TAG_BYTES];
     uint8_t supplied[RC_TAG_BYTES];
     if (!compute_tag_with_key(peer->key, canonical, expected) ||
@@ -1223,16 +1309,21 @@ static void authenticate_response(cJSON *response, const char *destination,
     if (key == NULL || nonce == 0) return;
     char nonce_hex[17];
     snprintf(nonce_hex, sizeof(nonce_hex), "%016llx", (unsigned long long)nonce);
-    char canonical[320];
-    snprintf(canonical, sizeof(canonical), "%s|%s|%s|%s|%s|%s", s_device_id,
-             destination, request_id, status, s_boot_nonce_hex, nonce_hex);
+    cJSON *payload = cJSON_GetObjectItemCaseSensitive(response, "payload");
+    cJSON *signed_body = cJSON_GetObjectItemCaseSensitive(payload, "result");
+    if (signed_body == NULL) signed_body = cJSON_GetObjectItemCaseSensitive(payload, "error");
+    char payload_digest[65];
+    if (!json_digest_hex(signed_body, payload_digest)) return;
+    char canonical[400];
+    snprintf(canonical, sizeof(canonical), "%s|%s|%s|%s|%s|%s|%s", s_device_id,
+             destination, request_id, status, s_boot_nonce_hex, payload_digest, nonce_hex);
     uint8_t tag[RC_TAG_BYTES];
     if (!compute_tag_with_key(key, canonical, tag)) return;
     char tag_hex[RC_TAG_BYTES * 2 + 1];
     hex_encode(tag_hex, tag, sizeof(tag));
-    cJSON *payload = cJSON_GetObjectItemCaseSensitive(response, "payload");
     cJSON *auth = cJSON_AddObjectToObject(payload, "auth");
     cJSON_AddStringToObject(auth, "nonce", nonce_hex);
+    cJSON_AddStringToObject(auth, "payload_digest", payload_digest);
     cJSON_AddStringToObject(auth, "tag", tag_hex);
 }
 
@@ -1240,6 +1331,263 @@ static bool json_string_equals(const cJSON *value, const char *expected)
 {
     return cJSON_IsString(value) && value->valuestring != NULL &&
            strcmp(value->valuestring, expected) == 0;
+}
+
+static bool compute_tag_with_key_full(const uint8_t key[RC_KEY_BYTES], const char *message,
+                                      uint8_t output[32])
+{
+    if (key == NULL || message == NULL) return false;
+    const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    return info != NULL && mbedtls_md_hmac(info, key, RC_KEY_BYTES,
+                                           (const uint8_t *)message, strlen(message), output) == 0;
+}
+
+static bool sha256_hex_of_text(const char *text, char output[65])
+{
+    uint8_t digest[32];
+    if (mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
+                   (const uint8_t *)text, strlen(text), digest) != 0) return false;
+    hex_encode(output, digest, sizeof(digest));
+    return true;
+}
+
+typedef struct {
+    char *data;
+    size_t capacity;
+    size_t length;
+    bool overflow;
+} canon_buf_t;
+
+static void canon_append(canon_buf_t *buf, const char *text)
+{
+    if (buf->overflow || text == NULL) return;
+    const size_t text_length = strlen(text);
+    if (buf->length + text_length >= buf->capacity) { buf->overflow = true; return; }
+    memcpy(buf->data + buf->length, text, text_length);
+    buf->length += text_length;
+    buf->data[buf->length] = '\0';
+}
+
+// Appends `value` to `buf` as compact JSON with object keys sorted lexicographically,
+// matching the desktop coordinator's Python json.dumps(value, sort_keys=True,
+// separators=(",", ":")) canonical form used to sign scope-delegation tokens and
+// bind them to specific arguments (engagement_policy.py, reconclave_node.py; see
+// docs/capabilities.md). Only the JSON subset the protocol actually carries here is
+// supported -- null, bool, string, integer, array, string-keyed object -- and
+// anything else fails closed rather than guessing a representation. `exclude_key`
+// (may be NULL) is a single top-level object key to omit, used to canonicalise a
+// token without its own "tag", or arguments without the embedded "_scope_delegation".
+static bool canonical_json(const cJSON *value, canon_buf_t *buf, const char *exclude_key)
+{
+    if (value == NULL || cJSON_IsNull(value)) { canon_append(buf, "null"); return !buf->overflow; }
+    if (cJSON_IsBool(value)) { canon_append(buf, cJSON_IsTrue(value) ? "true" : "false"); return !buf->overflow; }
+    if (cJSON_IsString(value)) {
+        char *encoded = cJSON_PrintUnformatted(value);
+        if (encoded == NULL) return false;
+        canon_append(buf, encoded);
+        cJSON_free(encoded);
+        return !buf->overflow;
+    }
+    if (cJSON_IsNumber(value)) {
+        char text[32];
+        snprintf(text, sizeof(text), "%lld", (long long)value->valuedouble);
+        canon_append(buf, text);
+        return !buf->overflow;
+    }
+    if (cJSON_IsArray(value)) {
+        canon_append(buf, "[");
+        bool first = true;
+        const cJSON *item = NULL;
+        cJSON_ArrayForEach(item, value) {
+            if (!first) canon_append(buf, ",");
+            first = false;
+            if (!canonical_json(item, buf, NULL)) return false;
+        }
+        canon_append(buf, "]");
+        return !buf->overflow;
+    }
+    if (cJSON_IsObject(value)) {
+        const cJSON *keys[32];
+        size_t count = 0;
+        const cJSON *item = NULL;
+        cJSON_ArrayForEach(item, value) {
+            if (item->string == NULL) return false;
+            if (exclude_key != NULL && strcmp(item->string, exclude_key) == 0) continue;
+            for (const char *c = item->string; *c != '\0'; ++c) {
+                const bool safe = (*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') ||
+                                  (*c >= '0' && *c <= '9') || *c == '_';
+                if (!safe) return false;
+            }
+            if (count >= sizeof(keys) / sizeof(keys[0])) return false;
+            keys[count++] = item;
+        }
+        for (size_t i = 1; i < count; ++i) {
+            const cJSON *current = keys[i];
+            size_t j = i;
+            while (j > 0 && strcmp(keys[j - 1]->string, current->string) > 0) {
+                keys[j] = keys[j - 1];
+                --j;
+            }
+            keys[j] = current;
+        }
+        canon_append(buf, "{");
+        for (size_t i = 0; i < count; ++i) {
+            if (i > 0) canon_append(buf, ",");
+            canon_append(buf, "\"");
+            canon_append(buf, keys[i]->string);
+            canon_append(buf, "\":");
+            if (!canonical_json(keys[i], buf, NULL)) return false;
+        }
+        canon_append(buf, "}");
+        return !buf->overflow;
+    }
+    return false;
+}
+
+static bool parse_cidr(const char *text, uint32_t *base, uint8_t *prefix)
+{
+    if (text == NULL) return false;
+    unsigned a, b, c, d, bits;
+    if (sscanf(text, "%u.%u.%u.%u/%u", &a, &b, &c, &d, &bits) != 5) return false;
+    if (a > 255 || b > 255 || c > 255 || d > 255 || bits > 32) return false;
+    *base = ((uint32_t)a << 24) | ((uint32_t)b << 16) | ((uint32_t)c << 8) | (uint32_t)d;
+    *prefix = (uint8_t)bits;
+    return true;
+}
+
+static uint32_t mask_for_prefix(uint8_t prefix)
+{
+    return prefix == 0 ? 0 : (0xffffffffu << (32 - prefix));
+}
+
+static bool cidr_subnet_of(uint32_t target_base, uint8_t target_prefix,
+                           uint32_t other_base, uint8_t other_prefix)
+{
+    if (target_prefix < other_prefix) return false;
+    const uint32_t mask = mask_for_prefix(other_prefix);
+    return (target_base & mask) == (other_base & mask);
+}
+
+static bool cidr_overlaps(uint32_t a_base, uint8_t a_prefix, uint32_t b_base, uint8_t b_prefix)
+{
+    const uint32_t mask = mask_for_prefix(a_prefix < b_prefix ? a_prefix : b_prefix);
+    return (a_base & mask) == (b_base & mask);
+}
+
+// Checks a requested target network against a delegated token's included/excluded
+// CIDR lists the same way EngagementPolicy.authorize does on the desktop
+// coordinator: the target must be contained by at least one included network and
+// must not overlap any excluded network.
+static bool scope_network_authorised(const cJSON *included, const cJSON *excluded,
+                                     const char *target_text)
+{
+    uint32_t target_base;
+    uint8_t target_prefix;
+    if (!parse_cidr(target_text, &target_base, &target_prefix)) return false;
+    bool included_match = false;
+    const cJSON *entry = NULL;
+    cJSON_ArrayForEach(entry, included) {
+        if (!cJSON_IsString(entry)) continue;
+        uint32_t base;
+        uint8_t prefix;
+        if (parse_cidr(entry->valuestring, &base, &prefix) &&
+            cidr_subnet_of(target_base, target_prefix, base, prefix)) { included_match = true; break; }
+    }
+    if (!included_match) return false;
+    cJSON_ArrayForEach(entry, excluded) {
+        if (!cJSON_IsString(entry)) continue;
+        uint32_t base;
+        uint8_t prefix;
+        if (parse_cidr(entry->valuestring, &base, &prefix) &&
+            cidr_overlaps(target_base, target_prefix, base, prefix)) return false;
+    }
+    return true;
+}
+
+// Verifies a delegated engagement-scope token embedded at arguments["_scope_delegation"],
+// mirroring EngagementPolicy.delegate/ReconclaveNode.verify_scope_delegation on the
+// desktop coordinator (engagement_policy.py, reconclave_node.py). The token is signed
+// with the same per-peer execution key used to authenticate the outer request, is
+// bound to this exact capability, destination node, and argument set, and lists the
+// networks it authorises. This device has no wall-clock time (no NTP sync), so unlike
+// the desktop verifier this cannot check issued_at_ms/expires_at_ms against "now"; it
+// only checks the token's internal consistency (expiry strictly after issue, and
+// within the 5-minute lifetime ceiling the coordinator itself enforces when minting
+// tokens). Absolute freshness is still covered by the outer request's boot-nonce-bound
+// replay protection, which already prevents an old signed request -- token included --
+// from being resent after this device reboots or replayed within the same boot session.
+static bool scope_delegation_valid(const cJSON *arguments, const char *capability,
+                                   const rc_provisioned_peer_t *peer, const char *device_id,
+                                   const char **error_code, const char **error_message)
+{
+    const cJSON *token = cJSON_GetObjectItemCaseSensitive(arguments, "_scope_delegation");
+    if (peer == NULL || !cJSON_IsObject(token)) {
+        *error_code = "SCOPE_REQUIRED";
+        *error_message = "signed scope delegation is required";
+        return false;
+    }
+    const cJSON *tag_json = cJSON_GetObjectItemCaseSensitive(token, "tag");
+    uint8_t supplied_tag[32];
+    if (!cJSON_IsString(tag_json) || strlen(tag_json->valuestring) != sizeof(supplied_tag) * 2 ||
+        !hex_decode(supplied_tag, sizeof(supplied_tag), tag_json->valuestring)) {
+        *error_code = "SCOPE_INVALID";
+        *error_message = "scope delegation signature is invalid";
+        return false;
+    }
+    char unsigned_text[4096];
+    canon_buf_t unsigned_buf = {unsigned_text, sizeof(unsigned_text), 0, false};
+    if (!canonical_json(token, &unsigned_buf, "tag")) {
+        *error_code = "SCOPE_INVALID";
+        *error_message = "scope delegation could not be canonicalised";
+        return false;
+    }
+    uint8_t expected_tag[32];
+    if (!compute_tag_with_key_full(peer->key, unsigned_text, expected_tag) ||
+        !constant_time_equal(expected_tag, supplied_tag, sizeof(expected_tag))) {
+        *error_code = "SCOPE_INVALID";
+        *error_message = "scope delegation signature is invalid";
+        return false;
+    }
+    if (!json_string_equals(cJSON_GetObjectItemCaseSensitive(token, "capability"), capability) ||
+        !json_string_equals(cJSON_GetObjectItemCaseSensitive(token, "destination_node"), device_id)) {
+        *error_code = "SCOPE_INVALID";
+        *error_message = "scope delegation does not match this operation";
+        return false;
+    }
+    char original_text[4096];
+    canon_buf_t original_buf = {original_text, sizeof(original_text), 0, false};
+    if (!canonical_json(arguments, &original_buf, "_scope_delegation")) {
+        *error_code = "SCOPE_INVALID";
+        *error_message = "scope delegation could not be canonicalised";
+        return false;
+    }
+    char arguments_digest_hex[65];
+    if (!sha256_hex_of_text(original_text, arguments_digest_hex) ||
+        !json_string_equals(cJSON_GetObjectItemCaseSensitive(token, "arguments_digest"),
+                            arguments_digest_hex)) {
+        *error_code = "SCOPE_INVALID";
+        *error_message = "scope delegation does not match this operation";
+        return false;
+    }
+    const cJSON *issued_json = cJSON_GetObjectItemCaseSensitive(token, "issued_at_ms");
+    const cJSON *expires_json = cJSON_GetObjectItemCaseSensitive(token, "expires_at_ms");
+    const double issued_at = cJSON_IsNumber(issued_json) ? issued_json->valuedouble : -1;
+    const double expires_at = cJSON_IsNumber(expires_json) ? expires_json->valuedouble : -1;
+    if (issued_at < 0 || expires_at <= issued_at || (expires_at - issued_at) > 300000) {
+        *error_code = "SCOPE_EXPIRED";
+        *error_message = "scope delegation has an invalid lifetime";
+        return false;
+    }
+    const cJSON *network_json = cJSON_GetObjectItemCaseSensitive(arguments, "network");
+    if (!cJSON_IsString(network_json) ||
+        !scope_network_authorised(cJSON_GetObjectItemCaseSensitive(token, "included_networks"),
+                                  cJSON_GetObjectItemCaseSensitive(token, "excluded_networks"),
+                                  network_json->valuestring)) {
+        *error_code = "SCOPE_DENIED";
+        *error_message = "target is outside delegated scope";
+        return false;
+    }
+    return true;
 }
 
 static esp_err_t message_handler(httpd_req_t *request)
@@ -1299,8 +1647,15 @@ static esp_err_t message_handler(httpd_req_t *request)
         response = system_info_response(source_id, id);
         response_status = "ok";
     } else if (json_string_equals(capability, "net.discovery.scan")) {
-        response = scan_response(source_id, id, true, arguments);
-        response_status = "ok";
+        const char *scope_error_code = NULL;
+        const char *scope_error_message = NULL;
+        if (!scope_delegation_valid(arguments, "net.discovery.scan", authenticated_peer,
+                                    s_device_id, &scope_error_code, &scope_error_message)) {
+            response = error_response(source_id, id, scope_error_code, scope_error_message);
+        } else {
+            response = scan_response(source_id, id, true, arguments);
+            response_status = "ok";
+        }
     } else if (json_string_equals(capability, "coordination.job.status")) {
         response = scan_response(source_id, id, false, arguments);
         response_status = "ok";

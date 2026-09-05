@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import ipaddress
 import json
 import mimetypes
@@ -21,13 +22,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zeroconf import ServiceInfo, Zeroconf
 
 from coordinator import Coordinator
+from engagement_policy import TARGET_CAPABILITIES, TARGET_PREFIXES, EngagementPolicy
+from fleet_manager import FleetManager
 from reconclave_node import ANNOUNCE_PATH, MESSAGE_PATH, PROTOCOL, Node, local_ip
 from workspace_store import WorkspaceStore
+from workflow_engine import WorkflowEngine
+from vulnerability_analysis import import_document
 
 WEB_ROOT = pathlib.Path(__file__).parent / "web" / "dist"
 DEFAULT_TRUST_STORE = pathlib.Path(__file__).resolve().parents[2] / ".reconclave-provisioning" / "fleet.json"
 DEFAULT_WORKSPACE_STORE = pathlib.Path(__file__).resolve().parents[2] / ".reconclave-data" / "workspace.json"
-MAX_BODY_BYTES = 16 * 1024
+MAX_BODY_BYTES = 2 * 1024 * 1024
 MAX_INSPECTION_HOSTS = 16
 MAX_INSPECTION_PORTS = 128
 
@@ -60,6 +65,15 @@ class AutomationEngine:
 
     def _trigger(self, rule: dict, condition_result: dict) -> None:
         now = int(time.time() * 1000)
+        # Recorded before dispatch, not after, so the trigger itself is on the
+        # audit trail even if the playbook call below fails partway - the UI's
+        # notification layer treats this as "rule started"; the playbook's own
+        # evidence/job audit events (below) carry how it actually finished.
+        self.workspace.add_audit_event({
+            "project_id": rule["project_id"], "action": "automation.triggered",
+            "subject_id": rule["id"], "outcome": rule["playbook"],
+            "node_id": rule["node_id"], "condition": rule["condition"],
+        })
         if rule["playbook"] == "system_snapshot":
             response = self.coordinator.invoke(rule["node_id"], "system.info", {})
             result = response.get("payload", {}).get("result", {})
@@ -91,6 +105,53 @@ class AutomationEngine:
             })
         self.workspace.set_automation(rule["id"], {"last_triggered_ms": now, "last_error": ""})
 
+    def _sync_outbox(self, node: dict, snapshot: dict) -> None:
+        response = self.coordinator.invoke(node["device_id"], "evidence.outbox.read", {})
+        records = response.get("payload", {}).get("result", {}).get("records", [])
+        # Coordinator.invoke() already verified this response's tag against the node's
+        # provisioned execution key before returning it (Coordinator._dispatch raises
+        # otherwise) - carry that proof of origin into the ledger instead of only
+        # recording an unauthenticated "source_node" string, per platform-roadmap.md
+        # Phase 5. The signature covers the whole outbox batch (P4 has no separate
+        # per-record evidence key independent of the pulling coordinator's own
+        # execution key), so every record ingested from one read shares the same
+        # response_nonce/response_tag - that's a batch-level provenance proof, not a
+        # per-record one, and is reported as such rather than implied otherwise.
+        auth = response.get("payload", {}).get("auth", {})
+        provenance = ({"source_node": node["device_id"], "verified": True,
+                       "response_nonce": str(auth.get("nonce", "")),
+                       "response_tag": str(auth.get("tag", "")),
+                       "algorithm": "hmac-sha256-truncated16"}
+                      if auth.get("tag") else {})
+        errors = []
+        for record in records:
+            project_id = str(record.get("project_id", ""))
+            if not any(item.get("id") == project_id for item in snapshot["projects"]):
+                errors.append(f"outbox record references unknown project {project_id!r}")
+                continue
+            boot_id = str(record.get("boot_id", "legacy"))
+            evidence_id = f"outbox-{node['device_id']}-{boot_id}-{int(record['sequence'])}"
+            self.workspace.add_evidence({
+                "id": evidence_id, "project_id": project_id,
+                "job_id": f"rule-{record.get('rule_id', '')}",
+                "kind": record.get("kind", "node-evidence"),
+                "title": f"Autonomous P4 result · {node['device_id']}",
+                "summary": f"Rule {record.get('rule_id')} run {record.get('run_count', 1)}",
+                "data": {**record, "source_node": node["device_id"]},
+                "provenance": provenance,
+            })
+            # Delete from the device only after the durable local write returns.
+            self.coordinator.invoke(node["device_id"], "evidence.outbox.ack",
+                                    {"sequence": record["sequence"]})
+        if errors:
+            raise ValueError("; ".join(errors))
+
+    def _clear_sync_errors(self, node_id: str) -> None:
+        for rule in self.workspace.snapshot().get("automations", []):
+            if (rule.get("node_id") == node_id and rule.get("device_managed") and
+                    str(rule.get("last_error", "")).startswith("Evidence sync failed:")):
+                self.workspace.set_automation(rule["id"], {"last_error": ""})
+
     def _run(self) -> None:
         while not self.stop_event.wait(10):
             snapshot = self.workspace.snapshot()
@@ -99,26 +160,16 @@ class AutomationEngine:
                 if "evidence.outbox.read" not in node.get("capabilities", []):
                     continue
                 try:
-                    response = self.coordinator.invoke(node["device_id"], "evidence.outbox.read", {})
-                    records = response.get("payload", {}).get("result", {}).get("records", [])
-                    for record in records:
-                        project_id = str(record.get("project_id", ""))
-                        if not any(item.get("id") == project_id for item in snapshot["projects"]):
-                            continue
-                        boot_id = str(record.get("boot_id", "legacy"))
-                        evidence_id = f"outbox-{node['device_id']}-{boot_id}-{int(record['sequence'])}"
-                        self.workspace.add_evidence({
-                            "id": evidence_id, "project_id": project_id,
-                            "job_id": f"rule-{record.get('rule_id', '')}",
-                            "kind": record.get("kind", "node-evidence"),
-                            "title": f"Autonomous P4 result · {node['device_id']}",
-                            "summary": f"Rule {record.get('rule_id')} run {record.get('run_count', 1)}",
-                            "data": {**record, "source_node": node["device_id"]},
-                        })
-                        self.coordinator.invoke(node["device_id"], "evidence.outbox.ack",
-                                                {"sequence": record["sequence"]})
-                except Exception:
-                    pass
+                    self._sync_outbox(node, snapshot)
+                    self._clear_sync_errors(node["device_id"])
+                except Exception as error:
+                    message = f"Evidence sync failed: {error}"[:300]
+                    print(f"[{node['device_id']}] {message}")
+                    for rule in snapshot.get("automations", []):
+                        if (rule.get("node_id") == node["device_id"] and
+                                rule.get("device_managed") and
+                                rule.get("last_error") != message):
+                            self.workspace.set_automation(rule["id"], {"last_error": message})
             active_ids = set()
             for rule in snapshot.get("automations", []):
                 node = nodes.get(rule["node_id"])
@@ -130,8 +181,11 @@ class AutomationEngine:
                         if response.get("payload", {}).get("status") == "ok":
                             self.workspace.set_automation(rule["id"], {
                                 "device_managed": True, "last_error": ""})
-                    except Exception:
-                        pass
+                    except Exception as error:
+                        message = f"Rule provisioning failed: {error}"[:300]
+                        print(f"[{rule['node_id']}] {message}")
+                        if rule.get("last_error") != message:
+                            self.workspace.set_automation(rule["id"], {"last_error": message})
                     continue
                 if not rule.get("enabled") or rule.get("device_managed"):
                     continue
@@ -191,6 +245,17 @@ def inspect_hosts(local_address: str, body: dict) -> dict:
             "ports": sorted(ports), "checked": len(pairs)}
 
 
+def is_target_bearing(capability: str) -> bool:
+    """True for a capability that requires a signed, delegated engagement scope.
+
+    Mirrors EngagementPolicy.authorize's own test (engagement_policy.py) so a
+    workflow definition can be checked for target-bearing steps before a run is
+    ever queued, rather than only discovering the missing scope deep inside a
+    failed dispatch attempt.
+    """
+    return capability in TARGET_CAPABILITIES or capability.startswith(TARGET_PREFIXES)
+
+
 def validate_scan_arguments(arguments: dict) -> None:
     """Reject broad or internally inconsistent assessment scopes before dispatch."""
     network = ipaddress.ip_network(str(arguments.get("network", "")), strict=True)
@@ -225,6 +290,19 @@ class AppHandler(BaseHTTPRequestHandler):
     def local_client(self) -> bool:
         return self.client_address[0] in ("127.0.0.1", "::1")
 
+    def trusted_api_origin(self) -> bool:
+        """Reject browser-driven cross-origin mutations of the loopback API."""
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return True  # Preserve non-browser CLI/API clients on loopback.
+        try:
+            parsed = urllib.parse.urlsplit(origin)
+            host = parsed.hostname
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        except ValueError:
+            return False
+        return parsed.scheme == "http" and host in ("127.0.0.1", "localhost", "::1") and port == self.server.server_port
+
     def send_bytes(self, status: int, body: bytes, content_type: str) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
@@ -239,7 +317,8 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_bytes(status, json.dumps(body, separators=(",", ":")).encode(), "application/json")
 
     def do_GET(self) -> None:
-        path = urllib.parse.urlsplit(self.path).path
+        parsed_path = urllib.parse.urlsplit(self.path)
+        path = parsed_path.path
         if path == ANNOUNCE_PATH:
             self.send_json(200, self.server.node.announcement())
         elif path == "/api/state":
@@ -250,6 +329,42 @@ class AppHandler(BaseHTTPRequestHandler):
         elif path == "/api/workspace":
             if self.local_client():
                 self.send_json(200, self.server.workspace.snapshot())
+            else:
+                self.send_json(403, {"error": "local_access_only"})
+        elif path == "/api/evidence/verify":
+            if self.local_client():
+                project_id = urllib.parse.parse_qs(parsed_path.query).get("project_id", [""])[0]
+                self.send_json(200, self.server.workspace.verify_evidence(project_id))
+            else:
+                self.send_json(403, {"error": "local_access_only"})
+        elif path == "/api/evidence/export":
+            if self.local_client():
+                project_id = urllib.parse.parse_qs(parsed_path.query).get("project_id", [""])[0]
+                self.send_json(200, self.server.workspace.evidence_bundle(project_id))
+            else:
+                self.send_json(403, {"error": "local_access_only"})
+        elif path == "/api/audit":
+            if self.local_client():
+                query = urllib.parse.parse_qs(parsed_path.query)
+                project_id = query.get("project_id", [""])[0]
+                cursor = query.get("cursor", [""])[0]
+                try:
+                    limit = int(query.get("limit", [""])[0] or 100)
+                except ValueError:
+                    limit = 100
+                self.send_json(200, self.server.workspace.list_audit_events(project_id, cursor, limit))
+            else:
+                self.send_json(403, {"error": "local_access_only"})
+        elif path == "/api/audit/export":
+            if self.local_client():
+                project_id = urllib.parse.parse_qs(parsed_path.query).get("project_id", [""])[0]
+                self.send_json(200, self.server.workspace.audit_bundle(project_id))
+            else:
+                self.send_json(403, {"error": "local_access_only"})
+        elif path == "/api/findings/export":
+            if self.local_client():
+                project_id = urllib.parse.parse_qs(parsed_path.query).get("project_id", [""])[0]
+                self.send_json(200, self.server.workspace.findings_bundle(project_id))
             else:
                 self.send_json(403, {"error": "local_access_only"})
         elif path == "/api/events":
@@ -267,6 +382,10 @@ class AppHandler(BaseHTTPRequestHandler):
         if path.startswith("/api/") and not self.local_client():
             self.send_json(403, {"error": "local_access_only"})
             return
+        if path.startswith("/api/") and (not self.trusted_api_origin() or
+                self.headers.get_content_type() != "application/json"):
+            self.send_json(403, {"error": "untrusted_browser_request"})
+            return
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if length <= 0 or length > MAX_BODY_BYTES:
@@ -281,10 +400,71 @@ class AppHandler(BaseHTTPRequestHandler):
             if path == "/api/projects":
                 self.send_json(201, self.server.workspace.create_project(body))
                 return
+            if path == "/api/workflows":
+                self.send_json(201, self.server.workspace.create_workflow(body))
+                return
+            if path == "/api/scopes":
+                if body.get("operator_authorised") is not True:
+                    raise PermissionError("explicit engagement scope approval is required")
+                self.send_json(201, self.server.policy.create_scope(body))
+                return
+            if path == "/api/findings/import":
+                if body.get("operator_authorised") is not True:
+                    raise PermissionError("explicit vulnerability import approval is required")
+                project_id = str(body.get("project_id", ""))
+                content = body.get("content", "")
+                if not isinstance(content, str) or not content or len(content.encode()) > MAX_BODY_BYTES - 4096:
+                    raise ValueError("vulnerability document is empty or too large")
+                findings = import_document(project_id, str(body.get("format", "")), content,
+                                           str(body.get("plugin_id", "offline")))
+                saved = self.server.workspace.upsert_findings(project_id, findings)
+                self.server.workspace.add_audit_event({"project_id": project_id,
+                    "action": "findings.imported", "subject_id": str(body.get("format", "")),
+                    "outcome": "accepted", "count": len(saved)})
+                self.send_json(201, {"findings": saved, "count": len(saved)})
+                return
+            if path == "/api/findings/correlate":
+                # Explicit "correlate now" trigger rather than an automatic
+                # per-job hook - see WorkspaceStore.correlate_findings's
+                # docstring for why. No operator_authorised gate: this only
+                # derives new candidate/confirmed-observed state from evidence
+                # and findings the operator already approved importing, the
+                # same trust level as /api/evidence/verify.
+                project_id = str(body.get("project_id", ""))
+                evidence_ids = body.get("evidence_ids")
+                if evidence_ids is not None and not isinstance(evidence_ids, list):
+                    raise ValueError("evidence_ids must be a list when provided")
+                self.send_json(200, self.server.workspace.correlate_findings(
+                    project_id, [str(item) for item in evidence_ids] if evidence_ids is not None else None))
+                return
+            if path == "/api/audit/prune":
+                if body.get("operator_authorised") is not True:
+                    raise PermissionError("explicit audit retention approval is required")
+                max_age_ms = body.get("max_age_ms")
+                max_count = body.get("max_count")
+                self.send_json(200, self.server.workspace.prune_audit_events(
+                    int(max_age_ms) if max_age_ms is not None else None,
+                    int(max_count) if max_count is not None else None))
+                return
+            if path == "/api/fleet/config":
+                self.send_json(200, self.server.fleet.set_config(body))
+                return
+            if path == "/api/fleet/releases":
+                if body.get("operator_authorised") is not True:
+                    raise PermissionError("explicit release signing approval is required")
+                self.send_json(201, self.server.fleet.create_release(body))
+                return
+            if path == "/api/fleet/rollouts":
+                if body.get("operator_authorised") is not True:
+                    raise PermissionError("explicit OTA rollout approval is required")
+                self.send_json(201, self.server.fleet.create_rollout(body))
+                return
             if path == "/api/automations":
                 if body.get("operator_authorised") is not True:
                     raise PermissionError("explicit automation authorization acknowledgement is required")
                 rule = self.server.workspace.create_automation({**body, "device_managed": True})
+                if rule["playbook"] == "network_scout":
+                    self.server.policy.get_valid(rule.get("scope_id", ""), rule["project_id"])
                 try:
                     response = self.server.coordinator.invoke(rule["node_id"], "automation.rule.put",
                                                               {"rule": rule})
@@ -304,6 +484,9 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.send_json(201, self.server.workspace.add_evidence(body))
                 return
             if path == "/api/inspect":
+                self.server.policy.authorize(str(body.get("scope_id", "")),
+                                             str(body.get("project_id", "")),
+                                             "net.tcp.inspect", {"hosts": body.get("hosts", [])})
                 result = inspect_hosts(self.server.node.address, body)
                 project_id = str(body.get("project_id", ""))
                 job_id = f"inspect-{uuid.uuid4().hex[:12]}"
@@ -328,6 +511,47 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.send_json(200, result)
                 return
             parts = path.strip("/").split("/")
+            if len(parts) == 4 and parts[:2] == ["api", "workflows"] and parts[3] == "runs":
+                workflow_id = urllib.parse.unquote(parts[2])
+                workflow = next((item for item in self.server.workspace.snapshot()["workflows"]
+                                 if item.get("id") == workflow_id), None)
+                if workflow is None:
+                    raise KeyError(workflow_id)
+                scope_id = str(body.get("scope_id", ""))
+                target_bearing = any(is_target_bearing(step["capability"]) for step in workflow["steps"])
+                if scope_id:
+                    self.server.policy.get_valid(scope_id, workflow["project_id"])
+                elif target_bearing:
+                    raise PermissionError(
+                        "a signed engagement scope is required to run a workflow with "
+                        "target-bearing steps")
+                self.send_json(201, self.server.workspace.create_workflow_run(workflow_id, scope_id))
+                return
+            if len(parts) == 4 and parts[:2] == ["api", "workflow-runs"] and parts[3] == "cancel":
+                self.send_json(200, self.server.workflows.cancel(urllib.parse.unquote(parts[2])))
+                return
+            if len(parts) == 4 and parts[:2] == ["api", "fleet"] and parts[3] == "advance":
+                self.send_json(200, self.server.fleet.advance_rollout(urllib.parse.unquote(parts[2])))
+                return
+            if len(parts) == 4 and parts[:2] == ["api", "fleet"] and parts[3] == "rollback":
+                if body.get("operator_authorised") is not True:
+                    raise PermissionError("explicit rollback approval is required")
+                self.send_json(200, self.server.fleet.rollback_rollout(urllib.parse.unquote(parts[2])))
+                return
+            if len(parts) == 4 and parts[:2] == ["api", "findings"] and parts[3] == "status":
+                finding_id = urllib.parse.unquote(parts[2])
+                self.send_json(200, self.server.workspace.set_finding_status(
+                    finding_id, str(body.get("status", "")), str(body.get("note", ""))))
+                return
+            if len(parts) == 4 and parts[:2] == ["api", "findings"] and parts[3] == "suppress":
+                finding_id = urllib.parse.unquote(parts[2])
+                self.send_json(200, self.server.workspace.set_finding_suppression(
+                    finding_id, body.get("suppressed") is True, str(body.get("reason", ""))))
+                return
+            if len(parts) == 4 and parts[:2] == ["api", "findings"] and parts[3] == "remediation":
+                finding_id = urllib.parse.unquote(parts[2])
+                self.send_json(200, self.server.workspace.set_finding_remediation(finding_id, body))
+                return
             if len(parts) == 3 and parts[:2] == ["api", "automations"]:
                 rule = self.server.workspace.set_automation(urllib.parse.unquote(parts[2]), body)
                 if rule.get("device_managed"):
@@ -336,6 +560,10 @@ class AppHandler(BaseHTTPRequestHandler):
                     if response.get("payload", {}).get("status") != "ok":
                         raise ConnectionError("node refused durable rule update")
                 self.send_json(200, rule)
+                return
+            if len(parts) == 3 and parts[:2] == ["api", "workflows"]:
+                self.send_json(200, self.server.workspace.update_workflow(
+                    urllib.parse.unquote(parts[2]), body))
                 return
             if len(parts) == 4 and parts[:2] == ["api", "nodes"] and parts[3] == "invoke":
                 capability = str(body.get("capability", ""))
@@ -346,8 +574,14 @@ class AppHandler(BaseHTTPRequestHandler):
                     if body.get("operator_authorised") is not True:
                         raise PermissionError("explicit scope authorization acknowledgement is required")
                     validate_scan_arguments(arguments)
+                    arguments = self.server.policy.delegate(str(body.get("scope_id", "")),
+                                                            str(body.get("project_id", "")), capability,
+                                                            arguments, urllib.parse.unquote(parts[2]))
                 response = self.server.coordinator.invoke(
                     urllib.parse.unquote(parts[2]), capability, arguments)
+                result = response.get("payload", {}).get("result", {})
+                if result.get("job_status") not in ("running", "waiting"):
+                    self.server.policy.release(arguments)
                 self.send_json(200, response)
                 return
             self.send_json(404, {"error": "not_found"})
@@ -365,6 +599,9 @@ class AppHandler(BaseHTTPRequestHandler):
         if not self.local_client():
             self.send_json(403, {"error": "local_access_only"})
             return
+        if not self.trusted_api_origin():
+            self.send_json(403, {"error": "untrusted_browser_request"})
+            return
         parts = path.strip("/").split("/")
         try:
             if len(parts) == 3 and parts[:2] == ["api", "automations"]:
@@ -379,10 +616,14 @@ class AppHandler(BaseHTTPRequestHandler):
                     if response.get("payload", {}).get("status") != "ok":
                         raise ConnectionError("node refused durable rule deletion")
                 self.send_json(200, self.server.workspace.delete_automation(rule_id))
+            elif len(parts) == 3 and parts[:2] == ["api", "workflows"]:
+                self.send_json(200, self.server.workspace.delete_workflow(urllib.parse.unquote(parts[2])))
             else:
                 self.send_json(404, {"error": "not_found"})
         except KeyError as error:
             self.send_json(404, {"error": "not_found", "message": str(error)})
+        except ValueError as error:
+            self.send_json(400, {"error": "invalid_request", "message": str(error)})
         except ConnectionError as error:
             self.send_json(502, {"error": "node_request_failed", "message": str(error)})
 
@@ -426,10 +667,14 @@ class AppServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, address: tuple[str, int], node: Node, coordinator: Coordinator,
-                 workspace: WorkspaceStore) -> None:
+                 workspace: WorkspaceStore, workflows: WorkflowEngine, policy: EngagementPolicy,
+                 fleet: FleetManager) -> None:
         self.node = node
         self.coordinator = coordinator
         self.workspace = workspace
+        self.workflows = workflows
+        self.policy = policy
+        self.fleet = fleet
         super().__init__(address, AppHandler)
 
 
@@ -441,6 +686,7 @@ def main() -> None:
     parser.add_argument("--node-id", default=f"rc-desktop-{uuid.getnode():012x}")
     parser.add_argument("--mode", choices=("node", "coordinator", "both"), default="both")
     parser.add_argument("--enable-network-scan", action="store_true")
+    parser.add_argument("--enable-tools", action="store_true")
     parser.add_argument("--evidence-dir", default=None)
     parser.add_argument("--execution-key", default=os.environ.get("RECONCLAVE_EXECUTION_KEY"))
     parser.add_argument("--evidence-key", default=os.environ.get("RECONCLAVE_EVIDENCE_KEY"))
@@ -458,7 +704,7 @@ def main() -> None:
     node = Node(args.node_id, args.name, args.address, args.port,
                 node_enabled and args.enable_network_scan,
                 args.evidence_dir if node_enabled else None,
-                args.evidence_key, args.execution_key)
+                args.evidence_key, args.execution_key, node_enabled and args.enable_tools)
     node.roles = ["node"] + (["coordinator"] if args.mode in ("coordinator", "both") else [])
     zeroconf = Zeroconf()
     try:
@@ -473,9 +719,19 @@ def main() -> None:
         workspace = WorkspaceStore(args.workspace_store)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         parser.error(f"could not load workspace store: {error}")
-    server = AppServer(("0.0.0.0", args.port), node, coordinator, workspace)
+    # Correlate node transport dispatch attempts into the same trace as the
+    # job/workflow-run audit events already recorded by the workspace store.
+    coordinator.audit_sink = workspace.add_audit_event
+    delegation_key = hashlib.sha256(args.execution_key.encode()).digest() if args.execution_key else None
+    policy = EngagementPolicy(workspace, args.workspace_store.with_suffix(".scope-key"), delegation_key)
+    workflows = WorkflowEngine(coordinator, workspace, policy)
+    fleet = FleetManager(coordinator, workspace, workspace.custody_key)
+    fleet.reconcile_once()
+    server = AppServer(("0.0.0.0", args.port), node, coordinator, workspace, workflows, policy, fleet)
     automations = AutomationEngine(coordinator, workspace)
     automations.start()
+    workflows.start()
+    fleet.start()
     service = ServiceInfo(
         "_reconclave._tcp.local.", f"{args.node_id}._reconclave._tcp.local.",
         addresses=[socket.inet_aton(args.address)], port=args.port,
@@ -495,6 +751,8 @@ def main() -> None:
         server.serve_forever(poll_interval=0.25)
     finally:
         automations.close()
+        workflows.close()
+        fleet.close()
         coordinator.close()
         zeroconf.unregister_service(service)
         zeroconf.close()
