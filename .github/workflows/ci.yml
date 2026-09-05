@@ -16,8 +16,15 @@ jobs:
         run: python3 -m json.tool protocol/schemas/envelope.schema.json >/dev/null && for f in protocol/schemas/*.json protocol/test-vectors/*.json; do python3 -m json.tool "$f" >/dev/null; done
       - name: Validate complete protocol vectors
         run: python3 tools/protocol-debugger/validate_vectors.py protocol/test-vectors/*.json
+      - name: Install desktop node test dependencies
+        run: pip install -r tools/desktop-node/requirements.txt
       - name: Test desktop node protocol handling
-        run: python3 -m unittest tools/desktop-node/test_reconclave_node.py tools/desktop-node/test_coordinator.py
+        # Must run with tools/desktop-node as the working directory: its modules import
+        # each other by bare name (e.g. reconclave_node.py does `from tool_runner import
+        # ToolRunner`), which only resolves when that directory is on sys.path. Running
+        # the discovered suite here also covers every test_*.py module, not just the
+        # two this step used to name explicitly (that list predates most of them).
+        run: cd tools/desktop-node && python3 -m unittest discover -p "test_*.py"
 
   desktop-web:
     runs-on: ubuntu-latest
@@ -38,5 +45,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Generate a throwaway trust header for CI compilation only
+        # generated_trust.h is per-deployment secret material (tools/provision_fleet.py),
+        # deliberately gitignored and never committed -- this build only needs the
+        # #include to resolve, not real keys, so a fresh set of CI-only device ids is
+        # generated and discarded every run.
+        run: python3 tools/provision_fleet.py --desktop-id ci-desktop --p4-id ci-p4 --cardputer-id ci-cardputer
       - run: pip install platformio
       - run: pio run --project-dir devices/cardputer-adv
