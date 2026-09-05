@@ -1,9 +1,24 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { Activity, AppState, CapabilityDescriptor, FindingStatus, Project, ReconNode, ScanJob, WorkspaceData } from './types'
+import type { Activity, AppState, CapabilityDescriptor, FindingStatus, Project, ReconNode, ScanJob, SessionInfo, WorkspaceData } from './types'
 import WorkspaceViews from './WorkspaceViews'
+import LoginScreen from './LoginScreen'
 
 const emptyState: AppState = { revision: 0, nodes: [], coordinator_id: '', updated_at_ms: 0 }
-const emptyWorkspace: WorkspaceData = { revision: 0, projects: [], jobs: [], evidence: [], automations: [], workflows: [], workflow_runs: [], scopes: [], audit_events: [], findings: [], fleet_nodes: [], fleet_configs: [], ota_releases: [], ota_rollouts: [], distributed_scans: [] }
+const emptyWorkspace: WorkspaceData = { revision: 0, projects: [], jobs: [], evidence: [], automations: [], workflows: [], workflow_runs: [], scopes: [], audit_events: [], findings: [], fleet_nodes: [], fleet_configs: [], ota_releases: [], ota_rollouts: [], distributed_scans: [], operators: [], approvals: [] }
+
+// A Bearer token in localStorage, not a cookie -- a cookie is attached to every request
+// automatically regardless of origin, which is exactly the ambient-credential problem
+// trusted_api_origin (desktop_app.py) already exists to guard against for this loopback
+// API. A token only travels if this code attaches it, so adding sessions doesn't widen
+// cross-origin/CSRF exposure at all.
+const TOKEN_STORAGE_KEY = 'reconclave.session_token'
+function getToken(): string { try { return localStorage.getItem(TOKEN_STORAGE_KEY) ?? '' } catch { return '' } }
+function setToken(token: string) { try { localStorage.setItem(TOKEN_STORAGE_KEY, token) } catch { /* private-browsing etc -- session just won't survive a reload */ } }
+function clearToken() { try { localStorage.removeItem(TOKEN_STORAGE_KEY) } catch { /* see above */ } }
+function authHeaders(): Record<string, string> {
+  const token = getToken()
+  return token ? { Authorization: `Bearer ${token}` } : {}
+}
 
 const ACTIVITY_LIMIT = 20
 
@@ -66,7 +81,7 @@ function defaultScope(address: string) {
 }
 
 function App() {
-  const [view, setView] = useState<'network' | 'map' | 'jobs' | 'projects' | 'evidence' | 'automations' | 'workflows' | 'scopes' | 'findings' | 'timeline' | 'fleet' | 'distributed'>('network')
+  const [view, setView] = useState<'network' | 'map' | 'jobs' | 'projects' | 'evidence' | 'automations' | 'workflows' | 'scopes' | 'findings' | 'timeline' | 'fleet' | 'distributed' | 'operators'>('network')
   const [state, setState] = useState<AppState>(emptyState)
   const [workspace, setWorkspace] = useState<WorkspaceData>(emptyWorkspace)
   const [projectId, setProjectId] = useState(() => localStorage.getItem('reconclave.project') ?? '')
@@ -87,16 +102,32 @@ function App() {
   const [scoutError, setScoutError] = useState('')
   const [recurringMinutes, setRecurringMinutes] = useState(0)
   const [scanJob, setScanJob] = useState<ScanJob | null>(savedJob)
+  const [session, setSession] = useState<SessionInfo | null>(null)
+  // null while /api/session hasn't answered yet; once it has, data-loading only starts
+  // once we know either no login is required at all (legacy single-operator mode) or
+  // login has actually happened -- see the session-fetch effect and the gated
+  // data-loading effect right after it.
+  const readyToLoadData = session !== null && (!session.auth_required || session.operator !== null)
   const statusFailures = useRef(0)
 
   useEffect(() => {
-    fetch('/api/state').then((response) => response.json()).then(setState).catch(() => setConnected(false))
+    fetch('/api/session', { headers: authHeaders() }).then((response) => response.json()).then(setSession)
+      .catch(() => setSession({ auth_required: false, operator: null }))
+  }, [])
+
+  useEffect(() => {
+    if (!readyToLoadData) return
+    fetch('/api/state', { headers: authHeaders() }).then((response) => response.json()).then(setState).catch(() => setConnected(false))
     refreshWorkspace()
     // Workspace mutations also happen in the background when autonomous nodes
     // upload their durable outboxes. Node-state SSE revisions do not cover
     // those writes, so keep the project/evidence view live independently.
     const workspaceTimer = window.setInterval(refreshWorkspace, 2000)
-    const events = new EventSource('/api/events')
+    // EventSource can't send custom headers, so the Bearer token travels as a query
+    // param here specifically -- the one exception to "auth always travels in a
+    // header", accepted only because this is a loopback-only, single-workstation tool.
+    const streamToken = getToken()
+    const events = new EventSource(streamToken ? `/api/events?token=${encodeURIComponent(streamToken)}` : '/api/events')
     events.addEventListener('state', (event) => {
       setState(JSON.parse((event as MessageEvent).data))
       setConnected(true)
@@ -104,7 +135,7 @@ function App() {
     events.onopen = () => setConnected(true)
     events.onerror = () => setConnected(false)
     return () => { events.close(); window.clearInterval(workspaceTimer) }
-  }, [])
+  }, [readyToLoadData])
 
   useEffect(() => { localStorage.setItem('reconclave.project', projectId) }, [projectId])
 
@@ -182,16 +213,45 @@ function App() {
   }, [notifOpen])
 
   async function refreshWorkspace() {
-    const response = await fetch('/api/workspace')
+    const response = await fetch('/api/workspace', { headers: authHeaders() })
     if (response.ok) setWorkspace(await response.json())
+    else if (response.status === 401) signOut()
   }
 
   async function postWorkspace(path: string, body: Record<string, unknown>) {
-    const response = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    const response = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() }, body: JSON.stringify(body) })
     if (!response.ok) { const error = await response.json(); throw new Error(error.message ?? error.error ?? 'Workspace update failed') }
     const result = await response.json()
     await refreshWorkspace()
     return result
+  }
+
+  function signOut() {
+    clearToken()
+    setSession((current) => current ? { ...current, operator: null } : { auth_required: true, operator: null })
+  }
+
+  async function login(username: string, password: string) {
+    const response = await fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }) })
+    const result = await response.json()
+    if (!response.ok) throw new Error(result.message ?? result.error ?? 'Login failed')
+    setToken(result.token)
+    setSession({ auth_required: true, operator: result.operator })
+  }
+
+  async function logout() {
+    try { await fetch('/api/logout', { method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() }, body: '{}' }) }
+    finally { signOut() }
+  }
+
+  async function createOperator(body: Record<string, unknown>) {
+    await postWorkspace('/api/operators', body)
+    addActivity({ title: 'Operator created', detail: String(body.username ?? ''), tone: 'info' })
+  }
+
+  async function decideApproval(id: string, decision: 'approved' | 'rejected') {
+    await postWorkspace(`/api/approvals/${encodeURIComponent(id)}/decide`, { decision })
+    addActivity({ title: decision === 'approved' ? 'Approval granted' : 'Approval rejected', detail: id, tone: decision === 'approved' ? 'ok' : 'warn' })
   }
 
   async function createProject(name: string, description: string) {
@@ -201,7 +261,7 @@ function App() {
 
   async function inspectSelectedHosts(hosts: string[], ports: number[]) {
     const scopeId = workspace.scopes.filter((item) => item.project_id === projectId && item.expires_at_ms > Date.now()).sort((a, b) => b.revision - a.revision)[0]?.id
-    const response = await fetch('/api/inspect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hosts, ports, project_id: projectId, scope_id: scopeId, operator_authorised: true }) })
+    const response = await fetch('/api/inspect', { method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() }, body: JSON.stringify({ hosts, ports, project_id: projectId, scope_id: scopeId, operator_authorised: true }) })
     const result = await response.json()
     if (!response.ok) throw new Error(result.message ?? result.error ?? 'Host inspection failed')
     await refreshWorkspace()
@@ -221,7 +281,7 @@ function App() {
   }
 
   async function deleteAutomation(id: string) {
-    const response = await fetch(`/api/automations/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    const response = await fetch(`/api/automations/${encodeURIComponent(id)}`, { method: 'DELETE', headers: authHeaders() })
     if (!response.ok) throw new Error('Could not delete automation')
     await refreshWorkspace()
   }
@@ -247,14 +307,34 @@ function App() {
   }
 
   async function deleteWorkflow(id: string) {
-    const response = await fetch(`/api/workflows/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    const response = await fetch(`/api/workflows/${encodeURIComponent(id)}`, { method: 'DELETE', headers: authHeaders() })
     if (!response.ok) throw new Error('Could not delete workflow (an active run may still be in progress)')
     await refreshWorkspace()
   }
 
+  // Once operators exist, a non-admin operator's request for one of the two
+  // approval-registry actions (scope.create, fleet.release.create) is transparently
+  // rerouted to POST /api/approvals instead of executing directly -- the same form,
+  // the same button, but the desktop_app.py route itself would reject a direct
+  // non-admin call outright once any operator exists (see require_admin_when_multi_
+  // operator), so this is what actually lets a non-admin operator use these forms at
+  // all rather than just hitting a 403.
+  async function submitOrRequestApproval(actionType: string, path: string, payload: Record<string, unknown>): Promise<boolean> {
+    const role = session?.operator?.role
+    if (session?.auth_required && role && role !== 'admin') {
+      await postWorkspace('/api/approvals', { action_type: actionType, payload })
+      return true
+    }
+    await postWorkspace(path, payload)
+    return false
+  }
+
   async function createScope(body: Record<string, unknown>) {
-    await postWorkspace('/api/scopes', { ...body, project_id: projectId, operator_authorised: true })
-    addActivity({ title: 'Scope approved', detail: String(body.included_networks), tone: 'ok' })
+    const requested = await submitOrRequestApproval('scope.create', '/api/scopes',
+      { ...body, project_id: projectId, operator_authorised: true })
+    addActivity(requested
+      ? { title: 'Scope approval requested', detail: String(body.included_networks), tone: 'info' }
+      : { title: 'Scope approved', detail: String(body.included_networks), tone: 'ok' })
   }
 
   async function importFindings(body: Record<string, unknown>) {
@@ -280,8 +360,11 @@ function App() {
   }
 
   async function createRelease(body: Record<string, unknown>) {
-    await postWorkspace('/api/fleet/releases', { ...body, operator_authorised: true })
-    addActivity({ title: 'OTA release signed', detail: `${body.device_type} ${body.version}`, tone: 'info' })
+    const requested = await submitOrRequestApproval('fleet.release.create', '/api/fleet/releases',
+      { ...body, operator_authorised: true })
+    addActivity(requested
+      ? { title: 'OTA release approval requested', detail: `${body.device_type} ${body.version}`, tone: 'info' }
+      : { title: 'OTA release signed', detail: `${body.device_type} ${body.version}`, tone: 'info' })
   }
 
   async function createRollout(body: Record<string, unknown>) {
@@ -335,7 +418,7 @@ function App() {
     setBusyCapability(capability)
     try {
       const response = await fetch(`/api/nodes/${encodeURIComponent(node.device_id)}/invoke`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ capability, arguments: arguments_, operator_authorised: operatorAuthorised,
           project_id: projectId, scope_id: workspace.scopes.filter((item) => item.project_id === projectId && item.expires_at_ms > Date.now()).sort((a, b) => b.revision - a.revision)[0]?.id }),
       })
@@ -442,6 +525,8 @@ function App() {
     }
   }
 
+  if (session && session.auth_required && !session.operator) return <LoginScreen onLogin={login} />
+
   return (
     <div className="app-shell">
       <div className="ambient ambient-one" /><div className="ambient ambient-two" />
@@ -464,7 +549,9 @@ function App() {
             </div>
           </div>}
         </div>
-        <button className="operator"><span>LOCAL</span><strong>{state.coordinator_id || 'INITIALISING'}</strong></button>
+        {session?.operator
+          ? <div className="operator-chip"><strong>{session.operator.display_name}</strong><span className={`role-badge ${session.operator.role}`}>{session.operator.role}</span><button onClick={logout}>SIGN OUT</button></div>
+          : <button className="operator"><span>LOCAL</span><strong>{state.coordinator_id || 'INITIALISING'}</strong></button>}
       </header>
 
       <aside className="rail">
@@ -481,6 +568,7 @@ function App() {
           <button className={view === 'timeline' ? 'active' : ''} title="Timeline" onClick={() => setView('timeline')}><span>≋</span><small>Audit</small></button>
           <button className={view === 'fleet' ? 'active' : ''} title="Fleet" onClick={() => setView('fleet')}><span>▤</span><small>Fleet</small></button>
           <button className={view === 'distributed' ? 'active' : ''} title="Distributed scanning" onClick={() => setView('distributed')}><span>⬡</span><small>Distrib</small></button>
+          <button className={view === 'operators' ? 'active' : ''} title="Operators and approvals" onClick={() => setView('operators')}><span>☺</span><small>Access</small></button>
         </nav>
         <div className="rail-foot"><div className="pulse-ring" /><small>RC/01</small></div>
       </aside>
@@ -558,7 +646,7 @@ function App() {
             </div>
           </div>
         </section>
-      </> : <WorkspaceViews view={view} workspace={workspace} nodes={state.nodes} projectId={projectId} onProject={setProjectId} onCreate={createProject} onInspect={inspectSelectedHosts} onCreateAutomation={createAutomation} onUpdateAutomation={updateAutomation} onDeleteAutomation={deleteAutomation} onCreateWorkflow={createWorkflow} onRunWorkflow={runWorkflow} onCancelWorkflow={cancelWorkflow} onUpdateWorkflow={updateWorkflow} onDeleteWorkflow={deleteWorkflow} onCreateScope={createScope} onImportFindings={importFindings} onCorrelateFindings={correlateFindings} onSetFindingStatus={setFindingStatus} onSetFindingSuppression={setFindingSuppression} onCreateRelease={createRelease} onCreateRollout={createRollout} onAdvanceRollout={advanceRollout} onRollbackRollout={rollbackRollout} onCreateDistributedScan={createDistributedScan} onCancelDistributedScan={cancelDistributedScan} />}</main>
+      </> : <WorkspaceViews view={view} workspace={workspace} nodes={state.nodes} projectId={projectId} onProject={setProjectId} onCreate={createProject} onInspect={inspectSelectedHosts} onCreateAutomation={createAutomation} onUpdateAutomation={updateAutomation} onDeleteAutomation={deleteAutomation} onCreateWorkflow={createWorkflow} onRunWorkflow={runWorkflow} onCancelWorkflow={cancelWorkflow} onUpdateWorkflow={updateWorkflow} onDeleteWorkflow={deleteWorkflow} onCreateScope={createScope} onImportFindings={importFindings} onCorrelateFindings={correlateFindings} onSetFindingStatus={setFindingStatus} onSetFindingSuppression={setFindingSuppression} onCreateRelease={createRelease} onCreateRollout={createRollout} onAdvanceRollout={advanceRollout} onRollbackRollout={rollbackRollout} onCreateDistributedScan={createDistributedScan} onCancelDistributedScan={cancelDistributedScan} currentOperator={session?.operator ?? null} onCreateOperator={createOperator} onDecideApproval={decideApproval} />}</main>
       {scoutOpen && selected && <div className="modal-shade" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setScoutOpen(false) }}>
         <section className="scout-modal" role="dialog" aria-modal="true" aria-labelledby="scout-title">
           <div className="modal-head"><div><span className="kicker">SCOPED OPERATION</span><h2 id="scout-title">Configure Network Scout</h2><p>Provider: {selected.device_id}</p></div><button onClick={() => setScoutOpen(false)} aria-label="Close">×</button></div>

@@ -432,6 +432,79 @@ class CoordinatorTests(unittest.TestCase):
                 "expires_at_ms": int(time.time() * 1000) + 60000})
             create_scan(scope["id"])  # does not raise
 
+    # -- operators/roles/approvals (Phase 10) --------------------------------
+
+    def make_handler(self, workspace, operators=None, approvals=None):
+        handler = object.__new__(desktop_module.AppHandler)
+        handler.server = types.SimpleNamespace(operators=operators, approvals=approvals,
+                                               workspace=workspace)
+        handler.headers = Message()
+        handler.send_json = mock.MagicMock()
+        return handler
+
+    def test_legacy_single_operator_mode_requires_no_session_at_all(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = desktop_module.WorkspaceStore(pathlib.Path(directory) / "workspace.json")
+            operators = desktop_module.OperatorManager(workspace)
+            handler = self.make_handler(workspace, operators=operators)
+            operator = handler.resolve_operator()
+            self.assertIsNone(operator)
+            self.assertTrue(handler.enforce_authenticated("/api/projects", operator))
+            handler.send_json.assert_not_called()
+
+    def test_authorization_header_resolves_a_real_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = desktop_module.WorkspaceStore(pathlib.Path(directory) / "workspace.json")
+            operators = desktop_module.OperatorManager(workspace)
+            operators.create_operator({"username": "alice", "password": "x" * 12}, actor=None)
+            session = operators.login("alice", "x" * 12)
+            handler = self.make_handler(workspace, operators=operators)
+            handler.headers["Authorization"] = f"Bearer {session['token']}"
+            resolved = handler.resolve_operator()
+            self.assertEqual(resolved["username"], "alice")
+
+    def test_multi_operator_mode_rejects_missing_or_invalid_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = desktop_module.WorkspaceStore(pathlib.Path(directory) / "workspace.json")
+            operators = desktop_module.OperatorManager(workspace)
+            operators.create_operator({"username": "alice", "password": "x" * 12}, actor=None)
+            handler = self.make_handler(workspace, operators=operators)
+            self.assertFalse(handler.enforce_authenticated("/api/projects", None))
+            handler.send_json.assert_called_once_with(401, {"error": "authentication_required"})
+            # The bootstrap/session/login paths stay reachable without a session even
+            # once operators exist.
+            handler.send_json.reset_mock()
+            for exempt_path in ("/api/login", "/api/session", "/api/operators"):
+                self.assertTrue(handler.enforce_authenticated(exempt_path, None))
+            handler.send_json.assert_not_called()
+
+    def test_viewer_role_is_blocked_from_mutating_but_not_from_identity_routes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = desktop_module.WorkspaceStore(pathlib.Path(directory) / "workspace.json")
+            operators = desktop_module.OperatorManager(workspace)
+            admin = operators.create_operator({"username": "admin", "password": "x" * 12}, actor=None)
+            viewer = operators.create_operator({"username": "viewer", "password": "y" * 12, "role": "viewer"},
+                                               actor=admin)
+            handler = self.make_handler(workspace, operators=operators)
+            self.assertFalse(handler.enforce_not_viewer("/api/projects", viewer))
+            handler.send_json.assert_called_once_with(403, {"error": "viewer_role_is_read_only"})
+            handler.send_json.reset_mock()
+            self.assertTrue(handler.enforce_not_viewer("/api/logout", viewer))
+            handler.send_json.assert_not_called()
+            self.assertTrue(handler.enforce_not_viewer("/api/projects", admin))
+
+    def test_scope_creation_requires_admin_once_operators_exist(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = desktop_module.WorkspaceStore(pathlib.Path(directory) / "workspace.json")
+            operators = desktop_module.OperatorManager(workspace)
+            admin = operators.create_operator({"username": "admin", "password": "x" * 12}, actor=None)
+            junior = operators.create_operator({"username": "junior", "password": "y" * 12, "role": "operator"},
+                                               actor=admin)
+            handler = self.make_handler(workspace, operators=operators)
+            with self.assertRaisesRegex(PermissionError, "admin role"):
+                handler.require_admin_when_multi_operator(junior, handler.server)
+            handler.require_admin_when_multi_operator(admin, handler.server)  # does not raise
+
     def test_host_inspection_rejects_unapproved_or_external_targets(self):
         with self.assertRaises(PermissionError):
             desktop_module.inspect_hosts("192.0.2.10", {"hosts": ["192.0.2.20"], "ports": [80]})

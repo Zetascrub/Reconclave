@@ -34,11 +34,35 @@ class WorkspaceStore:
             descriptor = os.open(self.custody_key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(descriptor, "wb") as output:
                 output.write(self.custody_key)
+        # Set for the duration of one request by AppHandler (via set_current_actor) so
+        # _append_audit can attribute the resulting audit events to a real operator once
+        # any exist, instead of the "local-operator" default -- a thread-local rather
+        # than threading every audit-producing method's signature through with an actor
+        # parameter, since ThreadingHTTPServer already gives each request its own thread.
+        self._actor_local = threading.local()
+        # Operator password material lives in its own file, never in self.data -- unlike
+        # every other collection here, self.data is handed out verbatim by snapshot()
+        # (that's what GET /api/workspace returns to the browser), so a password hash
+        # has no business anywhere inside it. Same reasoning as custody_key living
+        # outside self.data above.
+        self.credentials_path = path.with_suffix(".operator-credentials.json")
+        if self.credentials_path.is_file():
+            self._credentials: dict[str, dict] = json.loads(self.credentials_path.read_text(encoding="utf-8"))
+        else:
+            self._credentials = {}
+        # Session tokens are a bearer credential -- like password hashes above, and
+        # unlike every other collection here, they must never appear in snapshot()
+        # (GET /api/workspace hands that to any authenticated browser, including a
+        # viewer; a leaked token is an impersonation of whoever it belongs to). Kept
+        # in memory only, not persisted at all: restarting the desktop app simply signs
+        # every operator out, which is an acceptable, unsurprising cost for never having
+        # a live token sitting on disk.
+        self._sessions: dict[str, dict] = {}
         self.data = {"revision": 0, "projects": [], "jobs": [], "evidence": [],
                      "automations": [], "workflows": [], "workflow_runs": [], "scopes": [],
                      "audit_events": [], "dispatch_leases": [], "findings": [],
                      "fleet_nodes": [], "fleet_configs": [], "ota_releases": [], "ota_rollouts": [],
-                     "distributed_scans": []}
+                     "distributed_scans": [], "operators": [], "approvals": []}
         self._load()
 
     def _load(self) -> None:
@@ -47,7 +71,7 @@ class WorkspaceStore:
         document = json.loads(self.path.read_text(encoding="utf-8"))
         if not isinstance(document, dict):
             raise ValueError("workspace root must be an object")
-        for name in ("projects", "jobs", "evidence", "automations", "workflows", "workflow_runs", "scopes", "audit_events", "dispatch_leases", "findings", "fleet_nodes", "fleet_configs", "ota_releases", "ota_rollouts", "distributed_scans"):
+        for name in ("projects", "jobs", "evidence", "automations", "workflows", "workflow_runs", "scopes", "audit_events", "dispatch_leases", "findings", "fleet_nodes", "fleet_configs", "ota_releases", "ota_rollouts", "distributed_scans", "operators", "approvals"):
             if not isinstance(document.get(name, []), list):
                 raise ValueError(f"workspace {name} must be a list")
         self.data = {"revision": int(document.get("revision", 0)),
@@ -65,7 +89,9 @@ class WorkspaceStore:
                      "fleet_configs": document.get("fleet_configs", []),
                      "ota_releases": document.get("ota_releases", []),
                      "ota_rollouts": document.get("ota_rollouts", []),
-                     "distributed_scans": document.get("distributed_scans", [])}
+                     "distributed_scans": document.get("distributed_scans", []),
+                     "operators": document.get("operators", []),
+                     "approvals": document.get("approvals", [])}
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -83,11 +109,18 @@ class WorkspaceStore:
         self._save()
         return self.snapshot()
 
+    def set_current_actor(self, actor_id: str) -> None:
+        self._actor_local.actor_id = actor_id
+
+    def clear_current_actor(self) -> None:
+        self._actor_local.actor_id = "local-operator"
+
     def _append_audit(self, action: str, project_id: str, subject_id: str,
                       outcome: str = "accepted", trace_id: str = "") -> dict:
         record = {"id": f"audit-{uuid.uuid4().hex[:16]}",
                   "trace_id": trace_id or f"trace-{uuid.uuid4().hex[:16]}",
-                  "actor_id": "local-operator", "project_id": project_id,
+                  "actor_id": getattr(self._actor_local, "actor_id", "local-operator"),
+                  "project_id": project_id,
                   "action": action, "subject_id": subject_id, "outcome": outcome,
                   "created_at_ms": int(time.time() * 1000)}
         self.data["audit_events"].append(record)
@@ -417,6 +450,66 @@ class WorkspaceStore:
             scan["updated_at_ms"] = int(time.time() * 1000)
             self._commit()
             return json.loads(json.dumps(scan))
+
+    # -- operators, sessions, approvals (Phase 10) ---------------------------
+
+    def _save_credentials(self) -> None:
+        self.credentials_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        temporary = self.credentials_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(self._credentials, separators=(",", ":")), encoding="utf-8")
+        temporary.chmod(0o600)
+        os.replace(temporary, self.credentials_path)
+
+    def add_operator(self, operator: dict, salt_hex: str, password_hash_hex: str) -> dict:
+        """`operator` is the public record (id/username/display_name/role/disabled/
+        created_at_ms) -- it goes into self.data and is returned by snapshot() like
+        everything else. The credential pair never does; it's looked up separately by
+        get_credentials, only ever called from the login path.
+        """
+        with self.lock:
+            self.data["operators"].append(json.loads(json.dumps(operator)))
+            self._credentials[operator["id"]] = {"salt": salt_hex, "password_hash": password_hash_hex}
+            self._save_credentials()
+            self._append_audit("operator.created", "", operator["id"], operator["role"])
+            self._commit()
+            return json.loads(json.dumps(operator))
+
+    def get_credentials(self, operator_id: str) -> dict | None:
+        return self._credentials.get(operator_id)
+
+    def add_session(self, session: dict) -> dict:
+        with self.lock:
+            now = int(time.time() * 1000)
+            self._sessions = {key: value for key, value in self._sessions.items()
+                              if value.get("expires_at_ms", 0) > now}
+            self._sessions[session["id"]] = json.loads(json.dumps(session))
+            return json.loads(json.dumps(session))
+
+    def delete_session(self, session_id: str) -> None:
+        with self.lock:
+            self._sessions.pop(session_id, None)
+
+    def get_session(self, session_id: str) -> dict | None:
+        with self.lock:
+            session = self._sessions.get(session_id)
+            return json.loads(json.dumps(session)) if session is not None else None
+
+    def add_approval(self, approval: dict) -> dict:
+        with self.lock:
+            self.data["approvals"].append(json.loads(json.dumps(approval)))
+            self._append_audit("approval.requested", "", approval["id"], approval["action_type"])
+            self._commit()
+            return json.loads(json.dumps(approval))
+
+    def update_approval(self, approval_id: str, update: dict) -> dict:
+        with self.lock:
+            approval = next((item for item in self.data["approvals"] if item.get("id") == approval_id), None)
+            if approval is None:
+                raise KeyError(approval_id)
+            approval.update(json.loads(json.dumps(update)))
+            self._append_audit("approval.decided", "", approval_id, approval["status"])
+            self._commit()
+            return json.loads(json.dumps(approval))
 
     def add_audit_event(self, event: dict) -> dict:
         with self.lock:

@@ -1,8 +1,8 @@
 import { useMemo, useState } from 'react'
-import type { ArchivedJob, AutomationRule, DistributedScan, EvidenceRecord, Finding, FindingStatus, FleetNode, OtaRelease, OtaRollout, Project, ReconNode, Workflow, WorkflowRun, WorkspaceData } from './types'
+import type { Approval, ArchivedJob, AutomationRule, DistributedScan, EvidenceRecord, Finding, FindingStatus, FleetNode, OperatorRole, OtaRelease, OtaRollout, Project, PublicOperator, ReconNode, Workflow, WorkflowRun, WorkspaceData } from './types'
 import WorkflowBuilder from './WorkflowBuilder'
 
-type View = 'jobs' | 'projects' | 'evidence' | 'map' | 'automations' | 'workflows' | 'scopes' | 'findings' | 'timeline' | 'fleet' | 'distributed'
+type View = 'jobs' | 'projects' | 'evidence' | 'map' | 'automations' | 'workflows' | 'scopes' | 'findings' | 'timeline' | 'fleet' | 'distributed' | 'operators'
 
 const FINDING_STATUSES: FindingStatus[] = ['open', 'candidate', 'confirmed-observed', 'confirmed', 'false_positive', 'remediated']
 
@@ -26,8 +26,8 @@ async function readArtifactFile(file: File): Promise<{ base64: string; sha256: s
   return { base64: btoa(binary), sha256 }
 }
 
-export default function WorkspaceViews({ view, workspace, nodes, projectId, onProject, onCreate, onInspect, onCreateAutomation, onUpdateAutomation, onDeleteAutomation, onCreateWorkflow, onRunWorkflow, onCancelWorkflow, onUpdateWorkflow, onDeleteWorkflow, onCreateScope, onImportFindings, onCorrelateFindings, onSetFindingStatus, onSetFindingSuppression, onCreateRelease, onCreateRollout, onAdvanceRollout, onRollbackRollout, onCreateDistributedScan, onCancelDistributedScan }:
-  { view: View; workspace: WorkspaceData; nodes: ReconNode[]; projectId: string; onProject: (id: string) => void; onCreate: (name: string, description: string) => Promise<void>; onInspect: (hosts: string[], ports: number[]) => Promise<unknown>; onCreateAutomation: (body: Record<string, unknown>) => Promise<void>; onUpdateAutomation: (id: string, body: Record<string, unknown>) => Promise<void>; onDeleteAutomation: (id: string) => Promise<void>; onCreateWorkflow: (body: Record<string, unknown>) => Promise<void>; onRunWorkflow: (id: string) => Promise<void>; onCancelWorkflow: (id: string) => Promise<void>; onUpdateWorkflow: (id: string, body: Record<string, unknown>) => Promise<void>; onDeleteWorkflow: (id: string) => Promise<void>; onCreateScope: (body: Record<string, unknown>) => Promise<void>; onImportFindings: (body: Record<string, unknown>) => Promise<void>; onCorrelateFindings: () => Promise<unknown>; onSetFindingStatus: (id: string, status: FindingStatus) => Promise<void>; onSetFindingSuppression: (id: string, suppressed: boolean, reason: string) => Promise<void>; onCreateRelease: (body: Record<string, unknown>) => Promise<void>; onCreateRollout: (body: Record<string, unknown>) => Promise<void>; onAdvanceRollout: (id: string) => Promise<void>; onRollbackRollout: (id: string) => Promise<void>; onCreateDistributedScan: (body: Record<string, unknown>) => Promise<void>; onCancelDistributedScan: (id: string) => Promise<void> }) {
+export default function WorkspaceViews({ view, workspace, nodes, projectId, onProject, onCreate, onInspect, onCreateAutomation, onUpdateAutomation, onDeleteAutomation, onCreateWorkflow, onRunWorkflow, onCancelWorkflow, onUpdateWorkflow, onDeleteWorkflow, onCreateScope, onImportFindings, onCorrelateFindings, onSetFindingStatus, onSetFindingSuppression, onCreateRelease, onCreateRollout, onAdvanceRollout, onRollbackRollout, onCreateDistributedScan, onCancelDistributedScan, currentOperator, onCreateOperator, onDecideApproval }:
+  { view: View; workspace: WorkspaceData; nodes: ReconNode[]; projectId: string; onProject: (id: string) => void; onCreate: (name: string, description: string) => Promise<void>; onInspect: (hosts: string[], ports: number[]) => Promise<unknown>; onCreateAutomation: (body: Record<string, unknown>) => Promise<void>; onUpdateAutomation: (id: string, body: Record<string, unknown>) => Promise<void>; onDeleteAutomation: (id: string) => Promise<void>; onCreateWorkflow: (body: Record<string, unknown>) => Promise<void>; onRunWorkflow: (id: string) => Promise<void>; onCancelWorkflow: (id: string) => Promise<void>; onUpdateWorkflow: (id: string, body: Record<string, unknown>) => Promise<void>; onDeleteWorkflow: (id: string) => Promise<void>; onCreateScope: (body: Record<string, unknown>) => Promise<void>; onImportFindings: (body: Record<string, unknown>) => Promise<void>; onCorrelateFindings: () => Promise<unknown>; onSetFindingStatus: (id: string, status: FindingStatus) => Promise<void>; onSetFindingSuppression: (id: string, suppressed: boolean, reason: string) => Promise<void>; onCreateRelease: (body: Record<string, unknown>) => Promise<void>; onCreateRollout: (body: Record<string, unknown>) => Promise<void>; onAdvanceRollout: (id: string) => Promise<void>; onRollbackRollout: (id: string) => Promise<void>; onCreateDistributedScan: (body: Record<string, unknown>) => Promise<void>; onCancelDistributedScan: (id: string) => Promise<void>; currentOperator: PublicOperator | null; onCreateOperator: (body: Record<string, unknown>) => Promise<void>; onDecideApproval: (id: string, decision: 'approved' | 'rejected') => Promise<void> }) {
   const [query, setQuery] = useState('')
   const [sort, setSort] = useState<'newest' | 'oldest' | 'name'>('newest')
   const [graph, setGraph] = useState(true)
@@ -69,7 +69,7 @@ export default function WorkspaceViews({ view, workspace, nodes, projectId, onPr
   const mapped = [...nodes.map((node) => ({ id: node.device_id, address: node.address, label: node.device_type, sub: node.address, live: true, node })), ...hosts.filter((host) => !nodes.some((node) => node.address === host)).map((host) => ({ id: host, address: host, label: host, sub: 'observed', live: false }))]
   const selectedHost = selectedHosts.length === 1 ? mapped.find((item) => item.address === selectedHosts[0]) : undefined
   const hostEvidence = selectedHost ? evidence.filter((item) => item.data?.hosts?.some((host) => (typeof host === 'string' ? host : host.address) === selectedHost.address)) : []
-  const title = view === 'projects' ? 'Project registry' : view === 'jobs' ? 'Operation history' : view === 'evidence' ? 'Evidence library' : view === 'automations' ? 'Conditional operations' : view === 'workflows' ? 'Workflow automation' : view === 'scopes' ? 'Engagement authority' : view === 'findings' ? 'Vulnerability analysis' : view === 'timeline' ? 'Operations audit timeline' : view === 'fleet' ? 'Fleet management' : view === 'distributed' ? 'Distributed scanning' : 'Project network map'
+  const title = view === 'projects' ? 'Project registry' : view === 'jobs' ? 'Operation history' : view === 'evidence' ? 'Evidence library' : view === 'automations' ? 'Conditional operations' : view === 'workflows' ? 'Workflow automation' : view === 'scopes' ? 'Engagement authority' : view === 'findings' ? 'Vulnerability analysis' : view === 'timeline' ? 'Operations audit timeline' : view === 'fleet' ? 'Fleet management' : view === 'distributed' ? 'Distributed scanning' : view === 'operators' ? 'Operators and approvals' : 'Project network map'
 
   return <>
     <section className="hero"><div><p className="eyebrow">PROJECT INTELLIGENCE</p><h1>{title}</h1><p className="subhead">{project ? project.name : 'All authorised project workspaces'}</p></div></section>
@@ -94,6 +94,7 @@ export default function WorkspaceViews({ view, workspace, nodes, projectId, onPr
         intentionally not filtered by projectId. */}
     {view === 'fleet' && <FleetView nodes={workspace.fleet_nodes} releases={workspace.ota_releases} rollouts={workspace.ota_rollouts} onCreateRelease={onCreateRelease} onCreateRollout={onCreateRollout} onAdvanceRollout={onAdvanceRollout} onRollbackRollout={onRollbackRollout} />}
     {view === 'distributed' && <DistributedScanView scans={workspace.distributed_scans.filter((item) => !projectId || item.project_id === projectId)} nodes={nodes} onCreate={onCreateDistributedScan} onCancel={onCancelDistributedScan} />}
+    {view === 'operators' && <OperatorsView operators={workspace.operators} approvals={workspace.approvals} currentOperator={currentOperator} onCreateOperator={onCreateOperator} onDecideApproval={onDecideApproval} />}
     {view === 'map' && <section className="map-layout"><div>{graph ? <NetworkGraph points={mapped} selected={selectedHosts} onSelect={(host) => setSelectedHosts((current) => current.includes(host) ? current.filter((item) => item !== host) : [...current, host])} /> : <RecordGrid empty="No mapped nodes yet.">{mapped.filter((item) => JSON.stringify(item).toLowerCase().includes(query.toLowerCase())).map((item) => <button className={`record-card ${selectedHosts.includes(item.address) ? 'selected-record' : ''}`} key={item.id} onClick={() => setSelectedHosts((current) => current.includes(item.address) ? current.filter((host) => host !== item.address) : [...current, item.address])}><span className={`record-icon ${item.live ? 'live' : ''}`}>⌁</span><div><span className="kicker">{item.live ? 'LIVE NODE' : 'OBSERVATION'}</span><h3>{item.address}</h3><p>{item.label}</p></div><span className="selection-box">{selectedHosts.includes(item.address) ? '✓' : '+'}</span></button>)}</RecordGrid>}</div><HostInspector host={selectedHost} selected={selectedHosts} evidence={hostEvidence} project={project} ports={ports} setPorts={setPorts} authorised={authorised} setAuthorised={setAuthorised} busy={inspecting} error={inspectionError} onRun={async () => { const parsed = [...new Set(ports.split(/[\s,]+/).filter(Boolean).map(Number).filter((port) => Number.isInteger(port) && port > 0 && port <= 65535))]; setInspecting(true); setInspectionError(''); try { await onInspect(selectedHosts, parsed) } catch (error) { setInspectionError(error instanceof Error ? error.message : 'Inspection failed') } finally { setInspecting(false) } }} /></section>}
     {selectedEvidence && <div className="modal-shade" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelectedEvidence(null) }}><section className="evidence-viewer panel"><div className="modal-head"><div><span className="kicker">{selectedEvidence.kind}</span><h2>{selectedEvidence.title}</h2><p>{stamp(selectedEvidence.captured_at_ms)}</p></div><button onClick={() => setSelectedEvidence(null)}>×</button></div><p className="evidence-summary">{selectedEvidence.summary}</p><div className="evidence-meta"><span>PROJECT <strong>{workspace.projects.find((item) => item.id === selectedEvidence.project_id)?.name ?? selectedEvidence.project_id}</strong></span><span>JOB <strong>{selectedEvidence.job_id || '—'}</strong></span><span>EVIDENCE ID <strong>{selectedEvidence.id}</strong></span></div><h3>COLLECTED DATA</h3><pre>{JSON.stringify(selectedEvidence.data, null, 2)}</pre></section></div>}
   </>
@@ -215,6 +216,86 @@ function DistributedScanView({ scans, nodes, onCreate, onCancel }: { scans: Dist
         </div>
       </article>
     })}</RecordGrid>
+  </section>
+}
+
+function OperatorsView({ operators, approvals, currentOperator, onCreateOperator, onDecideApproval }: {
+  operators: PublicOperator[]; approvals: Approval[]; currentOperator: PublicOperator | null
+  onCreateOperator: (body: Record<string, unknown>) => Promise<void>
+  onDecideApproval: (id: string, decision: 'approved' | 'rejected') => Promise<void>
+}) {
+  const isAdmin = currentOperator?.role === 'admin'
+  const [username, setUsername] = useState('')
+  const [displayName, setDisplayName] = useState('')
+  const [password, setPassword] = useState('')
+  const [role, setRole] = useState<OperatorRole>('operator')
+  const [error, setError] = useState('')
+  const [rowErrorId, setRowErrorId] = useState('')
+  const [rowError, setRowError] = useState('')
+
+  async function submit() {
+    setError('')
+    try {
+      await onCreateOperator({ username: username.trim(), display_name: displayName.trim() || username.trim(), password, role })
+      setUsername(''); setDisplayName(''); setPassword('')
+    } catch (err) { setError(err instanceof Error ? err.message : 'Could not create operator') }
+  }
+
+  async function decide(id: string, decision: 'approved' | 'rejected') {
+    setRowErrorId('')
+    try { await onDecideApproval(id, decision) }
+    catch (err) { setRowErrorId(id); setRowError(err instanceof Error ? err.message : 'Decision failed') }
+  }
+
+  const approvalsByRecency = approvals.slice().sort((a, b) => (a.status === 'pending' ? -1 : b.status === 'pending' ? 1 : 0) || b.created_at_ms - a.created_at_ms)
+
+  return <section className="catalog-layout operators-layout">
+    <div className="operators-top">
+      <div className="panel create-card">
+        <span className="kicker">ACCESS CONTROL</span><h2>Operators</h2>
+        {!currentOperator && <p>This desktop is in single-operator mode. Creating the first account here switches on real logins, roles, and two-person approval.</p>}
+        {currentOperator && !isAdmin && <p>Only an admin operator may create new accounts.</p>}
+        {(isAdmin || !currentOperator) && <>
+          <p>The first operator created always becomes admin, regardless of the role chosen here.</p>
+          <label className="field"><span>USERNAME</span><input value={username} onChange={(event) => setUsername(event.target.value)} placeholder="jsmith" /></label>
+          <label className="field"><span>DISPLAY NAME</span><input value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="J. Smith" /></label>
+          <label className="field"><span>PASSWORD</span><input type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="At least 10 characters" /></label>
+          <label className="field"><span>ROLE</span><select value={role} onChange={(event) => setRole(event.target.value as OperatorRole)}>
+            <option value="operator">Operator</option><option value="admin">Admin</option><option value="viewer">Viewer</option>
+          </select></label>
+          {error && <div className="inspection-error">{error}</div>}
+          <button className="primary-action" disabled={!username.trim() || password.length < 10} onClick={submit}>+ CREATE OPERATOR</button>
+        </>}
+      </div>
+      <div className="panel">
+        <div className="panel-head"><div><span className="kicker">ROSTER</span><h2>{operators.length} operator{operators.length === 1 ? '' : 's'}</h2></div></div>
+        <RecordGrid empty="No operators registered yet -- this desktop is in single-operator mode.">{operators.map((item) => <article className="record-card" key={item.id}>
+          <span className="record-icon">☺</span>
+          <div><span className="kicker">{item.disabled ? 'DISABLED' : 'ACTIVE'}</span><h3>{item.display_name}</h3><p>@{item.username}</p><span className={`role-badge ${item.role}`}>{item.role}</span></div>
+        </article>)}</RecordGrid>
+      </div>
+    </div>
+    <div className="panel">
+      <div className="panel-head"><div><span className="kicker">MAKER-CHECKER</span><h2>Approvals</h2></div></div>
+      <RecordGrid empty="No approval requests yet.">{approvalsByRecency.map((item) => {
+        const decidable = isAdmin && item.status === 'pending' && item.requested_by !== currentOperator?.id
+        return <article className="record-card automation-card" key={item.id}>
+          <span className={`record-icon ${item.status === 'pending' ? 'live' : ''}`}>{item.status === 'approved' ? '✓' : item.status === 'rejected' ? '✕' : item.status === 'failed' ? '!' : '…'}</span>
+          <div>
+            <span className="kicker">{item.action_type} · {item.status.toUpperCase()}</span>
+            <h3>Requested by {item.requested_by_username}</h3>
+            <pre className="approval-payload">{JSON.stringify(item.payload, null, 2)}</pre>
+            {item.decided_by_username && <small>Decided by {item.decided_by_username}</small>}
+            {item.error && <small className="inspection-error">{item.error}</small>}
+            {rowErrorId === item.id && <small className="inspection-error">{rowError}</small>}
+          </div>
+          {decidable && <div className="rule-actions">
+            <button onClick={() => decide(item.id, 'approved')}>APPROVE</button>
+            <button className="danger" onClick={() => decide(item.id, 'rejected')}>REJECT</button>
+          </div>}
+        </article>
+      })}</RecordGrid>
+    </div>
   </section>
 }
 

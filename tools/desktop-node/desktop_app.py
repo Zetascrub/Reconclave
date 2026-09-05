@@ -25,6 +25,7 @@ from adaptive_scheduler import DistributedScanEngine
 from coordinator import Coordinator
 from engagement_policy import TARGET_CAPABILITIES, TARGET_PREFIXES, EngagementPolicy
 from fleet_manager import FleetManager
+from operators import ApprovalManager, OperatorManager
 from reconclave_node import ANNOUNCE_PATH, MESSAGE_PATH, PROTOCOL, Node, local_ip
 from workspace_store import WorkspaceStore
 from workflow_engine import WorkflowEngine
@@ -310,6 +311,66 @@ class AppHandler(BaseHTTPRequestHandler):
             return False
         return parsed.scheme == "http" and host in ("127.0.0.1", "localhost", "::1") and port == self.server.server_port
 
+    # -- operator identity (Phase 10) ---------------------------------------------
+    #
+    # A Bearer token, not a cookie: cookies are attached to a request automatically
+    # regardless of origin, which is exactly the ambient-credential problem
+    # trusted_api_origin already exists to guard against for this loopback API: a token
+    # only travels if the page's own JS attaches it, so cross-origin/CSRF exposure isn't
+    # widened by adding sessions at all.
+
+    NO_SESSION_REQUIRED_PATHS = ("/api/login", "/api/session", "/api/operators")
+    IDENTITY_PATHS = ("/api/login", "/api/logout", "/api/session")
+
+    def resolve_operator(self) -> dict | None:
+        auth = self.headers.get("Authorization", "")
+        token = auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
+        return self.server.operators.resolve_session(token) if token else None
+
+    def enforce_authenticated(self, path: str, operator: dict | None) -> bool:
+        """False means a 401 has already been sent and the caller must stop.
+
+        With no operator accounts created yet, every request is exempt -- this is the
+        "preserve a simple single-operator mode now" requirement (platform-roadmap.md
+        Product decisions): multi-operator mode only turns on once an operator actually
+        exists. /api/operators is exempt too since OperatorManager.create_operator
+        itself enforces the equivalent bootstrap-vs-admin-only rule; letting an
+        unauthenticated bootstrap attempt reach it produces a clearer PermissionError
+        than a generic 401 once operators already exist.
+        """
+        if self.server.operators.count() == 0 or path in self.NO_SESSION_REQUIRED_PATHS:
+            return True
+        if operator is None:
+            self.send_json(401, {"error": "authentication_required"})
+            return False
+        return True
+
+    def enforce_not_viewer(self, path: str, operator: dict | None) -> bool:
+        """False means a 403 has already been sent. A viewer role is read-only, so this
+        only ever needs to run for mutating requests (POST/DELETE); operator is None in
+        legacy single-operator mode, where nothing is gated by role at all. Login/logout
+        are identity operations, not workspace mutations, so an already-logged-in
+        viewer re-authenticating (or logging out) is exempt rather than 403ing.
+        """
+        if path in self.IDENTITY_PATHS:
+            return True
+        if operator is not None and operator["role"] == "viewer":
+            self.send_json(403, {"error": "viewer_role_is_read_only"})
+            return False
+        return True
+
+    @staticmethod
+    def require_admin_when_multi_operator(operator: dict | None, server: "AppServer") -> None:
+        """Raises PermissionError for the small set of actions registered in the
+        approval executors (scope.create, fleet.release.create): once any operator
+        exists, only admin may perform these directly -- anyone else must go through
+        POST /api/approvals instead, which is what actually gives "approval" teeth
+        rather than being an optional parallel path admins and non-admins can both skip.
+        """
+        if server.operators.count() > 0 and (operator is None or operator["role"] != "admin"):
+            raise PermissionError(
+                "this action requires admin role, or a decided approval request (POST /api/approvals)")
+
     def send_bytes(self, status: int, body: bytes, content_type: str) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
@@ -326,8 +387,13 @@ class AppHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed_path = urllib.parse.urlsplit(self.path)
         path = parsed_path.path
+        operator = self.resolve_operator()
+        if path.startswith("/api/") and not self.enforce_authenticated(path, operator):
+            return
         if path == ANNOUNCE_PATH:
             self.send_json(200, self.server.node.announcement())
+        elif path == "/api/session":
+            self.send_json(200, {"auth_required": self.server.operators.count() > 0, "operator": operator})
         elif path == "/api/state":
             if self.local_client():
                 self.send_json(200, self.server.coordinator.state())
@@ -393,6 +459,13 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.headers.get_content_type() != "application/json"):
             self.send_json(403, {"error": "untrusted_browser_request"})
             return
+        operator = self.resolve_operator()
+        if path.startswith("/api/"):
+            if not self.enforce_authenticated(path, operator):
+                return
+            if not self.enforce_not_viewer(path, operator):
+                return
+        self.server.workspace.set_current_actor(operator["id"] if operator else "local-operator")
         try:
             max_length = MAX_RELEASE_BODY_BYTES if path == "/api/fleet/releases" else MAX_BODY_BYTES
             length = int(self.headers.get("Content-Length", "0"))
@@ -405,6 +478,25 @@ class AppHandler(BaseHTTPRequestHandler):
                 status, response = self.server.node.respond(body)
                 self.send_json(status, response)
                 return
+            if path == "/api/login":
+                self.send_json(200, self.server.operators.login(
+                    str(body.get("username", "")), str(body.get("password", ""))))
+                return
+            if path == "/api/logout":
+                auth = self.headers.get("Authorization", "")
+                token = auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
+                self.server.operators.logout(token)
+                self.send_json(200, {"ok": True})
+                return
+            if path == "/api/operators":
+                self.send_json(201, self.server.operators.create_operator(body, operator))
+                return
+            if path == "/api/approvals":
+                if operator is None:
+                    raise PermissionError("an operator session is required to request an approval")
+                self.send_json(201, self.server.approvals.request(
+                    str(body.get("action_type", "")), body.get("payload", {}), operator))
+                return
             if path == "/api/projects":
                 self.send_json(201, self.server.workspace.create_project(body))
                 return
@@ -414,6 +506,7 @@ class AppHandler(BaseHTTPRequestHandler):
             if path == "/api/scopes":
                 if body.get("operator_authorised") is not True:
                     raise PermissionError("explicit engagement scope approval is required")
+                self.require_admin_when_multi_operator(operator, self.server)
                 self.send_json(201, self.server.policy.create_scope(body))
                 return
             if path == "/api/findings/import":
@@ -460,6 +553,7 @@ class AppHandler(BaseHTTPRequestHandler):
             if path == "/api/fleet/releases":
                 if body.get("operator_authorised") is not True:
                     raise PermissionError("explicit release signing approval is required")
+                self.require_admin_when_multi_operator(operator, self.server)
                 self.send_json(201, self.server.fleet.create_release(body))
                 return
             if path == "/api/fleet/rollouts":
@@ -537,6 +631,12 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             if len(parts) == 4 and parts[:2] == ["api", "workflow-runs"] and parts[3] == "cancel":
                 self.send_json(200, self.server.workflows.cancel(urllib.parse.unquote(parts[2])))
+                return
+            if len(parts) == 4 and parts[:2] == ["api", "approvals"] and parts[3] == "decide":
+                if operator is None:
+                    raise PermissionError("an operator session is required to decide an approval")
+                self.send_json(200, self.server.approvals.decide(
+                    urllib.parse.unquote(parts[2]), str(body.get("decision", "")), operator))
                 return
             if path == "/api/distributed-scans":
                 capability = str(body.get("capability", "net.discovery.scan"))
@@ -619,6 +719,8 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_json(400, {"error": "invalid_request", "message": str(error)})
         except ConnectionError as error:
             self.send_json(502, {"error": "node_request_failed", "message": str(error)})
+        finally:
+            self.server.workspace.clear_current_actor()
 
     def do_DELETE(self) -> None:
         path = urllib.parse.urlsplit(self.path).path
@@ -628,6 +730,12 @@ class AppHandler(BaseHTTPRequestHandler):
         if not self.trusted_api_origin():
             self.send_json(403, {"error": "untrusted_browser_request"})
             return
+        operator = self.resolve_operator()
+        if not self.enforce_authenticated(path, operator):
+            return
+        if not self.enforce_not_viewer(path, operator):
+            return
+        self.server.workspace.set_current_actor(operator["id"] if operator else "local-operator")
         parts = path.strip("/").split("/")
         try:
             if len(parts) == 3 and parts[:2] == ["api", "automations"]:
@@ -652,6 +760,8 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_json(400, {"error": "invalid_request", "message": str(error)})
         except ConnectionError as error:
             self.send_json(502, {"error": "node_request_failed", "message": str(error)})
+        finally:
+            self.server.workspace.clear_current_actor()
 
     def stream_events(self) -> None:
         try:
@@ -694,7 +804,8 @@ class AppServer(ThreadingHTTPServer):
 
     def __init__(self, address: tuple[str, int], node: Node, coordinator: Coordinator,
                  workspace: WorkspaceStore, workflows: WorkflowEngine, policy: EngagementPolicy,
-                 fleet: FleetManager, scheduler: DistributedScanEngine) -> None:
+                 fleet: FleetManager, scheduler: DistributedScanEngine, operators: OperatorManager,
+                 approvals: ApprovalManager) -> None:
         self.node = node
         self.coordinator = coordinator
         self.workspace = workspace
@@ -702,6 +813,8 @@ class AppServer(ThreadingHTTPServer):
         self.policy = policy
         self.fleet = fleet
         self.scheduler = scheduler
+        self.operators = operators
+        self.approvals = approvals
         super().__init__(address, AppHandler)
 
 
@@ -755,7 +868,17 @@ def main() -> None:
     fleet = FleetManager(coordinator, workspace, workspace.custody_key)
     fleet.reconcile_once()
     scheduler = DistributedScanEngine(coordinator, workspace, policy)
-    server = AppServer(("0.0.0.0", args.port), node, coordinator, workspace, workflows, policy, fleet, scheduler)
+    operators = OperatorManager(workspace)
+    # The approval registry is deliberately small for this first slice: the two
+    # existing operator_authorised-gated actions with the clearest two-person-control
+    # case (what's authorised to be attacked, what firmware gets pushed). Extending it
+    # to more action types later is just another executors entry, not a redesign.
+    approvals = ApprovalManager(workspace, executors={
+        "scope.create": policy.create_scope,
+        "fleet.release.create": fleet.create_release,
+    })
+    server = AppServer(("0.0.0.0", args.port), node, coordinator, workspace, workflows, policy, fleet,
+                       scheduler, operators, approvals)
     automations = AutomationEngine(coordinator, workspace)
     automations.start()
     workflows.start()

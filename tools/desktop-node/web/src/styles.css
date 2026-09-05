@@ -99,3 +99,24 @@ main { margin-left: 76px; padding: 34px clamp(22px,4vw,58px) 50px; position: rel
 .consensus-summary li.concord-high{border-color:var(--cyan-dim);color:#9fc9bd}
 .consensus-summary li.concord-low{border-color:var(--amber);color:#d3b886}
 .consensus-summary li.concord-unobserved{border-color:#4e625c;color:#7c918b}
+
+/* Operators/roles/approvals (Phase 10). */
+.login-shell{display:grid;place-items:center;min-height:100vh}
+.login-card{width:min(340px,90vw);padding:26px 24px;display:grid;gap:14px;justify-items:center;text-align:center}
+.login-card .brand{margin-top:2px}
+.login-sub{margin:2px 0 6px;color:var(--muted);font:400 10px DM Mono}
+.login-card .field{width:100%;text-align:left}
+.login-submit{width:100%;margin-top:4px}
+.operator-chip{display:flex;align-items:center;gap:8px;border:1px solid var(--line);background:rgba(12,27,23,.6);padding:6px 10px;font:500 8px DM Mono}
+.operator-chip strong{color:#cce0da;font-weight:500}
+.operator-chip span{color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+.operator-chip button{border:0;background:transparent;color:var(--muted);cursor:pointer;font:500 8px DM Mono;letter-spacing:.08em;padding:0;margin-left:4px}
+.operator-chip button:hover{color:var(--amber)}
+.role-badge{display:inline-block;padding:2px 6px;font:500 7px DM Mono;letter-spacing:.08em;text-transform:uppercase;border:1px solid var(--line)}
+.role-badge.admin{color:var(--cyan);border-color:var(--cyan-dim)}
+.role-badge.operator{color:var(--violet);border-color:rgba(169,150,255,.3)}
+.role-badge.viewer{color:var(--muted)}
+.approval-payload{margin:6px 0 0;padding:8px;background:rgba(4,10,8,.5);border:1px solid var(--line);font:8px/1.5 DM Mono;color:#a9c2bb;white-space:pre-wrap;overflow-wrap:anywhere;max-height:140px;overflow:auto}
+.operators-layout{grid-template-columns:1fr}
+.operators-top{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:900px){.operators-top{grid-template-columns:1fr}}

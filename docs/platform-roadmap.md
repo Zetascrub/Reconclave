@@ -55,7 +55,7 @@ capabilities require a separate, explicit approval policy and are disabled by de
 | 7 | Adaptive distributed scheduling | Complete | Capability/resource/topology selection, scope sharding, failover and backpressure, consensus scanning (design doc §9.2) |
 | 8 | VPN and internet relay | Planned | Mutually authenticated relay, expiring delegation, offline queue, no implicit transitive trust |
 | 9 | Vulnerability analysis | Complete | Normalised findings, correlation, confidence, CVE enrichment, safe validation, Nessus import |
-| 10 | Collaboration and reporting | Planned | Operators/roles/approvals, notes, comparisons, ATT&CK/STIX/OCSF mappings, report exports |
+| 10 | Collaboration and reporting | In progress (operators/roles/approvals done; notes, comparisons, ATT&CK/STIX/OCSF mappings, report exports remain) | Operators/roles/approvals, notes, comparisons, ATT&CK/STIX/OCSF mappings, report exports |
 | 11 | Secure relay/gateway nodes | Planned | Explicit routes, per-hop authority, store-and-forward, route visibility, emergency stop |
 | 12 | Edge AI and local analysis tier | Planned, gated on K230 hardware | K230 vision/OCR/classification capabilities, local AI analysis gateway (Ollama/llama.cpp/approved provider), RAG over security knowledge, enforced per-engagement AI privacy policy |
 
@@ -325,6 +325,83 @@ already wired to live API routes. Corrected here rather than left stale.
   `shard_ranges`, parallel dispatch/concurrency-ceiling/backpressure/failover/attempt-ceiling
   behaviour, and consensus reconciliation (high/low/unobserved) including the evidence record it
   produces.
+
+## Phase 10 collaboration and reporting
+
+Operators/roles/approvals landed; notes, comparisons, ATT&CK/STIX/OCSF mappings, and report
+exports are still open (tracked as their own follow-up, not attempted in this pass).
+
+- [x] Local operator accounts, roles, and sessions: `tools/desktop-node/operators.py`'s
+  `OperatorManager`. Every rule here is conditional on whether any operator account actually
+  exists yet, per the roadmap's own "starts with local accounts... preserve a simple
+  single-operator mode now" — with zero operators, the platform behaves exactly as it always
+  has (every action attributed to the implicit `"local-operator"`, no login, no gate on any
+  route). Creating the first operator (self-registered, no session needed) is the
+  single-operator-to-multi-operator transition; it always becomes admin regardless of the
+  role requested, and every operator after that requires an authenticated admin actor.
+  Three roles: `admin`, `operator`, `viewer` (read-only — blocked from every mutating route
+  once operators exist). Passwords are PBKDF2-HMAC-SHA256 (200k iterations, random salt);
+  login takes constant-ish time regardless of whether the username exists, to avoid that
+  timing itself confirming which usernames are registered. Sessions are a Bearer token
+  (`Authorization: Bearer <token>`), deliberately not a cookie — a cookie is attached to a
+  request automatically regardless of origin, exactly the ambient-credential problem
+  `trusted_api_origin` (`desktop_app.py`) already exists to guard this loopback API
+  against, so a token that only travels when this code attaches it doesn't widen
+  cross-origin/CSRF exposure at all. Session tokens live in memory only (never persisted,
+  never part of `WorkspaceStore.snapshot()`'s output, which is what `GET /api/workspace`
+  hands to any authenticated browser including a viewer) — restarting the desktop app signs
+  everyone out, an accepted cost for never having a live token sit on disk or leak through
+  the general snapshot API. Password hashes are likewise kept out of `self.data` entirely,
+  in their own file (`WorkspaceStore`'s `.operator-credentials.json`), mirroring the existing
+  `custody_key` pattern rather than the general snapshot/persistence path.
+- [x] Two-person control (maker-checker) for a small, explicit action registry:
+  `operators.ApprovalManager`, registered today for `scope.create` and `fleet.release.create`
+  — the two existing `operator_authorised`-gated actions with the clearest two-person-control
+  case (what's authorised to be attacked; what firmware gets pushed). Once any operator
+  exists, only admin may perform a registered action directly
+  (`AppHandler.require_admin_when_multi_operator`); an `operator`-role account must instead
+  `POST /api/approvals` (role `operator` or `admin` only — a `viewer` may not even request),
+  and a *different* admin decides it (`POST /api/approvals/<id>/decide`) — deciding is what
+  actually calls the same underlying code an admin's direct call would
+  (`EngagementPolicy.create_scope` / `FleetManager.create_release`), so approving an
+  operator's request and an admin acting directly produce identical results through the same
+  path. Self-approval is rejected outright. The web app makes this transparent: the existing
+  scope/release creation forms detect a non-admin session and submit to `/api/approvals`
+  instead of the direct route, rather than needing a separate "request" form. Extending the
+  registry to more action types later is one more `executors` entry, not a redesign.
+- [x] Real audit attribution: every audit event's `actor_id` was hardcoded to
+  `"local-operator"` regardless of who actually acted. `AppHandler` now resolves the
+  requester's session once per request and calls `WorkspaceStore.set_current_actor` /
+  `clear_current_actor` around it; `_append_audit` reads a thread-local instead of the
+  hardcoded literal (`ThreadingHTTPServer` already gives each request its own thread) rather
+  than threading an `actor` parameter through every audit-producing method's signature.
+  Verified end-to-end (not just unit-tested): an admin deciding an operator's approval
+  request shows the *admin's* id on the resulting `scope.created` audit event and the
+  *requesting operator's* id on `approval.requested`, exactly reflecting who did what.
+- [x] Web UI: a login screen gates the app once any operator exists (`LoginScreen.tsx`); a
+  topbar chip shows the signed-in operator/role with sign-out; a new "Access" tab
+  (`WorkspaceViews.tsx`'s `OperatorsView`) lists operators, lets an admin create new ones, and
+  lists/decides pending approvals. `EventSource` (the live `/api/events` stream) can't send
+  custom headers, so its token travels as a query parameter instead — the one deliberate
+  exception to "auth always travels in a header", accepted only because this is a
+  loopback-only, single-workstation tool per its existing threat model, not a
+  network-facing service.
+- [x] Test coverage: `test_operators.py` (new, 20 tests: password hashing, bootstrap-to-admin,
+  admin-gated operator creation, login/session/logout lifecycle, credential/session exposure
+  guarantees, and the full `ApprovalManager` maker-checker contract including self-approval
+  rejection and a failing executor's error capture) plus HTTP-layer tests in
+  `test_coordinator.py` for the session/role gates themselves. 187 desktop-node tests pass.
+  A manual end-to-end smoke test against a running server (bootstrap → login → viewer blocked
+  from mutating → non-admin blocked from direct scope creation → approval request → admin
+  decision → real scope created with a valid signature → audit trail correctly attributed)
+  is recorded in this phase's development history; not itself a regression test, but real
+  confidence beyond the unit suite for a change this security-sensitive.
+- [ ] Notes: free-text operator annotations attached to a project/finding/evidence record.
+- [ ] Comparisons: diffing scan/evidence state across two points in time.
+- [ ] ATT&CK/STIX/OCSF mappings: associate findings with MITRE ATT&CK techniques; export in
+  STIX/OCSF standard formats for interop with other tooling.
+- [ ] Report exports: a human-readable engagement report (findings, evidence, timeline) as one
+  exportable document.
 
 ## Tool-runner safety contract
 
