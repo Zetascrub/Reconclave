@@ -435,10 +435,12 @@ Consensus mode can expose:
 Reconclave must distinguish **not observed** from an explicit negative
 result.
 
-> **Status note (resolved):** consensus mode is now an explicit part of
+> **Status note (resolved):** consensus mode is implemented as part of
 > Phase 7's exit criteria (`docs/platform-roadmap.md`), alongside
 > capability/resource/topology-aware allocation and failover, rather than
-> a separate phase. Not yet implemented as of this note.
+> a separate phase. See `tools/desktop-node/adaptive_scheduler.py`'s
+> `DistributedScanEngine` (mode `"consensus"`) and its
+> `_reconcile_consensus` concord classification.
 
 ### 9.3 Adaptive Mode
 

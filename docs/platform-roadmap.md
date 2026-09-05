@@ -52,7 +52,7 @@ capabilities require a separate, explicit approval policy and are disabled by de
 | 4 | Fleet management and signed OTA | Complete (device firmware unverified on real hardware — see Phase 4 notes) | Health/inventory/config drift, staged rollout, verification and rollback |
 | 5 | Evidence pipeline and chain of custody | Complete (relay half of ESP32/relay item blocked on Phase 8/11; device firmware unverified on real hardware — see Phase 5 notes) | Content-addressed records, node MAC/signature, encrypted spool, receipts, export bundle |
 | 6 | Live operations timeline | Complete | Correlated campaign/job/node/evidence events with trace IDs and searchable audit history |
-| 7 | Adaptive distributed scheduling | Planned | Capability/resource/topology selection, scope sharding, failover and backpressure, consensus scanning (design doc §9.2) |
+| 7 | Adaptive distributed scheduling | Complete | Capability/resource/topology selection, scope sharding, failover and backpressure, consensus scanning (design doc §9.2) |
 | 8 | VPN and internet relay | Planned | Mutually authenticated relay, expiring delegation, offline queue, no implicit transitive trust |
 | 9 | Vulnerability analysis | Complete | Normalised findings, correlation, confidence, CVE enrichment, safe validation, Nessus import |
 | 10 | Collaboration and reporting | Planned | Operators/roles/approvals, notes, comparisons, ATT&CK/STIX/OCSF mappings, report exports |
@@ -286,6 +286,45 @@ already wired to live API routes. Corrected here rather than left stale.
   started/complete/failed/cancelled reuses the existing `job.updated` audit event, de-duplicated against
   the Network view's own richer Scout-specific notifications via a shared last-notified-status map
   (`markJobNotified`) so a UI-driven scan doesn't produce two notifications for one event.
+
+## Phase 7 adaptive distributed scheduling
+
+- [x] Capability/resource/topology-aware node selection: `adaptive_scheduler.select_node`
+  (`tools/desktop-node/adaptive_scheduler.py`) filters by capability, then prefers a node whose own
+  attached subnet actually contains the target network (falling back to every capable node when that
+  narrows the field to nothing, so a single-node deployment or ambiguous topology behaves exactly as
+  before), then ranks by live status, current dispatch-lease load (`active_lease_counts`, the one load
+  signal this platform already tracks — no new telemetry invented for this), and advertised bandwidth.
+  `WorkflowEngine._provider` now defers to this too instead of "first ready node", so existing
+  workflow dispatch benefits without a separate code path; an explicit `preferred_node` is still always
+  honoured as-is.
+- [x] Scope-sharded parallel scanning with failover and backpressure: `DistributedScanEngine` (same
+  file) splits an authorised network's usable host range into `net.discovery.scan` chunks
+  (`shard_ranges`, design doc §9.1's /28 "work units" example generalised to any chunk size) and
+  dispatches them through the existing `EngagementPolicy`/dispatch-lease machinery — a scope's own
+  `max_concurrency`/`max_requests_per_minute` ceiling is backpressure for free, no new rate-limiting
+  concept needed. A chunk whose node disappears or errors mid-job is requeued to a different eligible
+  node (three attempts before failing permanently); `select_node`'s exclude-list is a preference, not a
+  hard filter, specifically so a single-node deployment can still retry the only node it has instead of
+  stranding a chunk in "pending" forever after one transient failure.
+- [x] Consensus scanning (design doc §9.2): the same chunk model, but each target gets one
+  pre-assigned chunk per currently-capable node instead of a partitioned range, so every node's
+  opinion on the identical target is independently recorded (a fixed-node chunk is never reassigned on
+  failure, unlike a parallel chunk — reassigning would corrupt "which node observed what"). Once every
+  chunk for a target reaches a terminal state, `_reconcile_consensus` classifies agreement: "high"
+  when every node that actually completed a check agreed (present or absent), "low" on a genuine
+  disagreement (§9.2's worked example), and "unobserved" when no check ever completed at all — the
+  explicit not-observed/negative distinction §9.2 called for. The reconciliation is also recorded as
+  evidence (`kind: "consensus-scan"`).
+- [x] API: `POST /api/distributed-scans` (create; rejects at creation time with no valid scope for a
+  target-bearing capability, mirroring `/api/workflows/<id>/runs`'s own boundary) and
+  `POST /api/distributed-scans/<id>/cancel`. Web UI: a new "Distributed" tab
+  (`web/src/WorkspaceViews.tsx`'s `DistributedScanView`) to start a parallel or consensus scan and
+  watch chunk/consensus progress. Web build and lint verified clean.
+- [x] Test coverage: `test_adaptive_scheduler.py` (new), covering `select_node`'s ranking rules,
+  `shard_ranges`, parallel dispatch/concurrency-ceiling/backpressure/failover/attempt-ceiling
+  behaviour, and consensus reconciliation (high/low/unobserved) including the evidence record it
+  produces.
 
 ## Tool-runner safety contract
 

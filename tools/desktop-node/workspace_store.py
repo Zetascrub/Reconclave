@@ -37,7 +37,8 @@ class WorkspaceStore:
         self.data = {"revision": 0, "projects": [], "jobs": [], "evidence": [],
                      "automations": [], "workflows": [], "workflow_runs": [], "scopes": [],
                      "audit_events": [], "dispatch_leases": [], "findings": [],
-                     "fleet_nodes": [], "fleet_configs": [], "ota_releases": [], "ota_rollouts": []}
+                     "fleet_nodes": [], "fleet_configs": [], "ota_releases": [], "ota_rollouts": [],
+                     "distributed_scans": []}
         self._load()
 
     def _load(self) -> None:
@@ -46,7 +47,7 @@ class WorkspaceStore:
         document = json.loads(self.path.read_text(encoding="utf-8"))
         if not isinstance(document, dict):
             raise ValueError("workspace root must be an object")
-        for name in ("projects", "jobs", "evidence", "automations", "workflows", "workflow_runs", "scopes", "audit_events", "dispatch_leases", "findings", "fleet_nodes", "fleet_configs", "ota_releases", "ota_rollouts"):
+        for name in ("projects", "jobs", "evidence", "automations", "workflows", "workflow_runs", "scopes", "audit_events", "dispatch_leases", "findings", "fleet_nodes", "fleet_configs", "ota_releases", "ota_rollouts", "distributed_scans"):
             if not isinstance(document.get(name, []), list):
                 raise ValueError(f"workspace {name} must be a list")
         self.data = {"revision": int(document.get("revision", 0)),
@@ -63,7 +64,8 @@ class WorkspaceStore:
                      "fleet_nodes": document.get("fleet_nodes", []),
                      "fleet_configs": document.get("fleet_configs", []),
                      "ota_releases": document.get("ota_releases", []),
-                     "ota_rollouts": document.get("ota_rollouts", [])}
+                     "ota_rollouts": document.get("ota_rollouts", []),
+                     "distributed_scans": document.get("distributed_scans", [])}
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -396,6 +398,25 @@ class WorkspaceStore:
             self.data["scopes"].append(json.loads(json.dumps(scope)))
             self._commit()
             return json.loads(json.dumps(scope))
+
+    def add_distributed_scan(self, scan: dict) -> dict:
+        with self.lock:
+            if not any(item.get("id") == scan.get("project_id") for item in self.data["projects"]):
+                raise ValueError("project does not exist")
+            self.data["distributed_scans"].append(json.loads(json.dumps(scan)))
+            self._append_audit("distributed_scan.created", scan["project_id"], scan["id"], scan["mode"])
+            self._commit()
+            return json.loads(json.dumps(scan))
+
+    def update_distributed_scan(self, scan_id: str, update: dict) -> dict:
+        with self.lock:
+            scan = next((item for item in self.data["distributed_scans"] if item.get("id") == scan_id), None)
+            if scan is None:
+                raise KeyError(scan_id)
+            scan.update(json.loads(json.dumps(update)))
+            scan["updated_at_ms"] = int(time.time() * 1000)
+            self._commit()
+            return json.loads(json.dumps(scan))
 
     def add_audit_event(self, event: dict) -> dict:
         with self.lock:

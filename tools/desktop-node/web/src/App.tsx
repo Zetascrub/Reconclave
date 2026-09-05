@@ -3,7 +3,7 @@ import type { Activity, AppState, CapabilityDescriptor, FindingStatus, Project, 
 import WorkspaceViews from './WorkspaceViews'
 
 const emptyState: AppState = { revision: 0, nodes: [], coordinator_id: '', updated_at_ms: 0 }
-const emptyWorkspace: WorkspaceData = { revision: 0, projects: [], jobs: [], evidence: [], automations: [], workflows: [], workflow_runs: [], scopes: [], audit_events: [], findings: [], fleet_nodes: [], fleet_configs: [], ota_releases: [], ota_rollouts: [] }
+const emptyWorkspace: WorkspaceData = { revision: 0, projects: [], jobs: [], evidence: [], automations: [], workflows: [], workflow_runs: [], scopes: [], audit_events: [], findings: [], fleet_nodes: [], fleet_configs: [], ota_releases: [], ota_rollouts: [], distributed_scans: [] }
 
 const ACTIVITY_LIMIT = 20
 
@@ -66,7 +66,7 @@ function defaultScope(address: string) {
 }
 
 function App() {
-  const [view, setView] = useState<'network' | 'map' | 'jobs' | 'projects' | 'evidence' | 'automations' | 'workflows' | 'scopes' | 'findings' | 'timeline' | 'fleet'>('network')
+  const [view, setView] = useState<'network' | 'map' | 'jobs' | 'projects' | 'evidence' | 'automations' | 'workflows' | 'scopes' | 'findings' | 'timeline' | 'fleet' | 'distributed'>('network')
   const [state, setState] = useState<AppState>(emptyState)
   const [workspace, setWorkspace] = useState<WorkspaceData>(emptyWorkspace)
   const [projectId, setProjectId] = useState(() => localStorage.getItem('reconclave.project') ?? '')
@@ -298,6 +298,16 @@ function App() {
     addActivity({ title: 'Rollout rolled back', detail: id, tone: 'warn' })
   }
 
+  async function createDistributedScan(body: Record<string, unknown>) {
+    const scopeId = workspace.scopes.filter((item) => item.project_id === projectId && item.expires_at_ms > Date.now()).sort((a, b) => b.revision - a.revision)[0]?.id
+    await postWorkspace('/api/distributed-scans', { ...body, project_id: projectId, scope_id: scopeId })
+    addActivity({ title: 'Distributed scan started', detail: `${body.mode} · ${body.network}`, tone: 'info' })
+  }
+
+  async function cancelDistributedScan(id: string) {
+    await postWorkspace(`/api/distributed-scans/${encodeURIComponent(id)}/cancel`, {})
+  }
+
   useEffect(() => {
     localStorage.setItem('reconclave.activity', JSON.stringify(activity))
   }, [activity])
@@ -470,6 +480,7 @@ function App() {
           <button className={view === 'findings' ? 'active' : ''} title="Findings" onClick={() => setView('findings')}><span>△</span><small>Risks</small></button>
           <button className={view === 'timeline' ? 'active' : ''} title="Timeline" onClick={() => setView('timeline')}><span>≋</span><small>Audit</small></button>
           <button className={view === 'fleet' ? 'active' : ''} title="Fleet" onClick={() => setView('fleet')}><span>▤</span><small>Fleet</small></button>
+          <button className={view === 'distributed' ? 'active' : ''} title="Distributed scanning" onClick={() => setView('distributed')}><span>⬡</span><small>Distrib</small></button>
         </nav>
         <div className="rail-foot"><div className="pulse-ring" /><small>RC/01</small></div>
       </aside>
@@ -547,7 +558,7 @@ function App() {
             </div>
           </div>
         </section>
-      </> : <WorkspaceViews view={view} workspace={workspace} nodes={state.nodes} projectId={projectId} onProject={setProjectId} onCreate={createProject} onInspect={inspectSelectedHosts} onCreateAutomation={createAutomation} onUpdateAutomation={updateAutomation} onDeleteAutomation={deleteAutomation} onCreateWorkflow={createWorkflow} onRunWorkflow={runWorkflow} onCancelWorkflow={cancelWorkflow} onUpdateWorkflow={updateWorkflow} onDeleteWorkflow={deleteWorkflow} onCreateScope={createScope} onImportFindings={importFindings} onCorrelateFindings={correlateFindings} onSetFindingStatus={setFindingStatus} onSetFindingSuppression={setFindingSuppression} onCreateRelease={createRelease} onCreateRollout={createRollout} onAdvanceRollout={advanceRollout} onRollbackRollout={rollbackRollout} />}</main>
+      </> : <WorkspaceViews view={view} workspace={workspace} nodes={state.nodes} projectId={projectId} onProject={setProjectId} onCreate={createProject} onInspect={inspectSelectedHosts} onCreateAutomation={createAutomation} onUpdateAutomation={updateAutomation} onDeleteAutomation={deleteAutomation} onCreateWorkflow={createWorkflow} onRunWorkflow={runWorkflow} onCancelWorkflow={cancelWorkflow} onUpdateWorkflow={updateWorkflow} onDeleteWorkflow={deleteWorkflow} onCreateScope={createScope} onImportFindings={importFindings} onCorrelateFindings={correlateFindings} onSetFindingStatus={setFindingStatus} onSetFindingSuppression={setFindingSuppression} onCreateRelease={createRelease} onCreateRollout={createRollout} onAdvanceRollout={advanceRollout} onRollbackRollout={rollbackRollout} onCreateDistributedScan={createDistributedScan} onCancelDistributedScan={cancelDistributedScan} />}</main>
       {scoutOpen && selected && <div className="modal-shade" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setScoutOpen(false) }}>
         <section className="scout-modal" role="dialog" aria-modal="true" aria-labelledby="scout-title">
           <div className="modal-head"><div><span className="kicker">SCOPED OPERATION</span><h2 id="scout-title">Configure Network Scout</h2><p>Provider: {selected.device_id}</p></div><button onClick={() => setScoutOpen(false)} aria-label="Close">×</button></div>

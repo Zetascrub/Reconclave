@@ -5,6 +5,8 @@ from __future__ import annotations
 import threading
 import time
 
+from adaptive_scheduler import active_lease_counts, select_node
+
 
 class WorkflowEngine:
     def __init__(self, coordinator, workspace, policy=None) -> None:
@@ -22,13 +24,18 @@ class WorkflowEngine:
         self.thread.join(timeout=2)
 
     @staticmethod
-    def _provider(step: dict, nodes: list[dict]) -> dict | None:
-        capable = [node for node in nodes if step["capability"] in node.get("capabilities", [])]
+    def _provider(step: dict, nodes: list[dict], active_leases: dict[str, int] | None = None) -> dict | None:
+        """An explicit preferred_node is always honoured as-is (an operator's deliberate
+        pin overrides any heuristic). Otherwise defers to adaptive_scheduler.select_node
+        (Phase 7) for capability/topology/load-aware selection instead of just "the first
+        ready node" -- the step's own arguments.network, when present, is the topology hint.
+        """
         preferred = step.get("preferred_node")
         if preferred:
-            return next((node for node in capable if node.get("device_id") == preferred), None)
-        ready = [node for node in capable if node.get("status") == "ready"]
-        return (ready or capable or [None])[0]
+            return next((node for node in nodes if node.get("device_id") == preferred
+                        and step["capability"] in node.get("capabilities", [])), None)
+        network = step.get("arguments", {}).get("network") if isinstance(step.get("arguments"), dict) else None
+        return select_node(nodes, step["capability"], network=network, active_leases=active_leases)
 
     def _poll_step(self, state: dict, provider: dict, trace_id: str = "") -> None:
         response = self.coordinator.invoke(provider["device_id"], "coordination.job.status",
@@ -70,6 +77,7 @@ class WorkflowEngine:
     def advance_once(self) -> bool:
         snapshot = self.workspace.snapshot()
         nodes = self.coordinator.state().get("nodes", [])
+        active_leases = active_lease_counts(snapshot)
         workflows = {item["id"]: item for item in snapshot.get("workflows", [])}
         for run in snapshot.get("workflow_runs", []):
             if run.get("status") not in ("queued", "running"):
@@ -117,7 +125,7 @@ class WorkflowEngine:
                 if ready:
                     definition = ready[0]
                     state = states[definition["id"]]
-                    provider = self._provider(definition, nodes)
+                    provider = self._provider(definition, nodes, active_leases)
                     if provider is not None:
                         try:
                             if self.policy is not None:

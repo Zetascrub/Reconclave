@@ -21,6 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from zeroconf import ServiceInfo, Zeroconf
 
+from adaptive_scheduler import DistributedScanEngine
 from coordinator import Coordinator
 from engagement_policy import TARGET_CAPABILITIES, TARGET_PREFIXES, EngagementPolicy
 from fleet_manager import FleetManager
@@ -537,6 +538,24 @@ class AppHandler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[:2] == ["api", "workflow-runs"] and parts[3] == "cancel":
                 self.send_json(200, self.server.workflows.cancel(urllib.parse.unquote(parts[2])))
                 return
+            if path == "/api/distributed-scans":
+                capability = str(body.get("capability", "net.discovery.scan"))
+                scope_id = str(body.get("scope_id", ""))
+                project_id = str(body.get("project_id", ""))
+                target_bearing = capability in TARGET_CAPABILITIES or capability.startswith(TARGET_PREFIXES)
+                # Mirrors /api/workflows/<id>/runs: reject at creation time with no valid
+                # scope rather than only discovering the gap deep inside a per-chunk
+                # dispatch attempt later.
+                if scope_id:
+                    self.server.policy.get_valid(scope_id, project_id)
+                elif target_bearing:
+                    raise PermissionError(
+                        "a signed engagement scope is required for a target-bearing distributed scan")
+                self.send_json(201, self.server.scheduler.create(body))
+                return
+            if len(parts) == 4 and parts[:2] == ["api", "distributed-scans"] and parts[3] == "cancel":
+                self.send_json(200, self.server.scheduler.cancel(urllib.parse.unquote(parts[2])))
+                return
             if len(parts) == 4 and parts[:2] == ["api", "fleet"] and parts[3] == "advance":
                 self.send_json(200, self.server.fleet.advance_rollout(urllib.parse.unquote(parts[2])))
                 return
@@ -675,13 +694,14 @@ class AppServer(ThreadingHTTPServer):
 
     def __init__(self, address: tuple[str, int], node: Node, coordinator: Coordinator,
                  workspace: WorkspaceStore, workflows: WorkflowEngine, policy: EngagementPolicy,
-                 fleet: FleetManager) -> None:
+                 fleet: FleetManager, scheduler: DistributedScanEngine) -> None:
         self.node = node
         self.coordinator = coordinator
         self.workspace = workspace
         self.workflows = workflows
         self.policy = policy
         self.fleet = fleet
+        self.scheduler = scheduler
         super().__init__(address, AppHandler)
 
 
@@ -734,11 +754,13 @@ def main() -> None:
     workflows = WorkflowEngine(coordinator, workspace, policy)
     fleet = FleetManager(coordinator, workspace, workspace.custody_key)
     fleet.reconcile_once()
-    server = AppServer(("0.0.0.0", args.port), node, coordinator, workspace, workflows, policy, fleet)
+    scheduler = DistributedScanEngine(coordinator, workspace, policy)
+    server = AppServer(("0.0.0.0", args.port), node, coordinator, workspace, workflows, policy, fleet, scheduler)
     automations = AutomationEngine(coordinator, workspace)
     automations.start()
     workflows.start()
     fleet.start()
+    scheduler.start()
     service = ServiceInfo(
         "_reconclave._tcp.local.", f"{args.node_id}._reconclave._tcp.local.",
         addresses=[socket.inet_aton(args.address)], port=args.port,

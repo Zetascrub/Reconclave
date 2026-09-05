@@ -406,6 +406,32 @@ class CoordinatorTests(unittest.TestCase):
                 "expires_at_ms": int(time.time() * 1000) + 60000})
             create_run(scanning, scope["id"])
 
+    def test_distributed_scan_creation_requires_signed_scope_for_target_bearing_capability(self):
+        # Mirrors the workflow-run test above for the same reject-at-creation-time
+        # boundary, now for POST /api/distributed-scans (desktop_app.py).
+        with tempfile.TemporaryDirectory() as directory:
+            base = pathlib.Path(directory)
+            workspace = desktop_module.WorkspaceStore(base / "workspace.json")
+            policy = desktop_module.EngagementPolicy(workspace, base / "scope.key", b"k" * 32)
+            project = workspace.create_project({"name": "Engagement"})
+
+            def create_scan(scope_id=""):
+                capability = "net.discovery.scan"
+                target_bearing = (capability in desktop_module.TARGET_CAPABILITIES or
+                                  capability.startswith(desktop_module.TARGET_PREFIXES))
+                if scope_id:
+                    policy.get_valid(scope_id, project["id"])
+                elif target_bearing:
+                    raise PermissionError(
+                        "a signed engagement scope is required for a target-bearing distributed scan")
+
+            with self.assertRaises(PermissionError):
+                create_scan()
+            scope = policy.create_scope({"project_id": project["id"],
+                "included_networks": ["192.0.2.0/24"], "capability_classes": ["discovery"],
+                "expires_at_ms": int(time.time() * 1000) + 60000})
+            create_scan(scope["id"])  # does not raise
+
     def test_host_inspection_rejects_unapproved_or_external_targets(self):
         with self.assertRaises(PermissionError):
             desktop_module.inspect_hosts("192.0.2.10", {"hosts": ["192.0.2.20"], "ports": [80]})
