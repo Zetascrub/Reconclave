@@ -38,6 +38,14 @@ DEFAULT_CPU_SECONDS = 120
 DEFAULT_MEMORY_BYTES = 512 * 1024 * 1024
 MAX_RETAINED_JOBS = 200
 _HOSTNAME_LABEL = re.compile(r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)$")
+# nmap's optional script_category argument is restricted to this fixed allowlist -
+# never a raw script name, and never a category (vuln, auth, exploit, intrusive,
+# dos, external) that probes for or acts on a weakness rather than just
+# enumerating what's there. Matches docs/platform-roadmap.md's tool-runner safety
+# contract: "Tools or flags that exploit, alter, persist on, evade, or disrupt a
+# target remain disabled unless a future approval policy explicitly permits that
+# exact operation."
+NMAP_SAFE_SCRIPT_CATEGORIES = ("default", "discovery", "safe")
 
 
 class ToolRunner:
@@ -45,10 +53,43 @@ class ToolRunner:
         "tool.nmap.services": {
             "executable": "nmap", "risk_class": "discovery", "timeout_seconds": 120,
             "max_targets": 32, "max_ports": 128, "output": "nmap-services/v1",
-            "flags": ["connect-scan", "no-scripts", "no-os-detection"],
+            "flags": ["connect-scan", "no-os-detection", "safe-script-categories-only"],
+            "argument_schema": {"hosts": "ipv4[1..32]", "ports": "integer[1..65535][1..128]",
+                                 "script_category": "enum[default,discovery,safe]?"},
+            "isolation": "bubblewrap-ro-root-v1",
+            "resource_limits": {"cpu_percent": DEFAULT_CPU_PERCENT, "memory_bytes": DEFAULT_MEMORY_BYTES},
+        },
+        "tool.masscan.services": {
+            "executable": "masscan", "risk_class": "discovery", "timeout_seconds": 120,
+            "max_targets": 32, "max_ports": 128, "output": "nmap-services/v1",
+            "flags": ["fixed-rate", "no-banners", "syn-scan"],
             "argument_schema": {"hosts": "ipv4[1..32]", "ports": "integer[1..65535][1..128]"},
             "isolation": "bubblewrap-ro-root-v1",
             "resource_limits": {"cpu_percent": DEFAULT_CPU_PERCENT, "memory_bytes": DEFAULT_MEMORY_BYTES},
+            # masscan sends raw SYN packets rather than using the kernel's TCP stack
+            # (there is no masscan equivalent of nmap's -sT connect scan), so unlike
+            # every other adapter here it needs CAP_NET_RAW at the binary itself:
+            # `sudo setcap cap_net_raw,cap_net_admin+eip $(command -v masscan)`.
+            # Bubblewrap isolation here (_sandbox_command) doesn't unshare the user
+            # namespace, so a file capability set on the host binary carries through
+            # unchanged; nothing in this codebase applies or checks it, and a missing
+            # capability surfaces as an ordinary failed-job stderr message, not a
+            # distinct error code. --rate is intentionally fixed, not an argument:
+            # masscan's entire differentiator is scan speed/scale, and this adapter
+            # deliberately declines to expose that knob.
+            "notes": "requires cap_net_raw,cap_net_admin on the masscan binary",
+        },
+        "tool.arpscan.sweep": {
+            "executable": "arp-scan", "risk_class": "discovery", "timeout_seconds": 30,
+            "output": "arp-scan/v1", "flags": ["local-segment-only"],
+            "argument_schema": {"interface": "enum[discovered]"},
+            "isolation": "bubblewrap-ro-root-v1",
+            "resource_limits": {"cpu_percent": DEFAULT_CPU_PERCENT, "memory_bytes": DEFAULT_MEMORY_BYTES},
+            # Also needs CAP_NET_RAW on the binary (raw ARP frames), same caveat as
+            # masscan above. No host/port targeting at all: arp-scan can only ever
+            # see its own attached L2 segment regardless of arguments, so there is no
+            # scope-containment question the way there is for nmap/masscan.
+            "notes": "requires cap_net_raw on the arp-scan binary",
         },
         "tool.dns.lookup": {
             "executable": "dig", "risk_class": "discovery", "timeout_seconds": 20,
@@ -368,26 +409,41 @@ class ToolRunner:
     # tool.nmap.services
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _validate_hosts_and_ports(arguments: dict, max_targets: int, max_ports: int) -> tuple[list[str], list[int]]:
+        """Shared bounds/type checking for the two IP/port-targeted scan adapters
+        (nmap, masscan) - kept in one place so both stay bound to the same rules
+        rather than drifting apart."""
+        raw_targets = arguments.get("hosts", [])
+        raw_ports = arguments.get("ports", [])
+        if not isinstance(raw_targets, list) or not 1 <= len(raw_targets) <= max_targets:
+            raise ValueError(f"hosts must contain 1-{max_targets} IP addresses")
+        if not isinstance(raw_ports, list) or not 1 <= len(raw_ports) <= max_ports:
+            raise ValueError(f"ports must contain 1-{max_ports} values")
+        targets = [str(ipaddress.ip_address(str(value))) for value in dict.fromkeys(raw_targets)]
+        ports = sorted({int(value) for value in raw_ports})
+        if any(not 1 <= port <= 65535 for port in ports):
+            raise ValueError("ports must be between 1 and 65535")
+        return targets, ports
+
     def nmap_services(self, arguments: dict) -> dict:
         manifest = self.MANIFESTS["tool.nmap.services"]
         executable = shutil.which(manifest["executable"])
         if executable is None:
             raise RuntimeError("nmap is not installed")
-        raw_targets = arguments.get("hosts", [])
-        raw_ports = arguments.get("ports", [])
-        if not isinstance(raw_targets, list) or not 1 <= len(raw_targets) <= manifest["max_targets"]:
-            raise ValueError("hosts must contain 1-32 IP addresses")
-        if not isinstance(raw_ports, list) or not 1 <= len(raw_ports) <= manifest["max_ports"]:
-            raise ValueError("ports must contain 1-128 values")
-        targets = [str(ipaddress.ip_address(str(value))) for value in dict.fromkeys(raw_targets)]
-        ports = sorted({int(value) for value in raw_ports})
-        if any(not 1 <= port <= 65535 for port in ports):
-            raise ValueError("ports must be between 1 and 65535")
+        targets, ports = self._validate_hosts_and_ports(arguments, manifest["max_targets"], manifest["max_ports"])
+        script_category = arguments.get("script_category")
+        script_args: list[str] = []
+        if script_category is not None:
+            script_category = str(script_category)
+            if script_category not in NMAP_SAFE_SCRIPT_CATEGORIES:
+                raise ValueError(f"script_category must be one of {NMAP_SAFE_SCRIPT_CATEGORIES}")
+            script_args = ["--script", script_category]
         sandbox = shutil.which("bwrap")
         if sandbox is None:
             raise RuntimeError("bubblewrap isolation is not installed")
         tool_command = [executable, "-n", "-Pn", "-sT", "--max-retries", "1", "--host-timeout", "30s",
-                   "-p", ",".join(map(str, ports)), "-oX", "-", "--", *targets]
+                   "-p", ",".join(map(str, ports)), *script_args, "-oX", "-", "--", *targets]
         command = self._sandbox_command(sandbox, tool_command)
         job_id = self._new_job_id("nmap")
         limits = manifest["resource_limits"]
@@ -398,7 +454,14 @@ class ToolRunner:
         return self.job_status({"job_id": job_id})
 
     @staticmethod
-    def _parse_nmap_xml(stdout: str, targets: list[str], ports: list[int], manifest: dict) -> dict:
+    def _parse_nmap_xml(stdout: str, targets: list[str], ports: list[int], manifest: dict,
+                        tool_name: str = "nmap") -> dict:
+        # Shared by tool.nmap.services and tool.masscan.services: masscan's -oX
+        # output is nmap-compatible XML (host/address/ports/port/state elements),
+        # and without --banners it has no <service> element either, matching
+        # nmap's own "unknown" fallback below - both adapters land in the same
+        # nmap-services/v1 result shape so vulnerability_analysis.extract_observations
+        # needs no tool-specific branch.
         root = ET.fromstring(stdout)
         hosts = []
         for host in root.findall("host"):
@@ -414,8 +477,34 @@ class ToolRunner:
                                      "protocol": port.get("protocol", "tcp"),
                                      "service": service.get("name", "unknown") if service is not None else "unknown"})
             hosts.append({"address": address.get("addr"), "services": services})
-        return {"schema": manifest["output"], "tool": "nmap", "hosts": hosts,
+        return {"schema": manifest["output"], "tool": tool_name, "hosts": hosts,
                 "targets": targets, "ports": ports}
+
+    # ------------------------------------------------------------------
+    # tool.masscan.services
+    # ------------------------------------------------------------------
+
+    def masscan_services(self, arguments: dict) -> dict:
+        manifest = self.MANIFESTS["tool.masscan.services"]
+        executable = shutil.which(manifest["executable"])
+        if executable is None:
+            raise RuntimeError("masscan is not installed")
+        targets, ports = self._validate_hosts_and_ports(arguments, manifest["max_targets"], manifest["max_ports"])
+        sandbox = shutil.which("bwrap")
+        if sandbox is None:
+            raise RuntimeError("bubblewrap isolation is not installed")
+        # --rate is fixed (see the manifest's "notes"); no --banners, so this stays
+        # a pure port-state scan like nmap's -sT above (no probe/banner traffic).
+        tool_command = [executable, "--rate", "100", "-p", ",".join(map(str, ports)),
+                        "-oX", "-", "--wait", "2", *targets]
+        command = self._sandbox_command(sandbox, tool_command)
+        job_id = self._new_job_id("masscan")
+        limits = manifest["resource_limits"]
+        ceiling = self._select_resource_ceiling(job_id, limits["cpu_percent"], limits["memory_bytes"])
+        self._start_job(job_id, "tool.masscan.services", ceiling["command_prefix"] + command,
+                        manifest["timeout_seconds"],
+                        lambda stdout: self._parse_nmap_xml(stdout, targets, ports, manifest, "masscan"), ceiling)
+        return self.job_status({"job_id": job_id})
 
     # ------------------------------------------------------------------
     # tool.dns.lookup
@@ -522,3 +611,51 @@ class ToolRunner:
             packets.append({"timestamp": f"{parts[0]} {parts[1]}", "summary": parts[2]})
         return {"schema": manifest["output"], "tool": "tcpdump", "interface": interface,
                 "requested_count": requested_count, "packets": packets}
+
+    # ------------------------------------------------------------------
+    # tool.arpscan.sweep
+    # ------------------------------------------------------------------
+
+    def arpscan_sweep(self, arguments: dict) -> dict:
+        manifest = self.MANIFESTS["tool.arpscan.sweep"]
+        executable = shutil.which(manifest["executable"])
+        if executable is None:
+            raise RuntimeError("arp-scan is not installed")
+        interfaces = {name for _, name in socket.if_nameindex()}
+        interface = str(arguments.get("interface", ""))
+        if interface not in interfaces:
+            raise ValueError(f"interface must be one of the host's discovered interfaces: {sorted(interfaces)}")
+        sandbox = shutil.which("bwrap")
+        if sandbox is None:
+            raise RuntimeError("bubblewrap isolation is not installed")
+        # --localnet sweeps the interface's own attached IPv4 subnet - the only
+        # targeting mode this adapter exposes, since arp-scan cannot see past its
+        # own L2 segment regardless of arguments. --plain drops the summary/banner
+        # lines so stdout is exactly one "ip\tmac\tvendor" line per responding host.
+        tool_command = [executable, "--interface", interface, "--localnet", "--plain", "--retry", "1"]
+        command = self._sandbox_command(sandbox, tool_command)
+        job_id = self._new_job_id("arpscan")
+        limits = manifest["resource_limits"]
+        ceiling = self._select_resource_ceiling(job_id, limits["cpu_percent"], limits["memory_bytes"])
+        self._start_job(job_id, "tool.arpscan.sweep", ceiling["command_prefix"] + command,
+                        manifest["timeout_seconds"],
+                        lambda stdout: self._parse_arpscan_lines(stdout, interface, manifest), ceiling)
+        return self.job_status({"job_id": job_id})
+
+    @staticmethod
+    def _parse_arpscan_lines(stdout: str, interface: str, manifest: dict) -> dict:
+        # --plain output is one line per responding host:
+        # "192.168.1.1\t00:11:22:33:44:55\tVendor Name Inc."
+        # The vendor field is free text from arp-scan's OUI database and may be
+        # empty (unknown OUI) or absent entirely for some entries.
+        hosts = []
+        for line in stdout.splitlines():
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 2:
+                continue
+            address, mac = fields[0].strip(), fields[1].strip()
+            if not address or not mac:
+                continue
+            vendor = fields[2].strip() if len(fields) > 2 else ""
+            hosts.append({"address": address, "mac": mac, "vendor": vendor})
+        return {"schema": manifest["output"], "tool": "arp-scan", "interface": interface, "hosts": hosts}

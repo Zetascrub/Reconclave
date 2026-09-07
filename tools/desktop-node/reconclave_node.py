@@ -41,18 +41,23 @@ EVIDENCE_REQUIRED_FIELDS = ("job_id", "source_node", "target", "timestamp_ms", "
 AUTH_REQUIRED_CAPABILITIES = {
     "net.discovery.scan", "storage.evidence.write", "coordination.job.cancel",
     "tool.nmap.services", "tool.dns.lookup", "tool.tcpdump.capture", "tool.job.cancel",
+    "tool.masscan.services", "tool.arpscan.sweep",
 }
 AUTH_TAG_BYTES = 16
 RECENT_NONCES_PER_SOURCE = 16
-# net.discovery.scan and tool.nmap.services both take explicit IP/network targets
-# that a signed scope delegation can bind to. tool.dns.lookup targets hostnames
-# (not IP networks) and tool.tcpdump.capture's target is an optional local filter,
-# so neither fits the current IP-subnet scope-delegation contract; they still
-# require the execution-key auth above. See platform-roadmap notes for follow-up.
-SCOPE_REQUIRED_CAPABILITIES = {"net.discovery.scan", "tool.nmap.services"}
+# net.discovery.scan, tool.nmap.services, and tool.masscan.services all take
+# explicit IP/network targets that a signed scope delegation can bind to.
+# tool.dns.lookup targets hostnames (not IP networks), tool.tcpdump.capture's
+# target is an optional local filter, and tool.arpscan.sweep can only ever reach
+# its own attached L2 segment regardless of arguments - none of the three fit the
+# current IP-subnet scope-delegation contract, or (for arp-scan) need to; they
+# still require the execution-key auth above. See platform-roadmap notes for
+# follow-up on dns/tcpdump.
+SCOPE_REQUIRED_CAPABILITIES = {"net.discovery.scan", "tool.nmap.services", "tool.masscan.services"}
 # Packaged tool adapters that use the shared async job registry in ToolRunner
 # rather than a bespoke per-capability job slot like net.discovery.scan's.
-TOOL_JOB_CAPABILITIES = ("tool.nmap.services", "tool.dns.lookup", "tool.tcpdump.capture")
+TOOL_JOB_CAPABILITIES = ("tool.nmap.services", "tool.dns.lookup", "tool.tcpdump.capture",
+                         "tool.masscan.services", "tool.arpscan.sweep")
 
 
 def canonical_digest(value: object) -> str:
@@ -94,16 +99,104 @@ def local_ip() -> str:
         probe.close()
 
 
+class ArmedClock:
+    """Persists a standing scope grant's elapsed "armed" time across restarts.
+
+    A standing grant (EngagementPolicy.mint_standing_grant) carries a duration,
+    not an absolute expiry, because a device may have no live coordinator - and,
+    on an ESP32 target, no wall clock at all - to check back in against. This
+    class tracks elapsed time itself: a monotonic clock in memory, checkpointed
+    to a small JSON state file periodically and on clean shutdown so elapsed
+    time survives a restart.
+
+    Fail-closed by design: a missing, unreadable, or grant_id-mismatched state
+    file is treated as fully elapsed - elapsed_ms() reports one millisecond past
+    duration_ms - rather than freshly armed. A device that lost its bookkeeping
+    must never silently re-arm itself; it stays disarmed until an operator
+    mints and provisions a fresh grant.
+    """
+
+    CHECKPOINT_INTERVAL_SECONDS = 60.0
+
+    def __init__(self, state_path: str, grant_id: str) -> None:
+        self.state_path = state_path
+        self.grant_id = grant_id
+        self.lock = threading.Lock()
+        self._elapsed_ms, self._known_good = self._load()
+        self._checkpoint_monotonic = time.monotonic()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _load(self) -> tuple[int, bool]:
+        try:
+            with open(self.state_path, encoding="utf-8") as handle:
+                state = json.load(handle)
+            if state.get("grant_id") != self.grant_id:
+                return 0, False
+            return max(0, int(state["elapsed_ms_at_checkpoint"])), True
+        except (OSError, ValueError, KeyError, TypeError):
+            return 0, False
+
+    def elapsed_ms(self, duration_ms: int) -> int:
+        with self.lock:
+            if not self._known_good:
+                return int(duration_ms) + 1
+            return self._elapsed_ms + int((time.monotonic() - self._checkpoint_monotonic) * 1000)
+
+    def checkpoint(self) -> None:
+        with self.lock:
+            if not self._known_good:
+                return
+            now = time.monotonic()
+            self._elapsed_ms += int((now - self._checkpoint_monotonic) * 1000)
+            self._checkpoint_monotonic = now
+            try:
+                tmp_path = f"{self.state_path}.tmp"
+                with open(tmp_path, "w", encoding="utf-8") as handle:
+                    json.dump({"grant_id": self.grant_id, "elapsed_ms_at_checkpoint": self._elapsed_ms}, handle)
+                os.replace(tmp_path, self.state_path)
+            except OSError:
+                pass  # best-effort; the in-memory value is still correct for elapsed_ms()
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True, name="reconclave-armed-clock")
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self.CHECKPOINT_INTERVAL_SECONDS):
+            self.checkpoint()
+
+    def close(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+        self.checkpoint()
+
+
 class Node:
     def __init__(self, node_id: str, name: str, address: str, port: int,
                  enable_network_scan: bool = False, evidence_dir: str | None = None,
                  evidence_key: str | None = None, execution_key: str | None = None,
-                 enable_tools: bool = False) -> None:
+                 enable_tools: bool = False, standing_grant: dict | None = None,
+                 standing_grant_state_path: str | None = None) -> None:
         self.node_id = node_id
         self.name = name
         self.address = address
         self.port = port
         self.started = time.monotonic()
+        # Foundation only (platform-roadmap.md's deferred "local automation engine"
+        # phase is what will actually check this): a provisioned standing grant plus
+        # its persisted elapsed-time tracker, so a future capability handler running
+        # with no live coordinator has EngagementPolicy.verify_standing_grant and a
+        # real elapsed_ms() to check it against. Omitting both leaves every existing
+        # code path unchanged.
+        self.standing_grant = standing_grant
+        self.armed_clock: ArmedClock | None = None
+        if standing_grant is not None and standing_grant_state_path is not None:
+            self.armed_clock = ArmedClock(standing_grant_state_path, str(standing_grant.get("grant_id", "")))
+            self.armed_clock.start()
         self.boot_nonce = secrets.token_hex(8)
         self.sequence = 0
         self.lock = threading.Lock()
@@ -147,6 +240,8 @@ class Node:
                 "tool.nmap.services": self.tool_runner.nmap_services,
                 "tool.dns.lookup": self.tool_runner.dns_lookup,
                 "tool.tcpdump.capture": self.tool_runner.tcpdump_capture,
+                "tool.masscan.services": self.tool_runner.masscan_services,
+                "tool.arpscan.sweep": self.tool_runner.arpscan_sweep,
             }
             for capability, handler in tool_handlers.items():
                 if availability.get(capability, {}).get("available"):
@@ -219,6 +314,12 @@ class Node:
                 raise CapabilityError("UNAUTHENTICATED", "replayed request")
             seen.append(nonce)
         return key, nonce
+
+    def close(self) -> None:
+        """Best-effort cleanup on shutdown - checkpoints the armed clock (if any)
+        so elapsed standing-grant time isn't lost on a clean restart."""
+        if self.armed_clock is not None:
+            self.armed_clock.close()
 
     def system_info(self, _arguments: dict) -> dict:
         return {
@@ -734,6 +835,7 @@ def main() -> None:
         zeroconf.unregister_service(service)
         zeroconf.close()
         server.server_close()
+        node.close()
         print("Node stopped")
 
 

@@ -1,5 +1,6 @@
 import os
 import signal
+import socket
 import subprocess
 import shutil
 import tempfile
@@ -14,6 +15,22 @@ from tool_runner import ToolRunner
 NMAP_XML = """<nmaprun><host><address addr="192.168.1.10" addrtype="ipv4"/><ports>
 <port protocol="tcp" portid="443"><state state="open"/><service name="https"/></port>
 </ports></host></nmaprun>"""
+
+# NOT captured from a real run: masscan is not installed in this dev environment
+# (see docs/platform-roadmap.md's Phase 3 checklist). This follows masscan's
+# documented -oX output shape, which is nmap-compatible (host/address/ports/port/
+# state elements) and - without --banners, which this adapter never passes - has
+# no <service> element, matching nmap's own "unknown" fallback. Treat
+# _parse_nmap_xml's masscan path as unverified until run against the real binary.
+MASSCAN_XML = """<?xml version="1.0"?><nmaprun scanner="masscan"><host>
+<address addr="192.168.1.20" addrtype="ipv4"/><ports>
+<port protocol="tcp" portid="22"><state state="open" reason="syn-ack"/></port>
+</ports></host></nmaprun>"""
+
+# NOT captured from a real run: arp-scan is not installed in this dev environment
+# either. Follows arp-scan's documented --plain output: one "ip\tmac\tvendor" line
+# per responding host, vendor sometimes empty for an unrecognised OUI.
+ARPSCAN_PLAIN = "192.168.1.1\t00:11:22:33:44:55\tDell Inc.\n192.168.1.5\t66:77:88:99:aa:bb\t\n"
 
 # Captured from a real local run of `dig +noall +answer +time=1 +tries=1 <TYPE> <name>`
 # against example.com/github.com (see the adapter's docstring for the exact command
@@ -95,6 +112,28 @@ class ToolRunnerTests(unittest.TestCase):
         self.assertTrue(popen.call_args.kwargs.get("start_new_session"))
 
     @mock.patch("tool_runner.shutil.which", return_value="/usr/bin/nmap")
+    @mock.patch.object(ToolRunner, "_select_resource_ceiling", return_value=_noop_ceiling())
+    @mock.patch("tool_runner.subprocess.Popen")
+    def test_nmap_script_category_is_allowlisted_and_appended_only_when_present(self, popen, _ceiling, _which):
+        popen.return_value = _immediate_process(NMAP_XML)
+        runner = ToolRunner()
+        started = runner.nmap_services({"hosts": ["192.168.1.10"], "ports": [443],
+                                        "script_category": "discovery"})
+        self._wait_for_completion(runner, started["job_id"])
+        command = popen.call_args.args[0]
+        self.assertIn("--script", command)
+        self.assertEqual(command[command.index("--script") + 1], "discovery")
+
+    @mock.patch("tool_runner.shutil.which", return_value="/usr/bin/nmap")
+    def test_nmap_rejects_unsafe_or_unknown_script_categories_before_starting_any_job(self, _which):
+        runner = ToolRunner()
+        for bad_category in ("vuln", "exploit", "intrusive", "*", "http-slowloris"):
+            with self.assertRaises(ValueError):
+                runner.nmap_services({"hosts": ["192.168.1.10"], "ports": [443],
+                                      "script_category": bad_category})
+        self.assertEqual(runner.jobs, {})
+
+    @mock.patch("tool_runner.shutil.which", return_value="/usr/bin/nmap")
     def test_adapter_rejects_hostnames_and_unbounded_ports_before_starting_any_job(self, _which):
         runner = ToolRunner()
         with self.assertRaises(ValueError):
@@ -128,6 +167,8 @@ class ToolRunnerTests(unittest.TestCase):
         self.assertTrue(availability["tool.nmap.services"]["available"])
         self.assertFalse(availability["tool.dns.lookup"]["available"])
         self.assertFalse(availability["tool.tcpdump.capture"]["available"])
+        self.assertFalse(availability["tool.masscan.services"]["available"])
+        self.assertFalse(availability["tool.arpscan.sweep"]["available"])
 
     # ------------------------------------------------------------------
     # Cancellation
@@ -452,6 +493,98 @@ class ToolRunnerTests(unittest.TestCase):
         job = self._wait_for_completion(runner, started["job_id"], timeout=15.0)
         self.assertEqual(job["job_status"], "failed")
         self.assertTrue(job["error"])
+
+    # ------------------------------------------------------------------
+    # tool.masscan.services - fixture-based only; masscan is not installed in
+    # this dev environment (see MASSCAN_XML's comment and the real-binary test
+    # below, which self-skips until it is).
+    # ------------------------------------------------------------------
+
+    @mock.patch("tool_runner.shutil.which", return_value="/usr/bin/masscan")
+    @mock.patch.object(ToolRunner, "_select_resource_ceiling", return_value=_noop_ceiling())
+    @mock.patch("tool_runner.subprocess.Popen")
+    def test_masscan_adapter_uses_a_fixed_non_operator_settable_rate(self, popen, _ceiling, _which):
+        popen.return_value = _immediate_process(MASSCAN_XML)
+        runner = ToolRunner()
+        started = runner.masscan_services({"hosts": ["192.168.1.20"], "ports": [22]})
+        self.assertTrue(started["job_id"].startswith("tool-masscan-"))
+        job = self._wait_for_completion(runner, started["job_id"])
+        command = popen.call_args.args[0]
+        self.assertIn("--rate", command)
+        self.assertEqual(command[command.index("--rate") + 1], "100")
+        self.assertNotIn("--banners", command)
+        self.assertEqual(job["job_status"], "complete")
+        self.assertEqual(job["result"]["tool"], "masscan")
+        self.assertEqual(job["result"]["hosts"][0]["services"][0]["port"], 22)
+
+    @mock.patch("tool_runner.shutil.which", return_value="/usr/bin/masscan")
+    def test_masscan_adapter_rejects_the_same_bounds_as_nmap(self, _which):
+        runner = ToolRunner()
+        with self.assertRaises(ValueError):
+            runner.masscan_services({"hosts": ["example.com"], "ports": [443]})
+        with self.assertRaises(ValueError):
+            runner.masscan_services({"hosts": ["192.168.1.20"], "ports": list(range(1, 130))})
+        self.assertEqual(runner.jobs, {})
+
+    def test_masscan_command_construction_against_real_binary_if_installed(self):
+        # Self-skips until masscan/bwrap are actually installed - see the module
+        # docstring's fixture caveat above. Once installed, this exercises the
+        # real permission story too: masscan needs CAP_NET_RAW on its own binary
+        # (the manifest's "notes"), which a fresh install won't have yet, so this
+        # is expected to land in the normal "failed" job path, not "complete",
+        # until an operator runs the documented setcap step.
+        if shutil.which("masscan") is None or shutil.which("bwrap") is None:
+            self.skipTest("masscan/bwrap not installed on this host")
+        runner = ToolRunner()
+        started = runner.masscan_services({"hosts": ["127.0.0.1"], "ports": [22]})
+        job = self._wait_for_completion(runner, started["job_id"], timeout=15.0)
+        self.assertIn(job["job_status"], ("complete", "failed"))
+
+    # ------------------------------------------------------------------
+    # tool.arpscan.sweep - fixture-based only; arp-scan is not installed in this
+    # dev environment either.
+    # ------------------------------------------------------------------
+
+    @mock.patch("tool_runner.socket.if_nameindex", return_value=[(1, "lo"), (2, "eth0")])
+    @mock.patch("tool_runner.shutil.which", return_value="/usr/bin/arp-scan")
+    @mock.patch.object(ToolRunner, "_select_resource_ceiling", return_value=_noop_ceiling())
+    @mock.patch("tool_runner.subprocess.Popen")
+    def test_arpscan_adapter_builds_local_segment_command_and_parses_plain_output(
+            self, popen, _ceiling, _which, _interfaces):
+        popen.return_value = _immediate_process(ARPSCAN_PLAIN)
+        runner = ToolRunner()
+        started = runner.arpscan_sweep({"interface": "eth0"})
+        self.assertTrue(started["job_id"].startswith("tool-arpscan-"))
+        job = self._wait_for_completion(runner, started["job_id"])
+        command = popen.call_args.args[0]
+        self.assertIn("--localnet", command)
+        self.assertIn("--plain", command)
+        self.assertEqual(command[command.index("--interface") + 1], "eth0")
+        self.assertEqual(job["job_status"], "complete")
+        hosts = job["result"]["hosts"]
+        self.assertEqual(len(hosts), 2)
+        self.assertEqual(hosts[0], {"address": "192.168.1.1", "mac": "00:11:22:33:44:55", "vendor": "Dell Inc."})
+        self.assertEqual(hosts[1]["vendor"], "")
+
+    @mock.patch("tool_runner.socket.if_nameindex", return_value=[(1, "lo")])
+    @mock.patch("tool_runner.shutil.which", return_value="/usr/bin/arp-scan")
+    def test_arpscan_rejects_unknown_interface_before_starting_any_job(self, _which, _interfaces):
+        runner = ToolRunner()
+        with self.assertRaises(ValueError):
+            runner.arpscan_sweep({"interface": "eth9"})
+        self.assertEqual(runner.jobs, {})
+
+    def test_arpscan_command_construction_against_real_binary_if_installed(self):
+        # Self-skips until arp-scan/bwrap are actually installed - same caveat and
+        # expected-permission-failure story as masscan's real-binary test above
+        # (arp-scan also needs CAP_NET_RAW on its own binary to send raw frames).
+        if shutil.which("arp-scan") is None or shutil.which("bwrap") is None:
+            self.skipTest("arp-scan/bwrap not installed on this host")
+        runner = ToolRunner()
+        interface = next((name for _, name in socket.if_nameindex() if name != "lo"), "lo")
+        started = runner.arpscan_sweep({"interface": interface})
+        job = self._wait_for_completion(runner, started["job_id"], timeout=15.0)
+        self.assertIn(job["job_status"], ("complete", "failed"))
 
 
 if __name__ == "__main__":

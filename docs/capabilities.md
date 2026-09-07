@@ -29,6 +29,8 @@ new capability contract.
 | `coordination.job.cancel` | All job-executing nodes | Assessment | Reserved |
 | `storage.evidence.write` | Cardputer, desktop | Local evidence storage | Reserved |
 | `tool.nmap.services` | Desktop | Assessment + network scope | Implemented |
+| `tool.masscan.services` | Desktop | Assessment + network scope | Implemented (unverified — see below) |
+| `tool.arpscan.sweep` | Desktop | Assessment (local L2 segment only) | Implemented (unverified — see below) |
 | `tool.dns.lookup` | Desktop | Assessment (not signed-scope enforced — see below) | Implemented |
 | `tool.tcpdump.capture` | Desktop | Assessment (not signed-scope enforced — see below) | Implemented |
 | `tool.job.status` | Desktop | Read-only, non-sensitive | Implemented |
@@ -47,18 +49,19 @@ remote execution until their permission and scope enforcement is implemented.
 
 ## Packaged tool capabilities
 
-`tool.nmap.services`, `tool.dns.lookup`, and `tool.tcpdump.capture` are safe,
-schema-bound adapters (`tools/desktop-node/tool_runner.py`) matching the
-tool-runner safety contract in `docs/platform-roadmap.md`: fixed shell-free
-argument construction, bounded inputs, Bubblewrap process/PID isolation, and
-a best-effort CPU/memory ceiling (a cgroup v2 leaf, a user `systemd-run
---scope`, or POSIX rlimits, tried in that order — each job reports back which
-mechanism, if any, actually applied). Each is advertised only when its
-executable and Bubblewrap are both discovered installed, matching the "tool
-availability is discovered, never assumed" principle.
+`tool.nmap.services`, `tool.masscan.services`, `tool.arpscan.sweep`,
+`tool.dns.lookup`, and `tool.tcpdump.capture` are safe, schema-bound adapters
+(`tools/desktop-node/tool_runner.py`) matching the tool-runner safety contract
+in `docs/platform-roadmap.md`: fixed shell-free argument construction, bounded
+inputs, Bubblewrap process/PID isolation, and a best-effort CPU/memory ceiling
+(a cgroup v2 leaf, a user `systemd-run --scope`, or POSIX rlimits, tried in
+that order — each job reports back which mechanism, if any, actually applied).
+Each is advertised only when its executable and Bubblewrap are both discovered
+installed, matching the "tool availability is discovered, never assumed"
+principle.
 
 Unlike `net.discovery.scan`, tool execution is asynchronous: invoking any of
-the three returns a job descriptor immediately (`job_id`, `job_status`, and a
+these returns a job descriptor immediately (`job_id`, `job_status`, and a
 `resource_ceiling` object) rather than blocking until the tool exits. Poll
 with `tool.job.status` (`{"job_id": ...}`) and stop a running job with
 `tool.job.cancel` — idempotent, like `coordination.job.cancel` — which
@@ -67,14 +70,53 @@ SIGKILL) rather than trusting the tool to honour a signal. This is a
 separate, shared job registry from `net.discovery.scan`'s single-slot scan
 state, so a node can run a tool job and a discovery scan concurrently.
 
+`tool.nmap.services` accepts an optional `script_category` argument
+restricted to a fixed allowlist (`default`, `discovery`, `safe`) — never a raw
+script name, and never a category (`vuln`, `auth`, `exploit`, `intrusive`,
+`dos`, `external`) that probes for or acts on a weakness rather than
+enumerating what's there. Omitting it keeps the adapter's original
+connect-scan-only behaviour exactly as before.
+
+`tool.masscan.services` shares its `hosts`/`ports` argument schema and bounds
+with `tool.nmap.services` and produces the same `nmap-services/v1` result
+shape (masscan's `-oX` output is nmap-compatible XML), so
+`vulnerability_analysis.extract_observations` needs no tool-specific branch to
+correlate its findings. Unlike nmap's `-sT` connect scan, masscan sends raw
+SYN packets and has no kernel-connect equivalent, so it needs `CAP_NET_RAW`
+(and `CAP_NET_ADMIN`) on the `masscan` binary itself — Bubblewrap isolation
+here does not unshare the user namespace, so a file capability set on the host
+binary (`sudo setcap cap_net_raw,cap_net_admin+eip $(command -v masscan)`)
+carries through unchanged into the sandbox; without it, a scan simply lands in
+the normal "failed" job state with the permission error as `error` text.
+`--rate` is fixed at a conservative value and is not an operator-settable
+argument — masscan's entire differentiator is scan speed/scale, and this
+adapter deliberately declines to expose that knob. `tool.arpscan.sweep` takes
+only an `interface` (reusing `tool.tcpdump.capture`'s discovered-interface
+validation) and sweeps that interface's own attached subnet; it needs the same
+`CAP_NET_RAW` treatment as masscan, and has no host/port targeting at all,
+since arp-scan can never see past its own attached L2 segment regardless of
+arguments.
+
+**Verification status:** `tool.masscan.services` and `tool.arpscan.sweep`
+were built against each tool's documented output format only — neither
+`masscan` nor `arp-scan` was installed in the reference dev environment at the
+time these adapters were written (unlike `tool.nmap.services`/`tool.dns.lookup`/
+`tool.tcpdump.capture`, which were all validated against their real binaries).
+Treat both as unverified until run for real, matching the "no real capture to
+validate against" caveat already carried by `tool.tcpdump.capture`'s own
+output parser.
+
 `tool.dns.lookup` and `tool.tcpdump.capture` target hostnames and an optional
-local capture filter respectively, neither of which fits the IP-subnet-only
-scope-delegation contract described above under "Delegated scope tokens".
-They are execution-key authenticated like every other capability in this
-section, but — unlike `net.discovery.scan`/`tool.nmap.services` — accepting a
-request does not additionally require or verify a delegated scope token yet
-(`reconclave_node.py`'s `SCOPE_REQUIRED_CAPABILITIES`). See the "Non-IP scope
-delegation" entry in `docs/platform-roadmap.md`'s open design decisions.
+local capture filter respectively, and `tool.arpscan.sweep` can only ever
+reach its own attached L2 segment regardless of arguments — none of the three
+fit the IP-subnet-only scope-delegation contract described above under
+"Delegated scope tokens", or (for arp-scan) need to. All three are
+execution-key authenticated like every other capability in this section, but
+— unlike `net.discovery.scan`/`tool.nmap.services`/`tool.masscan.services` —
+accepting a request does not additionally require or verify a delegated scope
+token (`reconclave_node.py`'s `SCOPE_REQUIRED_CAPABILITIES`). See the "Non-IP
+scope delegation" entry in `docs/platform-roadmap.md`'s open design decisions
+for `tool.dns.lookup`/`tool.tcpdump.capture`.
 
 ## Authenticated capabilities
 
@@ -150,6 +192,63 @@ have no wall-clock time, so they check `issued_at_ms`/`expires_at_ms` only for
 internal consistency (a valid, ≤5-minute lifetime) rather than against the current
 time; the desktop coordinator's own key custody and the request's boot-nonce-bound
 replay protection are what keeps an old token from being usefully replayed there.
+
+### Standing scope grants (offline autonomy)
+
+Delegated scope tokens above are minted at dispatch time by a live coordinator and
+hard-capped at five minutes (`EngagementPolicy.delegate`'s `min(scope["expires_at_ms"],
+now + 300000)`), because that coordinator is assumed to be reachable for every
+individual request. A device meant to operate autonomously with no coordinator
+present — the deferred "local automation engine" phase in
+`docs/platform-roadmap.md` — needs a different primitive: a **standing grant**,
+minted once (typically at provisioning) via `EngagementPolicy.mint_standing_grant`
+and verified locally by the device itself, with no live signer available
+afterward.
+
+```json
+{
+  "grant_id": "grant-...", "scope_id": "scope-...", "project_id": "PR001193",
+  "destination_node": "implant-1", "included_networks": ["192.168.8.0/24"],
+  "excluded_networks": [], "capability_classes": ["discovery"],
+  "duration_ms": 259200000, "minted_at_ms": 1787688000000,
+  "nonce": "...", "tag": "hmac-sha256 hexdigest, 64 hex chars, untruncated"
+}
+```
+
+Unlike a delegated scope token, a standing grant carries a **duration**, not an
+absolute `expires_at_ms` — a freshly provisioned device may have no wall clock at
+all (matching how ESP32 providers already treat delegated-token timestamps as
+internal-consistency-only, not wall time, per "Delegated scope tokens" above).
+`mint_standing_grant` requires the requested `capability_classes` to be a subset
+of the underlying scope's own approved classes, and caps `duration_ms` at the
+smaller of 7 days or the scope's own remaining validity — an offline grant must
+not outlive the engagement scope it was derived from, even though nothing will
+be present to re-check that scope once the device goes offline. The grant is
+signed with the same delegation-key domain and full, untruncated
+HMAC-SHA256 hex-digest convention as `_scope_delegation` tokens.
+
+Verification (`EngagementPolicy.verify_standing_grant`) is a `staticmethod`
+taking the raw key bytes rather than reading an instance's own
+`self.delegation_key`, so a provider holding only its shared execution-key
+bytes — not a live `EngagementPolicy`/`WorkspaceStore` — can check a grant on its
+own, the same way `ReconclaveNode.verify_scope_delegation` independently
+re-derives a delegated token's HMAC rather than calling back into
+`EngagementPolicy`. It is also deliberately clock-agnostic: the caller supplies
+`elapsed_ms` from whatever local clock it has. On the desktop provider today
+that is `ArmedClock` (`tools/desktop-node/reconclave_node.py`) — a small
+persisted counter, checkpointed to disk periodically and on clean shutdown, so
+elapsed time survives a restart. `ArmedClock` is **fail-closed**: a missing,
+unreadable, or `grant_id`-mismatched state file reports elapsed time one
+millisecond past the grant's `duration_ms` (i.e. already expired) rather than
+zero — a device that lost its bookkeeping must never silently re-arm itself.
+
+As of this writing, this is a **foundation-only primitive**: nothing in the
+codebase yet calls `verify_standing_grant` from a capability handler.
+`Node.__init__` accepts optional `standing_grant`/`standing_grant_state_path`
+arguments purely to construct and start the `ArmedClock`; no autonomous
+execution is wired to it. The consumer — a local, no-coordinator-required
+automation engine on a Linux companion node — is a deferred phase in
+`docs/platform-roadmap.md`.
 
 ## Fleet OTA delivery
 

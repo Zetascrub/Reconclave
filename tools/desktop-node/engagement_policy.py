@@ -16,6 +16,13 @@ TARGET_CAPABILITIES = {"net.discovery.scan", "net.tcp.inspect"}
 TARGET_PREFIXES = ("web.", "tls.", "dns.", "vuln.", "capture.", "tool.")
 ALLOWED_CLASSES = {"inventory", "discovery", "vulnerability", "capture"}
 
+# A standing grant is a *duration*, not an absolute expiry: it is minted once at
+# provisioning time for a device that may run with no live coordinator (and, on an
+# ESP32 target, no wall clock at all) to check back in against afterward. The
+# device tracks its own elapsed "armed" time locally and compares it against this
+# ceiling - see verify_standing_grant below and reconclave_node.py's ArmedClock.
+STANDING_GRANT_MAX_DURATION_MS = 7 * 86400000
+
 
 class EngagementPolicy:
     def __init__(self, workspace, key_path: pathlib.Path, delegation_key: bytes | None = None) -> None:
@@ -138,3 +145,83 @@ class EngagementPolicy:
         token = delegated_arguments.get("_scope_delegation", {})
         if isinstance(token, dict):
             self.workspace.release_dispatch_lease(str(token.get("lease_id", "")))
+
+    # ------------------------------------------------------------------
+    # Standing scope grants: offline authorization for a device that may run
+    # with no live coordinator to sign a per-request delegation against (see
+    # delegate() above, which is dispatch-time and caps at five minutes). A
+    # standing grant is minted once - typically at provisioning - and verified
+    # locally by the device itself for as long as its own elapsed-time
+    # bookkeeping says it remains within duration_ms. It is not, by itself, a
+    # capability grant: nothing in this codebase yet calls verify_standing_grant
+    # from a capability handler. It exists so that a future local automation
+    # engine (docs/platform-roadmap.md's deferred "local automation engine"
+    # phase) has a signed, bounded, self-contained authorization primitive to
+    # check against.
+    # ------------------------------------------------------------------
+
+    def mint_standing_grant(self, scope_id: str, project_id: str, capability_classes: list[str],
+                            duration_ms: int, destination_node: str) -> dict:
+        scope = self.get_valid(scope_id, project_id)
+        if self.delegation_key is None:
+            raise PermissionError("scope delegation key is not configured")
+        classes = sorted(set(map(str, capability_classes)))
+        if not classes or not set(classes) <= set(scope["capability_classes"]):
+            raise PermissionError("standing grant capability_classes exceed the scope's own approval")
+        now = int(time.time() * 1000)
+        # Never outlives the scope it was minted from, even though nothing will be
+        # there to re-check that scope once the device goes offline - an offline
+        # grant derived from a scope that itself expires sooner has no business
+        # outliving it.
+        ceiling = min(int(duration_ms), STANDING_GRANT_MAX_DURATION_MS, scope["expires_at_ms"] - now)
+        if ceiling <= 0:
+            raise PermissionError("standing grant duration must be positive and within scope validity")
+        grant = {"grant_id": f"grant-{uuid.uuid4().hex[:16]}", "scope_id": scope["id"],
+                 "project_id": project_id, "destination_node": destination_node,
+                 "included_networks": scope["included_networks"],
+                 "excluded_networks": scope["excluded_networks"],
+                 "capability_classes": classes, "duration_ms": ceiling,
+                 "minted_at_ms": now, "nonce": uuid.uuid4().hex}
+        # Full, untruncated hex digest - the same convention docs/capabilities.md
+        # documents for _scope_delegation tokens, and distinct from the 16-byte
+        # truncated tag used for ordinary request/response auth.
+        grant["tag"] = hmac.new(self.delegation_key, self._canonical(grant), hashlib.sha256).hexdigest()
+        self.workspace.add_audit_event({"project_id": project_id, "action": "standing_grant.minted",
+                                        "subject_id": grant["grant_id"], "outcome": destination_node})
+        return grant
+
+    @staticmethod
+    def verify_standing_grant(delegation_key: bytes | None, grant: dict, capability: str,
+                              elapsed_ms: int) -> None:
+        """Raises PermissionError on any failure; returns None on success.
+
+        A staticmethod taking the raw key rather than an instance method reading
+        self.delegation_key, so a provider with only its shared execution-key
+        bytes - not a live EngagementPolicy/WorkspaceStore instance - can verify a
+        grant on its own, exactly the way reconclave_node.py's
+        Node.verify_scope_delegation independently re-checks a delegated scope
+        token's HMAC using only self.execution_key rather than calling back into
+        this class.
+
+        Deliberately clock-agnostic: elapsed_ms is supplied by the caller from
+        whatever local clock it has (wall-clock time on a Linux companion node
+        today; a persisted uptime counter on a future ESP32 port, matching how
+        delegated scope tokens are already checked "for internal consistency"
+        rather than wall time on ESP32 providers - see docs/capabilities.md's
+        "Delegated scope tokens" section). This function never reads the system
+        clock itself, so the same logic is reusable everywhere.
+        """
+        if not isinstance(grant, dict):
+            raise PermissionError("a standing grant is required")
+        if delegation_key is None:
+            raise PermissionError("scope delegation key is not configured")
+        unsigned = {key: value for key, value in grant.items() if key != "tag"}
+        if not hmac.compare_digest(str(grant.get("tag", "")),
+                                   hmac.new(delegation_key, EngagementPolicy._canonical(unsigned), hashlib.sha256).hexdigest()):
+            raise PermissionError("standing grant signature is invalid")
+        capability_class = ("vulnerability" if capability.startswith("vuln.") else
+                            "capture" if capability.startswith("capture.") else "discovery")
+        if capability_class not in grant.get("capability_classes", []):
+            raise PermissionError(f"standing grant does not cover {capability_class} operations")
+        if int(elapsed_ms) > int(grant.get("duration_ms", 0)):
+            raise PermissionError("standing grant has expired")

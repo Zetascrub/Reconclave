@@ -58,6 +58,9 @@ capabilities require a separate, explicit approval policy and are disabled by de
 | 10 | Collaboration and reporting | In progress (operators/roles/approvals done; notes, comparisons, ATT&CK/STIX/OCSF mappings, report exports remain) | Operators/roles/approvals, notes, comparisons, ATT&CK/STIX/OCSF mappings, report exports |
 | 11 | Secure relay/gateway nodes | Planned | Explicit routes, per-hop authority, store-and-forward, route visibility, emergency stop |
 | 12 | Edge AI and local analysis tier | Planned, gated on K230 hardware | K230 vision/OCR/classification capabilities, local AI analysis gateway (Ollama/llama.cpp/approved provider), RAG over security knowledge, enforced per-engagement AI privacy policy |
+| 13 | SMB/AD enumeration adapter | Planned | `enum4linux-ng`-based single-host, read-only-flags-only adapter on the existing packaged-tool-runner pattern |
+| 14 | Local (no-coordinator) automation engine | Planned, depends on Phase 1's standing scope grants | Standalone playbook engine on a Linux companion node, mirroring `poe-p4`'s NVS rule loop, gated on a provisioned standing grant rather than a live coordinator |
+| 15 | Responder-class credential capture | Planned, blocked on an explicit post-exploitation approval policy decision (see Product decisions) | Analyze-only (zero poisoned replies) capture first; active poisoning deferred further behind its own opt-in |
 
 ## Phase 2 workflow and campaign engine
 
@@ -115,6 +118,26 @@ capabilities require a separate, explicit approval policy and are disabled by de
   ceiling the coordinator enforces when minting tokens) rather than against the current time;
   absolute token freshness still relies on the outer request's boot-nonce-bound replay protection.
   Their existing attached-network bounds remain an additional, independent constraint regardless.
+- [x] Add a standing (offline) scope grant primitive alongside the existing dispatch-time delegated
+  scope token: `EngagementPolicy.mint_standing_grant`/`verify_standing_grant`
+  (`tools/desktop-node/engagement_policy.py`), a signed, duration-bounded (7-day ceiling, further
+  capped by the underlying scope's own remaining validity) grant meant for a device that may run
+  with no live coordinator to sign a per-request delegation against — the motivating case is a
+  future "drop it on a network" implant. Unlike `delegate()`'s 5-minute dispatch lease, a standing
+  grant is minted once (at provisioning) and self-verified locally: `verify_standing_grant` is a
+  `staticmethod` taking the raw key bytes rather than reading an instance's own
+  `self.delegation_key`, so a provider holding only its shared execution-key bytes can check a
+  grant without a live `EngagementPolicy`/`WorkspaceStore`, mirroring how
+  `ReconclaveNode.verify_scope_delegation` already independently re-derives a delegated token's
+  HMAC. It is also clock-agnostic (`elapsed_ms` is supplied by the caller) so the same check
+  works with real wall-clock time today and a persisted uptime counter on a future ESP32 port
+  without changing. `tools/desktop-node/reconclave_node.py`'s new `ArmedClock` tracks that elapsed
+  time today, checkpointed to disk periodically and on clean shutdown, and is fail-closed: a
+  missing, unreadable, or grant-mismatched state file reports elapsed time already past the
+  grant's duration, never freshly armed. See `docs/capabilities.md`'s "Standing scope grants
+  (offline autonomy)" section for the full shape. **This is a foundation-only primitive** —
+  nothing yet calls `verify_standing_grant` from a capability handler; the consumer is Phase 14's
+  local automation engine below.
 
 ## Phase 3 packaged runners
 
@@ -139,6 +162,67 @@ capabilities require a separate, explicit approval policy and are disabled by de
   best-effort across three mechanisms tried in order — a cgroup v2 leaf, a user `systemd-run --scope`,
   then POSIX rlimits — and each job reports back which mechanism (if any) actually applied rather than
   assuming one worked.
+- [x] Broaden the packaged discovery adapters toward a standard pentest kit, on the same safe/bounded
+  contract as above: `tool.masscan.services` (masscan, `hosts`/`ports` schema and bounds reused
+  directly from `tool.nmap.services`, fixed non-operator-settable `--rate` since masscan's whole
+  differentiator is scan speed/scale, same `nmap-services/v1` result shape so
+  `vulnerability_analysis.extract_observations` needs no tool-specific branch) and
+  `tool.arpscan.sweep` (arp-scan, `interface`-only argument reusing `tool.tcpdump.capture`'s
+  discovered-interface validation, no host/port targeting since arp-scan can never see past its
+  own attached L2 segment). `tool.nmap.services` also gained an optional `script_category`
+  argument restricted to a fixed allowlist (`default`, `discovery`, `safe`) — never a raw script
+  name, and never a category that probes for or acts on a weakness (`vuln`, `auth`, `exploit`,
+  `intrusive`, `dos`, `external`), per this doc's tool-runner safety contract below. `masscan` and
+  `arp-scan` are intended to be installed via `dnf` specifically so these two adapters can be
+  checked against real output the same way `tool.nmap.services`/`tool.dns.lookup` were, but as of
+  this writing that install hasn't completed in the reference dev environment (needs interactive
+  `sudo`) — **both tools also need `CAP_NET_RAW` (masscan additionally `CAP_NET_ADMIN`) on their
+  own binaries to send raw packets, which a fresh install won't have either**
+  (`sudo setcap cap_net_raw,cap_net_admin+eip $(command -v masscan)` /
+  `sudo setcap cap_net_raw+ep $(command -v arp-scan)`). Until both the install and the setcap step
+  are done and a real scan is run, treat both adapters' argument validation/command construction as
+  implemented but their output parsing as unverified, same caveat `tool.tcpdump.capture`'s parser
+  already carries. `tool.masscan.services` is scope-delegation
+  enforced like `tool.nmap.services` (real host/port targeting, same containment story);
+  `tool.arpscan.sweep` is not, for the same reason `tool.dns.lookup`/`tool.tcpdump.capture` aren't
+  — nothing to contain. **Deliberately not built yet, and not on this list:** an SMB/AD
+  enumeration adapter, a local no-coordinator automation engine to run any of this autonomously,
+  and Responder-class credential capture — see Phases 13-15 below for why each is a distinct,
+  separately-sequenced phase rather than an extension of this one.
+
+## Phase 13 SMB/AD enumeration adapter
+
+Deferred, not yet started. A single-host, read-only-flags-only adapter wrapping `enum4linux-ng`
+(actively maintained, JSON-output-capable) rather than legacy `enum4linux` or `crackmapexec` —
+their much larger blast radius (arbitrary auth/exec modules) is a poor fit for this tool-runner's
+"safe adapters only" contract. Same manifest/async-job/Bubblewrap pattern as Phase 3's adapters.
+
+## Phase 14 local (no-coordinator) automation engine
+
+Deferred, not yet started; depends on Phase 1's standing scope grants. `poe-p4`'s NVS-resident
+automation rules already run playbooks with no coordinator present, but that engine is ESP32-only
+and its two playbooks (`system_snapshot`, `network_scout`) are lightweight native capabilities —
+nothing that needs a real OS. This phase is the equivalent for a Linux companion node: a
+standalone `LocalAutomationEngine`, consuming a provisioned standing grant
+(`EngagementPolicy.verify_standing_grant` + `ArmedClock`, Phase 1) to authorize itself with no live
+coordinator, and wiring new playbooks (starting with `network_recon`, using Phase 3's
+masscan/arp-scan/nmap adapters; later `smb_enum` once Phase 13 exists) to the desktop node's own
+`tool_runner`. Extends `workspace_store.py`'s playbook allowlist. This is the actual "drop it on a
+network and it acts autonomously" implant behaviour; none of it runs on the P4 itself, which stays
+limited to its existing native ESP-IDF capabilities.
+
+## Phase 15 Responder-class credential capture
+
+Deferred, not yet started; blocked on an explicit approval-policy decision, not on engineering
+readiness. `capture.credential.harvest` would wrap the real upstream Responder tool in its own
+Bubblewrap profile, analyze-only (`-A`, zero poisoned replies) first — active LLMNR/NBT-NS/mDNS
+poisoning is a further, separately-gated opt-in. This is the concrete capability the "Product
+decisions" section's post-exploitation approval policy was left open for: "Post-exploitation
+approval policy is deferred until a specific post-exploitation capability is actually proposed...
+Post-exploitation stays disabled by default in the meantime." That decision needs to be revisited
+specifically for this capability — a captured-credential evidence path (redacted from ordinary
+findings views, requiring the evidence key to view) also needs designing — before any
+implementation starts.
 
 ## Phase 4 fleet management and signed OTA
 

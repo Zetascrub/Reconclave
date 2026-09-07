@@ -66,6 +66,41 @@ class EngagementPolicyTests(unittest.TestCase):
             policy.delegate(scope["id"], project["id"], "tool.nmap.services",
                             {"hosts": ["192.168.10.3"], "ports": [443]}, "node-1")
 
+    def test_standing_grant_round_trip_and_expiry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, project, policy = self.make_policy(directory, b"k" * 32)
+            scope = self.create_scope(policy, project)
+            grant = policy.mint_standing_grant(scope["id"], project["id"], ["discovery"],
+                                               60000, "implant-1")
+            EngagementPolicy.verify_standing_grant(b"k" * 32, grant, "tool.masscan.services", elapsed_ms=30000)
+            with self.assertRaisesRegex(PermissionError, "expired"):
+                EngagementPolicy.verify_standing_grant(b"k" * 32, grant, "tool.masscan.services", elapsed_ms=60001)
+
+    def test_standing_grant_rejects_tampering_and_uncovered_class(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, project, policy = self.make_policy(directory, b"k" * 32)
+            scope = self.create_scope(policy, project)
+            grant = policy.mint_standing_grant(scope["id"], project["id"], ["discovery"],
+                                               60000, "implant-1")
+            tampered = {**grant, "capability_classes": ["discovery", "capture"]}
+            with self.assertRaisesRegex(PermissionError, "signature"):
+                EngagementPolicy.verify_standing_grant(b"k" * 32, tampered, "tool.masscan.services", elapsed_ms=0)
+            with self.assertRaisesRegex(PermissionError, "does not cover"):
+                EngagementPolicy.verify_standing_grant(b"k" * 32, grant, "capture.credential.harvest", elapsed_ms=0)
+
+    def test_standing_grant_cannot_exceed_scope_approval_or_duration_cap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, project, policy = self.make_policy(directory, b"k" * 32)
+            scope = self.create_scope(policy, project)
+            with self.assertRaisesRegex(PermissionError, "exceed the scope"):
+                policy.mint_standing_grant(scope["id"], project["id"], ["capture"], 1000, "implant-1")
+            # duration_ms is silently capped, not rejected, when it exceeds the
+            # 7-day ceiling or the scope's own remaining validity (whichever is
+            # smaller) - the scope above expires in 60s.
+            grant = policy.mint_standing_grant(scope["id"], project["id"], ["discovery"],
+                                               999 * 86400000, "implant-1")
+            self.assertLessEqual(grant["duration_ms"], 60000)
+
 
 if __name__ == "__main__":
     unittest.main()

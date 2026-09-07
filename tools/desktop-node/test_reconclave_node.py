@@ -284,5 +284,36 @@ class DesktopNodeTests(unittest.TestCase):
             self.assertFalse(cancel_response["payload"]["result"]["cancelled"])
 
 
+class ArmedClockTests(unittest.TestCase):
+    def test_checkpoint_and_reload_preserves_elapsed_time(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = str(pathlib.Path(directory) / "standing_grant_state.json")
+            clock = node_module.ArmedClock(state_path, "grant-1")
+            time.sleep(0.05)
+            clock.checkpoint()
+            elapsed_before_reload = clock.elapsed_ms(duration_ms=60000)
+            self.assertGreaterEqual(elapsed_before_reload, 50)
+
+            reloaded = node_module.ArmedClock(state_path, "grant-1")
+            elapsed_after_reload = reloaded.elapsed_ms(duration_ms=60000)
+            self.assertGreaterEqual(elapsed_after_reload, elapsed_before_reload)
+
+    def test_missing_or_mismatched_state_is_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing_path = str(pathlib.Path(directory) / "does-not-exist.json")
+            clock = node_module.ArmedClock(missing_path, "grant-1")
+            self.assertEqual(clock.elapsed_ms(duration_ms=60000), 60001)
+
+            state_path = str(pathlib.Path(directory) / "standing_grant_state.json")
+            node_module.ArmedClock(state_path, "grant-1").checkpoint()
+            mismatched = node_module.ArmedClock(state_path, "grant-2")
+            self.assertEqual(mismatched.elapsed_ms(duration_ms=60000), 60001)
+
+            with open(state_path, "w", encoding="utf-8") as handle:
+                handle.write("not json")
+            corrupt = node_module.ArmedClock(state_path, "grant-1")
+            self.assertEqual(corrupt.elapsed_ms(duration_ms=60000), 60001)
+
+
 if __name__ == "__main__":
     unittest.main()
