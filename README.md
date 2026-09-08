@@ -1,131 +1,216 @@
+<div align="center">
+
+<img src="devices/cardputer-adv/assets/zeta-title-source.png" alt="Zeta, the Reconclave mascot, wearing cyan goggles" width="180">
+
 # Reconclave
 
-**Development preview — source-first release preparation.** Hardware coverage
-and production security work remain in progress. See [release signing](docs/releasing.md),
-[security policy](SECURITY.md) and [contributing](CONTRIBUTING.md).
+**A desktop hub. A handheld console. A cooperating fleet.**
 
-Reconclave is a platform for coordinating **authorised** security assessment
-work across a desktop coordinator and a fleet of purpose-built ESP32 devices.
-It is the successor to Ghostwire: the Cardputer ADV, Unit PoE-P4, and (once
-available) a K230 vision node act as cooperating nodes rather than one
-tightly coupled product.
+Coordinate authorised security assessments, observe signals and keep evidence together.
 
-> Only use Reconclave on systems and networks you own or are explicitly
-> authorised to assess.
+[![CI](https://github.com/Zetascrub/Reconclave/actions/workflows/ci.yml/badge.svg)](https://github.com/Zetascrub/Reconclave/actions/workflows/ci.yml)
+[![Code licence: MIT](https://img.shields.io/badge/code-MIT-00cdd7?style=flat-square)](LICENSE)
+[![Status: Development preview](https://img.shields.io/badge/status-development_preview-ffaa1c?style=flat-square)](#project-status)
 
-## Architecture at a glance
+[Get started](#get-started) · [Explore the fleet](#explore-the-fleet) · [Features](#what-you-can-do) · [Documentation](#documentation) · [Contribute](CONTRIBUTING.md)
 
-The desktop coordinator is the permanent hub: it holds signed engagement
-scopes, dispatches workflows, and owns evidence custody. Devices are
-capability-rich nodes, not dumb sensors — each announces itself over mDNS and
-advertises the capabilities it supports (`system.info`, `net.discovery.scan`,
-etc.). Protected coordinator-to-node requests use JSON envelopes authenticated
-with per-peer HMAC keys and bound to a boot nonce to resist replay. Discovery
-and transport encryption have different boundaries; see the security policy.
-Nothing is master/slave: a K230 node, once added, is just another capable
-node rather than a required brain for the fleet.
+</div>
 
-## Components
+---
 
-| Component | What it is |
-|---|---|
-| [`tools/desktop-node/`](tools/desktop-node/README.md) | The permanent coordinator: web UI, workflow engine, fleet management, evidence store |
-| [`devices/poe-p4/`](devices/poe-p4/) | ESP-IDF (C) firmware for the M5Stack Unit PoE-P4 — an Ethernet-attached node |
-| [`devices/cardputer-adv/`](devices/cardputer-adv/) | PlatformIO/Arduino (C++) firmware for the M5Stack Cardputer ADV — a handheld node/console |
+Reconclave brings a desktop coordinator and purpose-built ESP32 devices into one
+assessment workflow. Plan and review work on the desktop, use the Cardputer ADV
+in the field, and delegate supported tasks to connected nodes. Each device
+advertises its capabilities so the coordinator can work with the fleet that is
+actually available.
 
-## Requirements
+The successor to Ghostwire, Reconclave is designed around cooperating nodes.
+The desktop is the permanent hub; additional devices extend what the fleet can do.
 
-- Python 3.11+ and Node 22 for the desktop coordinator and its web UI
-- ESP-IDF v5.4.x to build/flash `devices/poe-p4/`
-- PlatformIO to build/flash `devices/cardputer-adv/`
-- CMake and a C++17 toolchain for the shared protocol library and its tests
+> [!NOTE]
+> **Development preview.** Features and hardware validation are still evolving.
+> Start with the [project status](#project-status) and each device's guide before deploying.
+>
+> Use Reconclave only on systems and networks you own or are explicitly authorised to assess.
 
-## Features
+## Explore the fleet
 
-- **Signed engagement scopes** — coordinator assessment workflows validate
-  operator-authorised, expiring scopes; scope enforcement remains a security
-  property to test across every execution path.
-- **Workflow engine** — durable, retryable DAG workflows across nodes, with a
-  drag-and-drop visual builder alongside the JSON form.
-- **Adaptive distributed scheduling** — jobs are sharded and dispatched across
-  the fleet by capability, load, and topology, with failover and consensus
-  scanning across multiple vantage points.
-- **Fleet management** — health/inventory tracking, config drift detection,
-  and staged OTA rollout with rollback orchestration. Offline publisher
-  signatures are available separately; hardware Secure Boot is not enabled.
-- **Evidence pipeline** — content-addressed, chain-of-custody evidence with
-  AES-256-GCM at-rest encryption on both the coordinator and supported devices.
-- **Vulnerability analysis** — offline normalisation, correlation, and
-  confidence scoring, including Nessus/NASL import.
-- **Operators, roles, and approvals** — local accounts with maker-checker
-  approval for sensitive actions.
-- **Live operations timeline** — a searchable, correlated audit history across
-  campaigns, jobs, nodes, and evidence.
-- **Capability SDK** — packaged tool runners with signed manifests, schemas,
-  and risk classes; availability is discovered per node, never assumed.
+| | Role | Explore |
+| :-- | :-- | :-- |
+| **Desktop coordinator** | Web interface, projects, workflows, fleet management and evidence custody. | [Desktop guide](tools/desktop-node/README.md) |
+| **Cardputer ADV** | Portable console with network discovery, Wi-Fi/BLE observation, NFC and sub-GHz tools. | [Cardputer guide](devices/cardputer-adv/README.md) |
+| **Unit PoE-P4** | Ethernet-attached execution node for network discovery, connectivity checks and automation. | [PoE-P4 guide](devices/poe-p4/README.md) |
+| **K230 · planned** | Future vision and edge-AI node; not required for the current fleet. | [K230 notes](devices/k230/README.md) |
 
-Implementation and validation vary by component. Native and desktop tests,
-web builds and Cardputer compilation run in CI; they do not establish complete
-hardware interoperability or a production security audit. K230, production
-transport and hardware-enforced boot trust remain future work. See the
-[roadmap](docs/platform-roadmap.md) and [firmware review](docs/cardputer-firmware-review.md)
-for implementation notes and known limitations.
+```mermaid
+flowchart LR
+    Desktop["Desktop coordinator<br/>Plan · dispatch · review"]
+    Cardputer["Cardputer ADV<br/>Field console · observation"]
+    P4["Unit PoE-P4<br/>Ethernet · execution"]
+    Evidence[("Evidence & project history")]
+    Desktop <--> Cardputer
+    Desktop <--> P4
+    Cardputer <--> P4
+    Desktop --> Evidence
+    style Desktop fill:#0e222e,stroke:#00cdd7,color:#fff2d7
+    style Cardputer fill:#0e222e,stroke:#00cdd7,color:#fff2d7
+    style P4 fill:#0e222e,stroke:#00cdd7,color:#fff2d7
+    style Evidence fill:#0e222e,stroke:#ffaa1c,color:#fff2d7
+```
 
-## How to use it
+Nodes announce themselves over mDNS and expose supported capabilities through the
+Reconclave protocol. Protected requests use provisioned per-peer HMAC keys and
+boot-session binding. Discovery, authentication and transport encryption have
+different boundaries—see the [trust architecture](docs/trust-architecture.md).
 
-The quickest way to get the coordinator running:
+## What you can do
+
+### Plan, coordinate and review
+
+| Area | Capabilities |
+| :-- | :-- |
+| **Scoped assessment** | Operator-authorised, expiring engagement scopes for coordinator assessment workflows. |
+| **Workflows** | Durable, retryable task graphs, with a visual workflow builder and JSON configuration. |
+| **Distributed execution** | Scheduling by capability, load and topology, with failover and multiple observation points. |
+| **Fleet operations** | Health and inventory, configuration drift, staged OTA rollout and rollback orchestration. |
+| **Evidence** | Project-linked observations, content-addressed storage, custody records and at-rest encryption on supported paths. |
+| **Analysis** | Offline vulnerability normalisation, correlation and confidence scoring, including Nessus/NASL import. |
+| **Team controls** | Local operator accounts, roles, approvals and a searchable operations timeline. |
+| **Extensibility** | Packaged tool runners with manifests, schemas and risk classes; availability follows installed capabilities. |
+
+### Take the Cardputer into the field
+
+- **Observe nearby networks:** Wi-Fi discovery, channel analysis and BLE discovery.
+- **Inspect NFC tags:** discover NFC-A/B/F/V identifiers and view supported Type 2 text/URI content.
+- **Write and emulate NDEF:** write text/URLs to supported formatted tags, or present virtual NFC-A/F tags. Reuse messages from microSD presets.
+- **Watch sub-GHz activity:** receive-only signal history, adjustable thresholds, activity percentages and CSV exports with the CC1101 cap.
+- **Keep controls close:** offline field mode, evidence exports, selectable themes and the mascot-inspired **Zeta Mascot** palette.
+
+The [Cardputer guide](devices/cardputer-adv/README.md) covers accessory requirements,
+key controls and exact tag compatibility. The RF display measures activity at a
+selected frequency; it is not a swept spectrum analyser or packet decoder.
+
+## Get started
+
+### 1. Prepare your environment
+
+| Component | Requirements |
+| :-- | :-- |
+| Desktop coordinator | Python **3.11+**, Node.js **22**, npm and Python virtualenv support |
+| Cardputer firmware | PlatformIO; versions are specified in [platformio.ini](devices/cardputer-adv/platformio.ini) |
+| PoE-P4 firmware | ESP-IDF **5.4.2**; follow the [device setup](devices/poe-p4/README.md) |
+| Shared native tests | CMake and a C++17 toolchain |
+
+### 2. Start the desktop
+
+From the repository root, on a host with Bash:
 
 ```sh
 ./start-desktop.sh
 ```
 
-This creates the Python virtualenv and installs web dependencies on first
-run, rebuilds the web UI only when its source has changed, then starts
-`desktop_app.py --mode both`. Any arguments are passed straight through, e.g.
-`./start-desktop.sh --enable-network-scan --evidence-dir ./evidence`. Then
-open <http://127.0.0.1:8767>. See the [desktop node guide](tools/desktop-node/README.md)
-for the full set of options, including environment-based secrets.
+Open **[127.0.0.1:8767](http://127.0.0.1:8767)** in your browser.
 
-Build and test the shared protocol library:
+The launcher creates the Python environment and installs web dependencies on
+first run, builds the interface when needed, then starts the coordinator in
+`both` mode. Additional arguments are passed through to the desktop application.
+See the [desktop guide](tools/desktop-node/README.md) for credentials, optional
+assessment adapters and network-scan configuration.
+
+### 3. Provision before building devices
+
+Generate private trust headers **before** compiling or flashing. Replace these
+synthetic examples with your actual fleet identities:
+
+```sh
+python3 tools/provision_fleet.py \
+  --desktop-id rc-desktop-example \
+  --p4-id rc-p4-example \
+  --cardputer-id rc-adv-example
+```
+
+Follow the [trust guide](docs/trust-architecture.md) to obtain matching identities,
+then build and flash using the [Cardputer](devices/cardputer-adv/README.md) or
+[PoE-P4](devices/poe-p4/README.md) instructions. Re-running provisioning with the
+same IDs preserves keys; rotation is an intentional fleet-wide operation.
+
+> [!IMPORTANT]
+> Generated trust headers and the fleet store are private deployment material.
+> Firmware compiled with them contains deployment keys and must not be shared
+> as a public download. See [release signing and packaging](docs/releasing.md).
+
+## Project status
+
+**A development preview, with automated checks and ongoing hardware validation.**
+
+| Validation | Coverage |
+| :-- | :-- |
+| **GitHub CI** | Native tests, desktop Python tests, release/provisioning tests, frontend build, Cardputer compilation and secret scanning. |
+| **Hardware** | Feature-specific checks and limitations are recorded in the device guides and [Cardputer review](docs/cardputer-firmware-review.md). Compilation does not establish interoperability. |
+| **Release signing** | Detached Ed25519 signatures verify artifact bytes and metadata through the release CLI. Devices do not enforce these publisher manifests. |
+| **Still ahead** | K230 integration, production encrypted transport, hardware-enforced boot trust and broader hardware coverage. |
+
+Secure Boot is **not enabled** by the release tools. Existing fleet authentication
+and OTA checks are separate from publisher signatures. Scope enforcement and
+other security properties require validation across execution paths; the test
+suite is not a complete security audit.
+
+[Delivery roadmap →](docs/platform-roadmap.md) · [Security policy →](SECURITY.md) · [Release guide →](docs/releasing.md)
+
+## Documentation
+
+| I want to… | Read |
+| :-- | :-- |
+| Understand the system | [Architecture](docs/architecture.md) |
+| Run the desktop coordinator | [Desktop guide](tools/desktop-node/README.md) |
+| Build or use a device | [Cardputer ADV](devices/cardputer-adv/README.md) · [PoE-P4](devices/poe-p4/README.md) |
+| Understand requests and capabilities | [Wire protocol](docs/protocol.md) · [Capability reference](docs/capabilities.md) |
+| Manage identities and keys | [Fleet trust](docs/trust-architecture.md) |
+| Prepare and verify a release | [Release signing](docs/releasing.md) |
+| Work on the interface | [UI design](docs/ui-design.md) |
+| Find planned work | [Platform roadmap](docs/platform-roadmap.md) |
+| Report a vulnerability privately | [Security policy](SECURITY.md) |
+
+<details>
+<summary><strong>Run the shared native tests</strong></summary>
 
 ```sh
 cmake -S . -B build
-cmake --build build
+cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-Before building or flashing a device, generate its private trust headers from
-the repository root. Replace these synthetic IDs with your actual fleet IDs:
+The [contribution guide](CONTRIBUTING.md) lists the desktop, web and release-tool
+checks, together with expectations for documenting hardware validation.
 
-```sh
-python3 tools/provision_fleet.py --desktop-id rc-desktop-example \
-  --p4-id rc-p4-example --cardputer-id rc-adv-example
-```
+</details>
 
-Follow the [trust guide](docs/trust-architecture.md) to obtain matching device
-identities. Then follow the device's README/build instructions. The generated
-headers and fleet store are private deployment material; do not commit them or
-redistribute firmware compiled with them. Re-running with the same IDs preserves
-keys; rotation is an intentional fleet-wide operation.
+## Contributing
 
-Devices announce themselves over mDNS (`_reconclave._tcp`) and appear
-automatically in the coordinator's live roster.
+Bug reports, documentation improvements and focused contributions are welcome.
+Include the affected commit, your device/toolchain and reproducible steps.
+For larger changes, discuss the scope first.
 
-## Further reading
+**Keep keys, private assessment data and provisioned firmware out of issues and
+pull requests.** Suspected vulnerabilities should follow [SECURITY.md](SECURITY.md).
 
-- [docs/architecture.md](docs/architecture.md) — system architecture
-- [docs/protocol.md](docs/protocol.md) — wire protocol
-- [docs/trust-architecture.md](docs/trust-architecture.md) — fleet provisioning, identities, key rotation
-- [docs/ui-design.md](docs/ui-design.md) — shared embedded interface style guide
-- [docs/capabilities.md](docs/capabilities.md) — capability reference
+[Read the contribution guide →](CONTRIBUTING.md)
 
-## Public release status
+## Licence & artwork
 
-Code and documentation are available under the [MIT licence](LICENSE), except
-for third-party material under its own terms. The mascot artwork and generated
-image data are **not MIT-licensed**; their rights are reserved under
-[the artwork terms](ARTWORK_LICENSE.md). A fork that redistributes those assets
-needs separate permission or replacement artwork.
+**Code and documentation:** [MIT](LICENSE), except third-party material under its
+own terms. See the [dependency notices](THIRD_PARTY_NOTICES.md).
 
-The repository is being prepared for public viewing. See
-[release preparation](docs/releasing.md) and [third-party notices](THIRD_PARTY_NOTICES.md).
+**Zeta mascot, branding and generated image data:** rights reserved under
+[ARTWORK_LICENSE.md](ARTWORK_LICENSE.md). They are **not covered by the MIT
+licence**. Redistributing those assets requires separate permission or
+replacement artwork.
+
+---
+
+<div align="center">
+
+<strong>Reconclave</strong><br>
+Plan on the desktop. Observe in the field. Keep the evidence together.
+
+</div>
