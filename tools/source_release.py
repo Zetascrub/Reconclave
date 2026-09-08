@@ -14,12 +14,14 @@ def forbidden(path: str) -> bool:
     p = PurePosixPath(path)
     if p.name.startswith('.env') and not p.name.endswith('.example'):
         return True
-    if p.name == 'generated_trust.h' or p.suffix in ('.bin', '.elf', '.key'):
+    if p.name == 'generated_trust.h' or p.suffix.lower() in ('.bin', '.elf', '.key', '.pcap', '.pcapng', '.sqlite', '.sqlite3', '.db', '.log', '.p12', '.pfx'):
         return True
-    if p.suffix == '.pem' and not (path.startswith('release/keys/') and p.name.endswith('.pub.pem')):
+    if p.name in ('id_rsa', 'id_ed25519', '.DS_Store', 'Thumbs.db'):
+        return True
+    if p.suffix.lower() == '.pem' and not (path.startswith('release/keys/') and p.name.endswith('.pub.pem')):
         return True
     return any(part in {'evidence', '.reconclave-data', '.reconclave-provisioning',
-                        '.reconclave-signing', '.reconclave-releases', '.pio', 'node_modules'} for part in p.parts)
+                        '.reconclave-signing', '.reconclave-releases', '.pio', 'node_modules', '.ssh', '.aws'} for part in p.parts)
 
 
 def git(*args):

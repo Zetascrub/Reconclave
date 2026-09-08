@@ -90,6 +90,24 @@ The [Cardputer guide](devices/cardputer-adv/README.md) covers accessory requirem
 key controls and exact tag compatibility. The RF display measures activity at a
 selected frequency; it is not a swept spectrum analyser or packet decoder.
 
+## Your fleet, your keys
+
+Reconclave ships as **source, not preconfigured firmware**. Each owner generates
+private trust keys for their own fleet and compiles locally. There is no shared
+community command key: another person's independently provisioned fleet cannot
+use its keys to authenticate commands to yours.
+
+| Material | Where it belongs |
+| :-- | :-- |
+| Source and public release-verification key | This repository |
+| Your fleet trust store and generated headers | Your private local deployment |
+| Firmware compiled with your fleet keys | Your devices and private backups |
+| Publisher signing private key | The maintainer's private signing environment |
+
+GitHub CI uses disposable test keys only to verify compilation. It does not
+publish firmware downloads. Fleet authentication is separate from publisher
+signing, and it does not hide discovery announcements or encrypt HTTP traffic.
+
 ## Get started
 
 ### 1. Prepare your environment
@@ -158,6 +176,8 @@ suite is not a complete security audit.
 [Delivery roadmap →](docs/platform-roadmap.md) · [Security policy →](SECURITY.md) · [Release guide →](docs/releasing.md)
 
 ## Documentation
+
+[Browse the documentation index →](docs/README.md)
 
 | I want to… | Read |
 | :-- | :-- |

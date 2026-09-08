@@ -9,12 +9,21 @@ Use systems you own or are authorised to assess. Report vulnerabilities using
 credentials, generated trust headers, provisioned firmware or assessment data.
 Use synthetic test identities and targets.
 
+## Keep contributions public-safe
+
+Use synthetic examples for captures and test identities. Local keys, firmware
+binaries, evidence, packet captures, databases and logs are excluded from normal
+source changes. CI also rejects those paths if they are force-added. If a test
+needs a fixture of a blocked type, discuss a narrow, reviewed exception instead
+of weakening the repository-wide checks.
+
 ## Checks
 
 ```sh
 python3 -m venv .venv
 .venv/bin/pip install -r tools/desktop-node/requirements.txt
 .venv/bin/python -m unittest discover -s tools -p 'test_*.py'
+python3 tools/check_public_tree.py
 (cd tools/desktop-node && ../../.venv/bin/python -m unittest discover -p 'test_*.py')
 cmake -S . -B build
 cmake --build build --parallel

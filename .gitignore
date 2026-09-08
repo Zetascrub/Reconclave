@@ -30,3 +30,17 @@ devices/cardputer-adv/src/generated_trust.h
 *.elf
 /.reconclave-releases/
 /.reconclave-signing/
+
+# Local captures, databases, logs and OS metadata.
+*.pcap
+*.pcapng
+*.sqlite
+*.sqlite3
+*.db
+*.log
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+.DS_Store
+Thumbs.db

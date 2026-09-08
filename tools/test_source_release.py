@@ -10,7 +10,9 @@ class SourcePolicyTests(unittest.TestCase):
     def test_private_paths_blocked(self):
         for path in ('.env', 'app/.env.production', 'devices/a/generated_trust.h',
                      'release/firmware.bin', 'release/firmware.elf', 'private.pem',
-                     'app/evidence/capture.jsonl', '.reconclave-provisioning/fleet.json'):
+                     'app/evidence/capture.jsonl', '.reconclave-provisioning/fleet.json',
+                     'session.pcapng', 'workspace.sqlite3', 'debug.log', 'signing.p12',
+                     '.ssh/id_rsa', 'id_ed25519', '.aws/credentials', 'private.PEM'):
             with self.subTest(path=path): self.assertTrue(forbidden(path))
 
     def test_public_source_and_examples_allowed(self):

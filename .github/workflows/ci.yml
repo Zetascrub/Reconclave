@@ -11,7 +11,9 @@ jobs:
   native:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - run: cmake -S . -B build
       - run: cmake --build build --parallel
       - run: ctest --test-dir build --output-on-failure
@@ -37,8 +39,10 @@ jobs:
       run:
         working-directory: tools/desktop-node/web
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 22
           cache: npm
@@ -49,7 +53,9 @@ jobs:
   cardputer-firmware:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - name: Generate a throwaway trust header for CI compilation only
         # generated_trust.h is per-deployment secret material (tools/provision_fleet.py),
         # deliberately gitignored and never committed -- this build only needs the
@@ -62,9 +68,12 @@ jobs:
   secrets:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          persist-credentials: false
           fetch-depth: 0
+      - name: Enforce public source policy
+        run: python3 tools/check_public_tree.py
       - name: Install checksum-pinned Gitleaks
         shell: bash
         run: |
