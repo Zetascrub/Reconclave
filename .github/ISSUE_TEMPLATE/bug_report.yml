@@ -1,0 +1,28 @@
+name: Bug report
+description: Report a reproducible problem without secrets or assessment data.
+body:
+  - type: markdown
+    attributes:
+      value: "For suspected security vulnerabilities, follow SECURITY.md. Never attach keys, provisioned firmware, passwords or private assessment evidence."
+  - type: input
+    id: version
+    attributes:
+      label: Commit or version
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Device and environment
+      description: Board model, accessory, host OS and toolchain versions; omit device identifiers.
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps, expected behaviour and actual behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitised logs
+      description: Remove credentials, device identifiers and private targets before posting.

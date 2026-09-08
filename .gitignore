@@ -16,3 +16,17 @@ __pycache__/
 /.claude/
 devices/poe-p4/main/generated_trust.h
 devices/cardputer-adv/src/generated_trust.h
+
+# Local credentials, assessment data and deployment-specific release outputs.
+.env
+.env.*
+!.env.example
+!.env.*.example
+**/evidence/
+**/*.pem
+!release/keys/*.pub.pem
+**/*.key
+*.bin
+*.elf
+/.reconclave-releases/
+/.reconclave-signing/

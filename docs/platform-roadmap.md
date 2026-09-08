@@ -499,7 +499,7 @@ remain disabled unless a future approval policy explicitly permits that exact op
 
 ## Icebreaker reuse assessment
 
-Candidate source areas under `/mnt/Storage/Coding/Icebreaker/`:
+Candidate source areas under the separate Icebreaker checkout:
 
 - `icebreaker/detectors/`: bounded network discovery and banner collection patterns.
 - `icebreaker/analyzers/`: TLS, certificates, headers, DNS, API discovery, and disclosure checks.

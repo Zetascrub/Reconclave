@@ -77,6 +77,22 @@ class ProvisionFleetTests(unittest.TestCase):
             self.assertEqual(set(backfilled["storage_keys"]), {"rc-p4-1", "rc-adv-1"})
             self.assertEqual(fleet["links"], backfilled["links"])
 
+    def test_headers_have_private_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.run_provision(pathlib.Path(directory))
+            for path in (provision_fleet.STORE, provision_fleet.P4_HEADER, provision_fleet.CARD_HEADER):
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_invalid_existing_store_is_not_modified(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.run_provision(pathlib.Path(directory))
+            fleet = json.loads(provision_fleet.STORE.read_text())
+            fleet['links'][next(iter(fleet['links']))] = 'invalid'
+            original = json.dumps(fleet)
+            provision_fleet.STORE.write_text(original)
+            with self.assertRaises(SystemExit): self.run_provision(pathlib.Path(directory))
+            self.assertEqual(provision_fleet.STORE.read_text(), original)
+
 
 if __name__ == "__main__":
     unittest.main()

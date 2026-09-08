@@ -34,7 +34,11 @@ void NetworkPortScanService::fill() {
     const uint16_t port = ports_[next_++];
     if (fd < 0) { ++checked_; continue; }
     const int flags = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+      close(fd);
+      ++checked_;
+      continue;
+    }
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(port);
@@ -61,15 +65,17 @@ void NetworkPortScanService::poll() {
     FD_SET(slot.fd, &errorSet);
     maxFd = std::max(maxFd, slot.fd);
   }
+  int readyCount = 0;
   if (maxFd >= 0) {
     timeval timeout{0, 0};
-    select(maxFd + 1, nullptr, &writeSet, &errorSet, &timeout);
+    readyCount = select(maxFd + 1, nullptr, &writeSet, &errorSet, &timeout);
   }
   const unsigned long now = millis();
   for (size_t i = 0; i < kSlots; ++i) {
     auto& slot = slots_[i];
     if (!slot.used) continue;
-    const bool ready = FD_ISSET(slot.fd, &writeSet) || FD_ISSET(slot.fd, &errorSet);
+    const bool ready = readyCount > 0 &&
+        (FD_ISSET(slot.fd, &writeSet) || FD_ISSET(slot.fd, &errorSet));
     if (!ready && now - slot.started <= kTimeoutMs) continue;
     if (ready) {
       int error = 0;

@@ -27,15 +27,15 @@ bool LocalHostScanService::start(uint32_t maxHosts) {
 }
 
 bool LocalHostScanService::startRange(uint32_t firstHost, uint32_t hostCount) {
-  if (WiFi.status() != WL_CONNECTED) return false;
+  if (active_ || hostCount == 0 || WiFi.status() != WL_CONNECTED) return false;
   const uint32_t address = ipValue(WiFi.localIP());
   const uint32_t mask = ipValue(WiFi.subnetMask());
-  network_ = address & mask;
-  const uint32_t broadcast = network_ | ~mask;
-  const uint32_t available = broadcast > network_ + 1
-      ? broadcast - network_ - 1 : 0;
-  ownIp_ = address;
+  const uint32_t network = address & mask;
+  const uint32_t hostBits = ~mask;
+  const uint32_t available = hostBits > 1 ? hostBits - 1 : 0;
   if (firstHost == 0 || firstHost > available) return false;
+  network_ = network;
+  ownIp_ = address;
   firstHost_ = firstHost;
   total_ = std::min(available - firstHost + 1, hostCount);
   current_ = 0;
@@ -46,10 +46,9 @@ bool LocalHostScanService::startRange(uint32_t firstHost, uint32_t hostCount) {
 }
 
 void LocalHostScanService::stop() {
-  if (handle_ != nullptr) {
-    esp_ping_stop(handle_);
-    esp_ping_delete_session(handle_);
-    handle_ = nullptr;
+  if (void* handle = handle_.exchange(nullptr)) {
+    esp_ping_stop(handle);
+    esp_ping_delete_session(handle);
   }
   active_ = false;
 }
@@ -80,18 +79,19 @@ void LocalHostScanService::beginNext() {
     }
     handle_ = handle;
     startedMs_ = millis();
-    esp_ping_start(handle);
-    return;
+    if (esp_ping_start(handle) == ESP_OK) return;
+    handle_ = nullptr;
+    esp_ping_delete_session(handle);
+    ++current_;
   }
   active_ = false;
 }
 
 void LocalHostScanService::finishCurrent() {
   if (found_) pending_.push_back({candidate(current_)});
-  if (handle_ != nullptr) {
-    esp_ping_stop(handle_);
-    esp_ping_delete_session(handle_);
-    handle_ = nullptr;
+  if (void* handle = handle_.exchange(nullptr)) {
+    esp_ping_stop(handle);
+    esp_ping_delete_session(handle);
   }
   ++current_;
   beginNext();
@@ -99,6 +99,7 @@ void LocalHostScanService::finishCurrent() {
 
 void LocalHostScanService::update() {
   if (!active_) return;
+  if (WiFi.status() != WL_CONNECTED) { stop(); return; }
   if (done_ || millis() - startedMs_ > kPingTimeoutMs + 750) finishCurrent();
 }
 
@@ -109,10 +110,12 @@ bool LocalHostScanService::nextResult(LocalHostResult& result) {
   return true;
 }
 
-void LocalHostScanService::onSuccess(void*, void* argument) {
-  static_cast<LocalHostScanService*>(argument)->found_ = true;
+void LocalHostScanService::onSuccess(void* handle, void* argument) {
+  auto* service = static_cast<LocalHostScanService*>(argument);
+  if (service->handle_.load() == handle) service->found_ = true;
 }
 
-void LocalHostScanService::onEnd(void*, void* argument) {
-  static_cast<LocalHostScanService*>(argument)->done_ = true;
+void LocalHostScanService::onEnd(void* handle, void* argument) {
+  auto* service = static_cast<LocalHostScanService*>(argument);
+  if (service->handle_.load() == handle) service->done_ = true;
 }

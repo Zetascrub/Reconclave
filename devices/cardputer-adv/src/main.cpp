@@ -1,3 +1,4 @@
+#include "cap_radio_service.h"
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <ESPmDNS.h>
@@ -13,6 +14,10 @@
 #include <base64.h>
 #include <esp_ota_ops.h>
 #include <esp_system.h>
+#include <esp_wifi.h>
+#include "uptime.h"
+#include "checked_file_print.h"
+#include "ndef_content.h"
 #include <mbedtls/gcm.h>
 #include <mbedtls/md.h>
 #include <algorithm>
@@ -68,6 +73,14 @@ enum class ScreenState {
   WifiDetail,
   BleResults,
   BleDetail,
+  NfcResults,
+  NfcViewer,
+  NfcPresets,
+  NfcTools,
+  NfcContent,
+  NfcWriteConfirm,
+  NfcEmulation,
+  SubGhz,
   Evidence,
   EvidenceDetail,
   EvidencePreview,
@@ -93,7 +106,8 @@ enum class PortProfile { Web, Common, Extended };
 enum class ScoutExecution : uint8_t { Auto, Single, Distributed, Consensus };
 enum class DistributionStyle : uint8_t { Equal, Weighted };
 enum class RecurringPolicy : uint8_t { Independent, Callback };
-enum class UiTheme : uint8_t { Field, NightCity, Amber };
+enum class UiTheme : uint8_t { Field, NightCity, Amber, Zeta };
+constexpr unsigned kThemeCount = 4;
 enum class NavigationStyle : uint8_t { Cards, List };
 enum class IdleStyle : uint8_t { Off, Radar, Nodes, Zeta };
 enum class BootSequence : uint8_t {
@@ -222,6 +236,19 @@ bool previewTruncated;
 bool sdAvailable;
 String fieldStatus;
 bool wifiRestorePending;
+unsigned nfcAction = 0;
+String nfcPayload;
+String nfcReadText, nfcReadUid;
+bool nfcReadUrl = false;
+size_t nfcReadRow = 0;
+std::array<String, 16> nfcPresets;
+std::array<bool, 16> nfcPresetUrls{};
+std::array<bool, 16> nfcPresetOccupied{};
+bool wifiScanning = false;
+bool bleScanning = false;
+bool wifiScanWasOff = false;
+bool restoreAfterBle = false;
+uint32_t wifiScanStartedMs = 0;
 bool systemOpenedFromSettings{false};
 uint8_t displayBrightness{160};
 UiTheme uiTheme{UiTheme::Field};
@@ -762,6 +789,19 @@ bool evidenceNonceFresh(const String& nonce) {
 
 uint16_t colour(uint8_t red, uint8_t green, uint8_t blue) {
   // Remap the shared semantic palette so every screen inherits the theme.
+  if (uiTheme == UiTheme::Zeta) {
+    if (red == 5 && green == 10 && blue == 16) return M5Cardputer.Display.color565(3, 15, 23);
+    if (red == 9 && green == 28 && blue == 39) return M5Cardputer.Display.color565(14, 34, 46);
+    if (red == 11 && green == 30 && blue == 40) return M5Cardputer.Display.color565(20, 42, 54);
+    if (red == 22 && green == 66 && blue == 72) return M5Cardputer.Display.color565(0, 70, 88);
+    if (red == 80 && green == 230 && blue == 190) return M5Cardputer.Display.color565(0, 225, 235);
+    if (red == 255 && green == 190 && blue == 70) return M5Cardputer.Display.color565(255, 170, 28);
+    if (red == 130 && green == 155 && blue == 160) return M5Cardputer.Display.color565(172, 188, 197);
+    if (red == 150 && green == 170 && blue == 175) return M5Cardputer.Display.color565(217, 191, 153);
+    if (red == 35 && green == 118 && blue == 112) return M5Cardputer.Display.color565(0, 124, 153);
+    if (red == 30 && green == 105 && blue == 105) return M5Cardputer.Display.color565(0, 117, 147);
+    if (red == 24 && green == 64 && blue == 70) return M5Cardputer.Display.color565(40, 72, 91);
+  }
   if (uiTheme == UiTheme::NightCity) {
     if (red == 5 && green == 10 && blue == 16) return M5Cardputer.Display.color565(5, 5, 12);
     if (red == 9 && green == 28 && blue == 39) return M5Cardputer.Display.color565(18, 12, 30);
@@ -780,6 +820,10 @@ uint16_t colour(uint8_t red, uint8_t green, uint8_t blue) {
     if (green > 60 && blue >= 70) return M5Cardputer.Display.color565(160, 105, 35);
   }
   return M5Cardputer.Display.color565(red, green, blue);
+}
+
+uint16_t themeTextColour() {
+  return uiTheme == UiTheme::Zeta ? M5Cardputer.Display.color565(255, 242, 215) : TFT_WHITE;
 }
 
 enum class UiCue : uint8_t { Move, Open, Back, Confirm, Warning, Boot };
@@ -805,12 +849,17 @@ void playUiCue(UiCue cue) {
 const char* themeLabel() {
   if (uiTheme == UiTheme::NightCity) return "NIGHT CITY";
   if (uiTheme == UiTheme::Amber) return "AMBER CRT";
+  if (uiTheme == UiTheme::Zeta) return "ZETA MASCOT";
   return "NEON GRID";
 }
 
 void drawDeckMotif() {
   auto& display = uiCanvas;
-  if (uiTheme == UiTheme::NightCity) {
+  if (uiTheme == UiTheme::Zeta) {
+    display.drawLine(0, 35, 8, 27, colour(80, 230, 190));
+    display.drawLine(0, 43, 8, 35, colour(35, 118, 112));
+    display.drawLine(231, 114, 239, 106, colour(255, 190, 70));
+  } else if (uiTheme == UiTheme::NightCity) {
     display.drawFastVLine(2, 27, 87, colour(255, 190, 70));
     display.drawFastHLine(2, 113, 20, colour(255, 190, 70));
   } else if (uiTheme == UiTheme::Amber) {
@@ -820,6 +869,34 @@ void drawDeckMotif() {
     display.drawLine(0, 32, 8, 24, colour(35, 118, 112));
     display.drawLine(232, 118, 239, 111, colour(35, 118, 112));
   }
+}
+
+// Fit labels to the actual pixel budget without leaving half a UTF-8 codepoint.
+String fitUiText(String value, int width) {
+  if (uiCanvas.textWidth(value.c_str()) <= width) return value;
+  while (!value.isEmpty() && uiCanvas.textWidth((value + "...").c_str()) > width) {
+    size_t end = value.length() - 1;
+    while (end && (static_cast<unsigned char>(value[end]) & 0xC0) == 0x80) --end;
+    value.remove(end);
+  }
+  return value + "...";
+}
+
+bool showTabHint() {
+  return screen != ScreenState::ProvisionSsid && screen != ScreenState::ProvisionPassword &&
+      screen != ScreenState::ProvisionProject && screen != ScreenState::ProvisionEvidenceKey &&
+      screen != ScreenState::Connecting && screen != ScreenState::NfcTools &&
+      screen != ScreenState::NfcViewer && screen != ScreenState::NfcPresets &&
+      screen != ScreenState::NfcWriteConfirm && screen != ScreenState::NfcEmulation;
+}
+
+void drawListPosition(size_t first, size_t visible, size_t count) {
+  if (count <= visible) return;
+  constexpr int top = 27, height = 87;
+  const int thumb = std::max(5, int(height * visible / count));
+  const int offset = int((height - thumb) * first / (count - visible));
+  uiCanvas.drawFastVLine(237, top, height, colour(24, 64, 70));
+  uiCanvas.fillRect(236, top + offset, 3, thumb, colour(80, 230, 190));
 }
 
 void header(const char* title) {
@@ -832,7 +909,7 @@ void header(const char* title) {
   display.setTextColor(colour(80, 230, 190));
   display.setTextSize(1);
   display.setCursor(7, 8);
-  display.print(String(title).substring(0, 26));
+  display.print(fitUiText(title, 160));
   display.setTextColor(WiFi.status() == WL_CONNECTED ? colour(80, 230, 190)
                                                      : colour(255, 190, 70));
   display.fillRoundRect(173, 5, 28, 12, 3, colour(11, 30, 40));
@@ -850,7 +927,8 @@ void footer(const char* text) {
   display.drawFastHLine(0, 118, display.width(), colour(24, 64, 70));
   display.setTextColor(colour(150, 170, 175));
   display.setCursor(6, 123);
-  display.print(String(text).substring(0, 31));
+  display.print(fitUiText(text, showTabHint() ? 196 : 228));
+  if (!showTabHint()) return;
   display.fillRoundRect(207, 121, 29, 11, 3, colour(22, 66, 72));
   display.setTextColor(colour(80, 230, 190));
   display.setCursor(211, 123);
@@ -863,7 +941,7 @@ void drawMenu(const char* title, const char* const* items, size_t count,
   auto& display = uiCanvas;
   if (count == 0) return;
   if (selection >= count) selection = count - 1;
-  const size_t first = selection >= 5 ? selection - 4 : 0;
+  const size_t first = count > 6 ? std::min(selection >= 5 ? selection - 4 : size_t(0), count - 6) : 0;
   for (size_t row = 0; row < 6 && first + row < count; ++row) {
     const size_t index = first + row;
     const int y = 27 + static_cast<int>(row) * 15;
@@ -878,17 +956,18 @@ void drawMenu(const char* title, const char* const* items, size_t count,
       display.setCursor(12, y);
       display.printf("%02u", static_cast<unsigned>(index + 1));
     }
-    display.setTextColor(index == selection ? colour(80, 230, 190) : TFT_WHITE);
+    display.setTextColor(index == selection ? colour(80, 230, 190) : themeTextColour());
     display.setCursor(34, y);
-    display.print(items[index]);
+    display.print(fitUiText(items[index], 195));
   }
+  drawListPosition(first, 6, count);
   footer(help);
 }
 
 void drawProvision(const char* label, bool secret) {
   header("RECONCLAVE SETUP");
   auto& display = uiCanvas;
-  display.setTextColor(TFT_WHITE);
+  display.setTextColor(themeTextColour());
   display.setCursor(8, 36);
   display.printf("Enter Wi-Fi %s:", label);
   display.drawRect(7, 51, 226, 28, colour(50, 110, 120));
@@ -901,7 +980,7 @@ void drawProvision(const char* label, bool secret) {
   }
   display.setTextColor(colour(150, 170, 175));
   display.setCursor(8, 91);
-  display.print("ENTER save   ESC cancel");
+  display.print("ENTER save   ESC offline/cancel");
   display.setCursor(8, 106);
   display.print("Credentials stay in device NVS");
 }
@@ -909,14 +988,14 @@ void drawProvision(const char* label, bool secret) {
 void drawConnecting() {
   header("RECONCLAVE");
   auto& display = uiCanvas;
-  display.setTextColor(TFT_WHITE);
+  display.setTextColor(themeTextColour());
   display.setCursor(8, 38);
   display.print(("Connecting to " + wifiSsid).substring(0, 37));
   display.setCursor(8, 56);
   display.printf("Wi-Fi: %s", WiFi.status() == WL_CONNECTED ? "connected" : "waiting...");
   display.setTextColor(colour(150, 170, 175));
   display.setCursor(8, 103);
-  display.print("W: change Wi-Fi");
+  display.print("W: Wi-Fi setup   Q/Esc: offline");
   if (!notice.isEmpty()) {
     display.setTextColor(colour(255, 190, 70));
     display.setCursor(8, 78);
@@ -937,7 +1016,7 @@ void drawDashboard() {
     const RemoteNode* node = local ? nullptr : &remoteNodes[index - 1];
     const int y = 29 + static_cast<int>(row) * 22;
     if (index == selection) display.fillRoundRect(4, y - 3, 232, 20, 4, colour(22, 66, 72));
-    display.setTextColor(index == selection ? colour(80, 230, 190) : TFT_WHITE);
+    display.setTextColor(index == selection ? colour(80, 230, 190) : themeTextColour());
     display.setCursor(8, y);
     display.print(index == selection ? '>' : ' ');
     display.setCursor(18, y);
@@ -994,7 +1073,7 @@ void drawNodeDetail() {
   display.setCursor(8, 31);
   display.print(String(local ? "THIS CARDPUTER" :
       (node ? node->deviceType.c_str() : "NODE UNAVAILABLE")).substring(0, 37));
-  display.setTextColor(TFT_WHITE);
+  display.setTextColor(themeTextColour());
   display.setCursor(8, 49);
   display.print((local ? deviceId : selectedNodeId).substring(0, 37));
   display.setCursor(8, 67);
@@ -1034,7 +1113,7 @@ void drawNodeCapabilities() {
     const size_t index = first + row;
     const int y = 28 + static_cast<int>(row) * 15;
     if (index == selection) display.fillRoundRect(4, y - 2, 232, 14, 3, colour(22, 66, 72));
-    display.setTextColor(index == selection ? colour(80, 230, 190) : TFT_WHITE);
+    display.setTextColor(index == selection ? colour(80, 230, 190) : themeTextColour());
     display.setCursor(8, y);
     display.print(index == selection ? "> " : "  ");
     const String capability = local ? String(localCapabilities[index]) : node->capabilities[index];
@@ -1063,7 +1142,7 @@ void drawScout() {
   display.printf("%u host%s", static_cast<unsigned>(discoveredHosts.size()),
                  discoveredHosts.size() == 1 ? "" : "s");
   display.setTextColor(scoutFailed ? TFT_MAGENTA :
-      (scoutRunning ? colour(255, 190, 70) : TFT_WHITE));
+      (scoutRunning ? colour(255, 190, 70) : themeTextColour()));
   display.setCursor(8, 44);
   display.print(scoutStatus.substring(0, 37));
   if (scoutRunning && scoutTotal > 0) {
@@ -1083,7 +1162,7 @@ void drawScout() {
       if (index == selection)
         display.fillRoundRect(4, 70 + static_cast<int>(row) * 14, 232, 13, 3,
                               colour(22, 66, 72));
-      display.setTextColor(index == selection ? colour(80, 230, 190) : TFT_WHITE);
+      display.setTextColor(index == selection ? colour(80, 230, 190) : themeTextColour());
       display.setCursor(8, 73 + static_cast<int>(row) * 14);
       if (scoutExecution == ScoutExecution::Consensus) {
         size_t seen = std::find(localScoutHosts.begin(), localScoutHosts.end(),
@@ -1114,7 +1193,7 @@ void drawHostDetail() {
   display.setTextColor(colour(80, 230, 190));
   display.setCursor(16, 42);
   display.print("RESPONSIVE HOST");
-  display.setTextColor(TFT_WHITE);
+  display.setTextColor(themeTextColour());
   display.setTextSize(2);
   display.setCursor(16, 58);
   display.print(selectedHost);
@@ -1151,7 +1230,7 @@ void drawPortResults() {
       if (index == selection)
         display.fillRoundRect(4, 67 + static_cast<int>(row) * 14, 232, 13, 3,
                               colour(22, 66, 72));
-      display.setTextColor(index == selection ? colour(80, 230, 190) : TFT_WHITE);
+      display.setTextColor(index == selection ? colour(80, 230, 190) : themeTextColour());
       display.setCursor(8, 70 + static_cast<int>(row) * 14);
       display.printf("%c TCP %-5u  open", index == selection ? '>' : ' ', openPorts[index]);
     }
@@ -1214,7 +1293,7 @@ void drawHome() {
   display.setTextSize(1);
   display.setCursor(63, 51);
   display.printf("MISSION %02u / 07", static_cast<unsigned>(selection + 1));
-  display.setTextColor(TFT_WHITE);
+  display.setTextColor(themeTextColour());
   display.setTextSize(2);
   display.setCursor(63, 64);
   display.print(card.title);
@@ -1232,12 +1311,182 @@ void drawHome() {
 
 void drawObserve() {
   static const char* const items[] = {
-      "Wi-Fi discovery", "Channel analyser", "BLE discovery"};
+      "Wi-Fi discovery", "Channel analyser", "BLE discovery",
+      "NFC tag reader", "Sub-GHz monitor"};
   drawMenu("OBSERVE SIGNALS", items, sizeof(items) / sizeof(items[0]));
+
+}
+
+void drawCap() {
+  const bool isNfc = screen == ScreenState::NfcResults;
+  header(isNfc ? "NFC TAG READER" : "SUB-GHZ MONITOR");
   auto& display = uiCanvas;
+  display.setTextColor(themeTextColour());
+  display.setCursor(8, 28);
+  display.print(cap::status().substring(0, 37));
+  if (isNfc) {
+    const auto& tags = cap::tags();
+    if (!tags.empty()) {
+      if (selection >= tags.size()) selection = tags.size() - 1;
+      const auto& tag = tags[selection];
+      display.setCursor(8, 45);
+      display.printf("Tag %u/%u  %s", unsigned(selection + 1), unsigned(tags.size()), tag.protocol.c_str());
+      display.setCursor(8, 60);
+      display.print(tag.uid.substring(0, 37));
+      display.setCursor(8, 75);
+      display.print(tag.type.substring(0, 37));
+      display.setCursor(8, 90);
+      display.print(tag.detail.substring(0, 37));
+    } else {
+      display.setCursor(8, 52);
+      display.print("Hold one tag against the cap");
+      display.setCursor(8, 70);
+      display.print("ISO14443 A/B, FeliCa, ISO15693");
+    }
+    display.setCursor(8, 106);
+    display.print(fieldStatus.isEmpty() ? String("L/R protocol: ") + cap::nfcFilterName() : fieldStatus.substring(0, 37));
+    footer(cap::scanningNfc() ? "Enter pause  U/D tags  Q back" : "Enter scan  U/D tags  Q back");
+  } else {
+    const auto& band = cap::band(cap::selectedBand());
+    // Fixed-frequency activity history: newest sample at the right edge.
+    // A time trace and heat strip, not a frequency-swept spectrum waterfall.
+    display.setCursor(8, 28);
+    display.fillRect(0, 26, 240, 12, colour(5, 10, 16));
+    const bool radioFailed = cap::status().startsWith("CC1101 unavailable");
+    display.printf("< %.2f MHz > %s", band.mhz, radioFailed ? "ERROR" :
+        cap::receiving() ? "LIVE" : band.samples ? "PAUSED" : "STOP");
+    display.setCursor(8, 41);
+    if (band.samples && !radioFailed) display.printf("%s %.0f dBm  peak %.0f", cap::receiving() ? "Now" : "Last", band.rssi, band.peak);
+    else display.print(cap::status().substring(0, 37));
+    constexpr int left = 34, top = 56, bottom = 96, width = 200;
+    display.setTextColor(colour(130, 155, 160));
+    for (int step = 0; step < 3; ++step) {
+      const int y = top + step * 20;
+      display.drawFastHLine(left, y, width, colour(24, 64, 70));
+      display.setCursor(2, y - 3);
+      display.print(step == 0 ? "-30" : step == 1 ? "-75" : "-120");
+    }
+    const auto& history = band.history;
+    const int offset = width - static_cast<int>(history.size());
+    int previousY = bottom;
+    for (size_t i = 0; i < history.size(); ++i) {
+      const int x = left + offset + static_cast<int>(i);
+      const int level = cap::RfHistory::height(history.at(i), bottom - top);
+      const int y = bottom - level;
+      const uint16_t heat = colour(255 * level / 40, 60 + 150 * level / 40, 170 - 130 * level / 40);
+      display.drawFastVLine(x, y, bottom - y + 1, colour(16, 65, 65));
+      if (history.connectedToPrevious(i)) display.drawLine(x - 1, previousY, x, y, colour(80, 230, 190));
+      else display.drawPixel(x, y, colour(80, 230, 190));
+      display.drawFastVLine(x, 99, 5, heat);
+      previousY = y;
+    }
+    display.setCursor(8, 108);
+    const int thresholdY = bottom - cap::RfHistory::height(band.threshold, bottom - top);
+    for (int x = left; x < left + width; x += 4)
+      display.drawFastHLine(x, thresholdY, 2, colour(255, 190, 70));
+    if (!fieldStatus.isEmpty()) display.print(fieldStatus.substring(0, 37));
+    else if (history.size()) display.printf("U/D %d dBm  above %u%% (%u)", band.threshold,
+        history.activityPercent(band.threshold), unsigned(history.size()));
+    else display.printf("U/D %d dBm  waiting for samples", band.threshold);
+    footer(cap::receiving() ? "Enter pause  L/R band  Q back" : "Enter resume L/R band Q back");
+  }
+}
+
+bool nfcContentIsUrl() { return nfcAction % 2 == 1; }
+
+void drawNfcViewer() {
+  header("NFC / CONTENT VIEWER");
+  auto& display = uiCanvas;
+  display.setTextColor(themeTextColour());
+  display.setCursor(8, 27);
+  display.print(cap::status().substring(0, 37));
+  display.setCursor(8, 40);
+  display.print(nfcReadUid.substring(0, 37));
+  for (size_t row = 0; row < 5; ++row) {
+    display.setCursor(8, 54 + row * 11);
+    display.print(nfcReadText.substring((nfcReadRow + row) * 37, (nfcReadRow + row + 1) * 37));
+  }
   display.setTextColor(colour(130, 155, 160));
-  display.setCursor(8, 78);
-  display.print("GPS / Mesh / War drive: planned");
+  display.setCursor(8, 110);
+  const size_t lines = (nfcReadText.length() + 36) / 37;
+  if (lines) display.printf("Lines %u-%u of %u", unsigned(nfcReadRow + 1),
+      unsigned(std::min(nfcReadRow + 5, lines)), unsigned(lines));
+  footer("U/D scroll  Enter read  Q back");
+}
+
+void drawNfcPresets() {
+  std::array<String, 17> labels;
+  std::array<const char*, 17> items;
+  labels[0] = "Save current content in free slot";
+  for (size_t i = 0; i < nfcPresets.size(); ++i)
+    labels[i + 1] = String(i + 1) + ": " + (nfcPresets[i].isEmpty() ?
+        (nfcPresetOccupied[i] ? "[invalid file]" : "[empty]") :
+        String(nfcPresetUrls[i] ? "URL " : "Text ") + nfcPresets[i]);
+  for (size_t i = 0; i < items.size(); ++i) {
+    labels[i] = labels[i].substring(0, 33);
+    items[i] = labels[i].c_str();
+  }
+  drawMenu("NFC / SD PRESETS", items.data(), items.size());
+}
+
+void drawNfcTools() {
+  static const char* const items[] = {"Write text to tag", "Write URL to tag",
+      "Emulate NFC-A text", "Emulate NFC-A URL", "Emulate FeliCa text", "Emulate FeliCa URL"};
+  drawMenu("NFC / WRITE & EMULATE", items, 6);
+}
+
+void drawNfcContent() {
+  header(nfcAction < 2 ? "NFC / WRITE CONTENT" : "NFC / EMULATE CONTENT");
+  auto& display = uiCanvas;
+  display.setTextColor(themeTextColour());
+  display.setCursor(8, 27);
+  display.print(nfcContentIsUrl() ? "URL: http:// or https://" : "Text record (English / UTF-8)");
+  for (unsigned row = 0; row < 4; ++row) {
+    display.setCursor(8, 41 + row * 12);
+    display.print(input.substring(row * 37, (row + 1) * 37));
+  }
+  display.drawFastHLine(8 + (input.length() % 37) * 6,
+      49 + (input.length() / 37) * 12, 5, colour(80, 230, 190));
+  display.setCursor(8, 91);
+  display.printf("%u/120  %s", unsigned(input.length()), nfcAction < 2 ? "Type 2 NDEF tag" : "New virtual tag");
+  display.setCursor(8, 105);
+  display.print(fieldStatus.substring(0, 37));
+  footer(nfcAction < 2 ? "Enter check  Tab presets  Esc back" : "Enter start  Tab presets  Esc back");
+}
+
+void drawNfcWriteConfirm() {
+  header("CONFIRM NFC WRITE");
+  auto& display = uiCanvas;
+  display.setTextColor(colour(255, 190, 70));
+  display.setCursor(8, 27);
+  display.print("Replace this tag's NDEF content?");
+  display.setTextColor(themeTextColour());
+  display.setCursor(8, 42);
+  display.print(cap::writeTarget().substring(0, 37));
+  for (unsigned row = 0; row < 4; ++row) {
+    display.setCursor(8, 58 + row * 12);
+    display.print(nfcPayload.substring(row * 37, (row + 1) * 37));
+  }
+  display.setCursor(8, 108);
+  display.print("Keep the same tag on the cap");
+  footer("Enter: WRITE   Q/Esc: cancel");
+}
+
+void drawNfcEmulation() {
+  header(nfcAction < 4 ? "NFC-A / VIRTUAL NTAG213" : "FELICA / VIRTUAL NDEF TAG");
+  auto& display = uiCanvas;
+  display.setTextColor(themeTextColour());
+  display.setCursor(8, 29);
+  display.print(cap::status().substring(0, 37));
+  display.setCursor(8, 47);
+  display.print(cap::emulatedIdentifier().substring(0, 37));
+  display.setCursor(8, 67);
+  display.print(nfcPayload.substring(0, 37));
+  display.setCursor(8, 80);
+  display.print(nfcPayload.substring(37, 74));
+  display.setCursor(8, 104);
+  display.print("Fleet servicing paused while active");
+  footer("Present cap to reader  Q: stop");
 }
 
 void drawWifiChannels() {
@@ -1270,7 +1519,7 @@ void drawWifiChannels() {
   for (size_t row = 0; row < 3; ++row) {
     const int channel = choices[row];
     const int y = 49 + static_cast<int>(row) * 21;
-    display.setTextColor(channel == recommended ? colour(80, 230, 190) : TFT_WHITE);
+    display.setTextColor(channel == recommended ? colour(80, 230, 190) : themeTextColour());
     display.setCursor(8, y);
     display.printf("CH %-2d  %2d AP%s", channel, counts[channel], counts[channel] == 1 ? " " : "s");
     display.drawRoundRect(92, y - 2, 137, 9, 3, colour(35, 118, 112));
@@ -1294,14 +1543,14 @@ void drawWifiResults() {
     display.print((fieldStatus.isEmpty() ? String("Use Tab to run a scan") : fieldStatus).substring(0, 37));
   } else {
     if (selection >= wifiObservations.size()) selection = wifiObservations.size() - 1;
-    const size_t first = selection >= 4 ? selection - 3 : 0;
+    const size_t first = wifiObservations.size() > 5 ? std::min(selection >= 4 ? selection - 3 : size_t(0), wifiObservations.size() - 5) : 0;
     for (size_t row = 0; row < 5 && first + row < wifiObservations.size(); ++row) {
       const size_t index = first + row;
       const auto& ap = wifiObservations[index];
       const int y = 28 + static_cast<int>(row) * 17;
       if (index == selection)
         display.fillRoundRect(3, y - 2, 234, 16, 3, colour(22, 66, 72));
-      display.setTextColor(index == selection ? colour(80, 230, 190) : TFT_WHITE);
+      display.setTextColor(index == selection ? colour(80, 230, 190) : themeTextColour());
       display.setCursor(5, y);
       display.printf("%c%-18s %4ld", index == selection ? '>' : ' ',
                      ap.ssid.substring(0, 18).c_str(), static_cast<long>(ap.rssi));
@@ -1310,9 +1559,11 @@ void drawWifiResults() {
       display.printf("ch%ld %s", static_cast<long>(ap.channel), authName(ap.auth));
     }
   }
-  footer(fieldStatus.startsWith("Saved") || fieldStatus.indexOf("save") >= 0 ||
-                 fieldStatus.indexOf("export") >= 0
-             ? fieldStatus.c_str() : "Enter: detail   Q/Esc: back");
+  if (wifiObservations.size() > 5) {
+    const size_t first = std::min(selection >= 4 ? selection - 3 : size_t(0), wifiObservations.size() - 5);
+    drawListPosition(first, 5, wifiObservations.size());
+  }
+  footer(!fieldStatus.isEmpty() ? fieldStatus.c_str() : "Enter: detail   Q/Esc: back");
 }
 
 void drawWifiDetail() {
@@ -1324,7 +1575,7 @@ void drawWifiDetail() {
   const auto& ap = wifiObservations[selection];
   header("WI-FI OBSERVATION");
   auto& display = uiCanvas;
-  display.setTextColor(TFT_WHITE);
+  display.setTextColor(themeTextColour());
   display.setCursor(8, 31);
   display.print(ap.ssid.substring(0, 36));
   display.setCursor(8, 48);
@@ -1335,9 +1586,7 @@ void drawWifiDetail() {
   display.printf("Signal: %ld dBm", static_cast<long>(ap.rssi));
   display.setCursor(8, 99);
   display.printf("Security: %s", authName(ap.auth));
-  footer(fieldStatus.startsWith("Saved") || fieldStatus.indexOf("save") >= 0 ||
-                 fieldStatus.indexOf("export") >= 0
-             ? fieldStatus.c_str() : "Q/Esc: results");
+  footer(!fieldStatus.isEmpty() ? fieldStatus.c_str() : "Q/Esc: results");
 }
 
 void drawBleResults() {
@@ -1349,14 +1598,14 @@ void drawBleResults() {
     display.print((fieldStatus.isEmpty() ? String("Use Tab to run a scan") : fieldStatus).substring(0, 37));
   } else {
     if (selection >= bleObservations.size()) selection = bleObservations.size() - 1;
-    const size_t first = selection >= 4 ? selection - 3 : 0;
+    const size_t first = bleObservations.size() > 5 ? std::min(selection >= 4 ? selection - 3 : size_t(0), bleObservations.size() - 5) : 0;
     for (size_t row = 0; row < 5 && first + row < bleObservations.size(); ++row) {
       const size_t index = first + row;
       const auto& device = bleObservations[index];
       const int y = 28 + static_cast<int>(row) * 17;
       if (index == selection)
         display.fillRoundRect(3, y - 2, 234, 16, 3, colour(22, 66, 72));
-      display.setTextColor(index == selection ? colour(80, 230, 190) : TFT_WHITE);
+      display.setTextColor(index == selection ? colour(80, 230, 190) : themeTextColour());
       display.setCursor(5, y);
       display.printf("%c%-20s %4d", index == selection ? '>' : ' ',
                      device.name.substring(0, 20).c_str(), device.rssi);
@@ -1366,9 +1615,11 @@ void drawBleResults() {
                      device.connectable ? "connectable" : "broadcast");
     }
   }
-  footer(fieldStatus.startsWith("Saved") || fieldStatus.indexOf("save") >= 0 ||
-                 fieldStatus.indexOf("export") >= 0
-             ? fieldStatus.c_str() : "Enter: detail   Q/Esc: back");
+  if (bleObservations.size() > 5) {
+    const size_t first = std::min(selection >= 4 ? selection - 3 : size_t(0), bleObservations.size() - 5);
+    drawListPosition(first, 5, bleObservations.size());
+  }
+  footer(!fieldStatus.isEmpty() ? fieldStatus.c_str() : "Enter: detail   Q/Esc: back");
 }
 
 void drawBleDetail() {
@@ -1380,7 +1631,7 @@ void drawBleDetail() {
   const auto& device = bleObservations[selection];
   header("BLE OBSERVATION");
   auto& display = uiCanvas;
-  display.setTextColor(TFT_WHITE);
+  display.setTextColor(themeTextColour());
   display.setCursor(8, 31);
   display.print(device.name.substring(0, 36));
   display.setCursor(8, 49);
@@ -1397,9 +1648,7 @@ void drawBleDetail() {
   display.setCursor(8, 107);
   display.print((device.manufacturer.isEmpty() ? String("Manufacturer: unknown") :
       device.manufacturer + "  " + String(device.payloadLength) + "B").substring(0, 37));
-  footer(fieldStatus.startsWith("Saved") || fieldStatus.indexOf("save") >= 0 ||
-                 fieldStatus.indexOf("export") >= 0
-             ? fieldStatus.c_str() : "Q/Esc: results");
+  footer(!fieldStatus.isEmpty() ? fieldStatus.c_str() : "Q/Esc: results");
 }
 
 void drawFieldKit() {
@@ -1420,7 +1669,7 @@ void drawNetworkDashboard() {
     footer("Q/Esc: Field Kit");
     return;
   }
-  display.setTextColor(TFT_WHITE);
+  display.setTextColor(themeTextColour());
   display.setCursor(8, 29);
   display.print((String("SSID: ") + WiFi.SSID() + "  " + String(WiFi.RSSI()) + " dBm").substring(0, 37));
   display.setCursor(8, 45);
@@ -1457,7 +1706,7 @@ void drawEvidence() {
       const int y = 28 + static_cast<int>(row) * 15;
       if (index == selection)
         display.fillRoundRect(3, y - 2, 234, 14, 3, colour(22, 66, 72));
-      display.setTextColor(index == selection ? colour(80, 230, 190) : TFT_WHITE);
+      display.setTextColor(index == selection ? colour(80, 230, 190) : themeTextColour());
       display.setCursor(6, y);
       display.printf("%c %-27s %luK", index == selection ? '>' : ' ',
                      evidenceFiles[index].name.substring(0, 27).c_str(),
@@ -1490,7 +1739,7 @@ void drawEvidenceDetail() {
   header("EVIDENCE DETAILS");
   auto& display = uiCanvas;
   const auto& entry = evidenceFiles[selection];
-  display.setTextColor(TFT_WHITE);
+  display.setTextColor(themeTextColour());
   display.setCursor(8, 34);
   display.print(entry.name.substring(0, 36));
   display.setCursor(8, 55);
@@ -1512,7 +1761,7 @@ void drawEvidencePreview() {
     display.print("(empty or unreadable file)");
   } else {
     for (size_t row = 0; row < 5 && previewLine + row < previewLines.size(); ++row) {
-      display.setTextColor(TFT_WHITE);
+      display.setTextColor(themeTextColour());
       display.setCursor(4, 27 + static_cast<int>(row) * 15);
       display.print(previewLines[previewLine + row].substring(0, 39));
     }
@@ -1545,7 +1794,7 @@ void drawProjects() {
     const size_t index = first + row;
     const int y = 31 + static_cast<int>(row) * 21;
     if (index == selection) display.fillRoundRect(5, y - 3, 230, 19, 4, colour(22, 66, 72));
-    display.setTextColor(index == selection ? colour(80, 230, 190) : TFT_WHITE);
+    display.setTextColor(index == selection ? colour(80, 230, 190) : themeTextColour());
     display.setCursor(8, y);
     display.printf("%c %-20s", index == selection ? '>' : ' ',
                    projects[index].projectId.substring(0, 20).c_str());
@@ -1567,7 +1816,7 @@ void drawProjectDetail() {
   display.setTextColor(colour(80, 230, 190));
   display.setCursor(8, 32);
   display.print(project.projectId.substring(0, 32));
-  display.setTextColor(TFT_WHITE);
+  display.setTextColor(themeTextColour());
   display.setCursor(8, 52);
   display.printf("DEFAULT SCOPE  REV %u", project.revision);
   display.setCursor(8, 69);
@@ -1583,7 +1832,7 @@ void drawProjectDetail() {
 void drawProvisionProject() {
   header("PROJECTS / NEW");
   auto& display = uiCanvas;
-  display.setTextColor(TFT_WHITE);
+  display.setTextColor(themeTextColour());
   display.setCursor(8, 34);
   display.print("Project identifier");
   display.drawRoundRect(7, 49, 226, 27, 4, colour(35, 118, 112));
@@ -1601,7 +1850,7 @@ void drawProvisionProject() {
 void drawSystem() {
   header("SYSTEM DIAGNOSTICS");
   auto& display = uiCanvas;
-  display.setTextColor(TFT_WHITE);
+  display.setTextColor(themeTextColour());
   display.setCursor(8, 30);
   display.printf("Firmware: %s", kFirmware);
   display.setCursor(8, 45);
@@ -1632,7 +1881,7 @@ void drawSettingsConnectivity() {
   display.setTextColor(colour(80, 230, 190));
   display.setCursor(8, 31);
   display.print(WiFi.status() == WL_CONNECTED ? "CONNECTED" : "OFFLINE");
-  display.setTextColor(TFT_WHITE);
+  display.setTextColor(themeTextColour());
   display.setCursor(8, 49);
   display.print((String("Network: ") + (wifiSsid.isEmpty() ? "not configured" : wifiSsid)).substring(0, 37));
   display.setCursor(8, 66);
@@ -1665,7 +1914,7 @@ void drawSettingsDisplay() {
     const size_t index = first + row;
     const int y = 28 + static_cast<int>(row) * 15;
     if (index == selection) display.fillRoundRect(4, y - 2, 232, 14, 3, colour(22, 66, 72));
-    display.setTextColor(index == selection ? colour(80, 230, 190) : TFT_WHITE);
+    display.setTextColor(index == selection ? colour(80, 230, 190) : themeTextColour());
     display.setCursor(8, y);
     display.printf("%c %-16s", index == selection ? '>' : ' ', labels[index]);
     display.setTextColor(index == selection ? colour(80, 230, 190) : colour(150, 170, 175));
@@ -1701,7 +1950,7 @@ void drawSettingsBoot() {
   for (size_t row = 0; row < 4; ++row) {
     const int y = 31 + static_cast<int>(row) * 19;
     if (row == selection) display.fillRoundRect(4, y - 3, 232, 16, 3, colour(22, 66, 72));
-    display.setTextColor(row == selection ? colour(80, 230, 190) : TFT_WHITE);
+    display.setTextColor(row == selection ? colour(80, 230, 190) : themeTextColour());
     display.setCursor(8, y);
     display.printf("%c %-12s", row == selection ? '>' : ' ', labels[row]);
     display.setCursor(126, y);
@@ -1900,7 +2149,7 @@ void drawBootAnimation() {
   canvas.setTextSize(1);
   canvas.setCursor(102, 40);
   canvas.print(uiTheme == UiTheme::Amber ? "> FIELD DECK" : "FIELD DECK // 01");
-  canvas.setTextColor(TFT_WHITE);
+  canvas.setTextColor(themeTextColour());
   canvas.setTextSize(1);
   canvas.setCursor(102, 58);
   canvas.print("RECONCLAVE");
@@ -1923,7 +2172,7 @@ void drawSettingsStorage() {
   display.setTextColor(sdAvailable ? colour(80, 230, 190) : colour(255, 190, 70));
   display.setCursor(8, 31);
   display.print(sdAvailable ? "MICROSD READY" : "MICROSD UNAVAILABLE");
-  display.setTextColor(TFT_WHITE);
+  display.setTextColor(themeTextColour());
   display.setCursor(8, 50);
   display.printf("Evidence files: %u", static_cast<unsigned>(evidenceFiles.size()));
   display.setCursor(8, 67);
@@ -1945,7 +2194,7 @@ void drawSettingsDevice() {
   for (size_t row = 0; row < 2; ++row) {
     const int y = 34 + static_cast<int>(row) * 31;
     if (selection == row) display.fillRoundRect(4, y - 4, 232, 26, 4, colour(22, 66, 72));
-    display.setTextColor(selection == row ? colour(80, 230, 190) : TFT_WHITE);
+    display.setTextColor(selection == row ? colour(80, 230, 190) : themeTextColour());
     display.setCursor(8, y);
     display.print(selection == row ? '>' : ' ');
     display.setCursor(18, y);
@@ -1967,7 +2216,7 @@ void drawSettingsTrust() {
     const bool active = row == 0 ? peerKeyValid : (row == 1 ? executionKeyValid : evidenceKeyValid);
     const int y = 28 + static_cast<int>(row) * 27;
     if (row == selection) display.fillRoundRect(4, y - 3, 232, 23, 4, colour(22, 66, 72));
-    display.setTextColor(row == selection ? colour(80, 230, 190) : TFT_WHITE);
+    display.setTextColor(row == selection ? colour(80, 230, 190) : themeTextColour());
     display.setCursor(8, y);
     display.print(row == selection ? '>' : ' ');
     display.setCursor(18, y);
@@ -1992,7 +2241,7 @@ void drawConfirmForgetTrust() {
   display.setTextColor(TFT_MAGENTA);
   display.setCursor(16, 42);
   display.print("REMOVE SAVED PAIRING?");
-  display.setTextColor(TFT_WHITE);
+  display.setTextColor(themeTextColour());
   display.setCursor(16, 61);
   display.print("Local trust will be erased.");
   display.setCursor(16, 75);
@@ -2076,6 +2325,8 @@ void selectedPortList(const uint16_t*& ports, size_t& count) {
 }
 
 size_t contextItemCount() {
+  if (contextOrigin == ScreenState::NfcResults) return 6;
+  if (contextOrigin == ScreenState::SubGhz) return 4;
   if (contextOrigin == ScreenState::Scout) return 8;
   if (contextOrigin == ScreenState::HostDetail) return 1;
   if (contextOrigin == ScreenState::PortResults) return 2;
@@ -2088,6 +2339,20 @@ size_t contextItemCount() {
 }
 
 String contextItemLabel(size_t index) {
+  if (contextOrigin == ScreenState::NfcResults) {
+    if (index == 0) return "Start / stop NFC scanning";
+    if (index == 1) return "Save NFC evidence";
+    if (index == 2) return String("Protocol: ") + cap::nfcFilterName();
+    if (index == 3) return "Clear NFC history";
+    if (index == 4) return "Write & emulate...";
+    return "Read text / URL content";
+  }
+  if (contextOrigin == ScreenState::SubGhz) {
+    if (index == 0) return "Start / stop receiver";
+    if (index == 1) return "Save RF summary";
+    if (index == 2) return "Save RF graph samples";
+    return "Clear this band's history";
+  }
   if (contextOrigin == ScreenState::Scout) {
     if (index == 0) return String("Scope             ") +
         (activeProjectId.isEmpty() ? "ATTACHED /24" : activeProjectId);
@@ -2108,10 +2373,10 @@ String contextItemLabel(size_t index) {
     return "Run service scan again";
   }
   if (contextOrigin == ScreenState::WifiResults || contextOrigin == ScreenState::WifiDetail)
-    return index == 0 ? "Run Wi-Fi scan" : "Save Wi-Fi evidence";
+    return index == 0 ? (wifiScanning ? "Stop Wi-Fi scan" : "Run Wi-Fi scan") : "Save Wi-Fi evidence";
   if (contextOrigin == ScreenState::WifiChannels) return "Run Wi-Fi scan";
   if (contextOrigin == ScreenState::BleResults || contextOrigin == ScreenState::BleDetail)
-    return index == 0 ? "Run BLE scan" : "Save BLE evidence";
+    return index == 0 ? (bleScanning ? "Stop BLE scan" : "Run BLE scan") : "Save BLE evidence";
   if (contextOrigin == ScreenState::Reconclave)
     return index == 0 ? "Refresh devices" : "Pair over Grove";
   if (contextOrigin == ScreenState::NodeDetail) {
@@ -2161,9 +2426,9 @@ void drawContextMenu() {
     const size_t index = first + row;
     const int y = 32 + static_cast<int>(row) * 16;
     if (index == selection) display.fillRoundRect(27, y - 3, 205, 15, 3, colour(22, 66, 72));
-    display.setTextColor(index == selection ? colour(80, 230, 190) : TFT_WHITE);
+    display.setTextColor(index == selection ? colour(80, 230, 190) : themeTextColour());
     display.setCursor(31, y);
-    display.printf("%c %s", index == selection ? '>' : ' ', contextItemLabel(index).substring(0, 35).c_str());
+    display.printf("%c %s", index == selection ? '>' : ' ', fitUiText(contextItemLabel(index), 185).c_str());
   }
   const bool adjustable = (contextOrigin == ScreenState::Scout && selection < 7) ||
       contextOrigin == ScreenState::HostDetail ||
@@ -2208,6 +2473,13 @@ void draw() {
   else if (screen == ScreenState::Scout) drawScout();
   else if (screen == ScreenState::HostDetail) drawHostDetail();
   else if (screen == ScreenState::PortResults) drawPortResults();
+  else if (screen == ScreenState::NfcResults || screen == ScreenState::SubGhz) drawCap();
+  else if (screen == ScreenState::NfcViewer) drawNfcViewer();
+  else if (screen == ScreenState::NfcPresets) drawNfcPresets();
+  else if (screen == ScreenState::NfcTools) drawNfcTools();
+  else if (screen == ScreenState::NfcContent) drawNfcContent();
+  else if (screen == ScreenState::NfcWriteConfirm) drawNfcWriteConfirm();
+  else if (screen == ScreenState::NfcEmulation) drawNfcEmulation();
   else if (screen == ScreenState::Observe) drawObserve();
   else if (screen == ScreenState::WifiResults) drawWifiResults();
   else if (screen == ScreenState::WifiChannels) drawWifiChannels();
@@ -3805,6 +4077,18 @@ void startConnecting() {
   draw();
 }
 
+void workOffline() {
+  WiFi.disconnect(true, false);
+  wifiRestorePending = false;
+  wifiSsid = preferences.getString("ssid", "");
+  wifiPassword = preferences.getString("password", "");
+  input = "";
+  screen = ScreenState::Home;
+  selection = 0;
+  notice = "Offline field mode";
+  draw();
+}
+
 void beginProvisioning() {
   WiFi.disconnect(true, false);
   wifiSsid = "";
@@ -3920,6 +4204,8 @@ void appendProjectAudit(const char* event, JsonVariantConst detail) {
 }
 
 void mountEvidence() {
+  cap::stop();
+  cap::deselect();
   evidenceFiles.clear();
   SD.end();
   SPI.end();
@@ -3962,9 +4248,68 @@ String csvField(String value) {
 bool openEvidenceCsv(const char* kind, File& file, String& path) {
   if (!sdAvailable) mountEvidence();
   if (!sdAvailable) return false;
-  path = "/reconclave/evidence/" + String(kind) + "-" + String(millis()) + ".csv";
-  file = SD.open(path, FILE_WRITE);
-  return static_cast<bool>(file);
+  static uint32_t sequence = 0;
+  for (unsigned attempt = 0; attempt < 100; ++attempt) {
+    path = "/reconclave/evidence/" + String(kind) + "-" +
+        String(nodeBootNonceHex).substring(0, 8) + "-" + String(++sequence) + ".csv";
+    if (SD.exists(path)) continue;
+    file = SD.open(path, FILE_WRITE);
+    return static_cast<bool>(file);
+  }
+  return false;
+}
+
+// Presets use bounded plain-text files: one type byte followed by the payload.
+// New slots are committed by rename only after a checked write and readback.
+String nfcPresetPath(size_t slot) {
+  return "/reconclave/nfc-presets/" + String(unsigned(slot + 1)) + ".txt";
+}
+bool loadNfcPresets() {
+  if (!sdAvailable) mountEvidence();
+  if (!sdAvailable) return false;
+  if (!SD.exists("/reconclave/nfc-presets") && !SD.mkdir("/reconclave/nfc-presets")) return false;
+  for (size_t i = 0; i < nfcPresets.size(); ++i) {
+    nfcPresets[i] = "";
+    nfcPresetOccupied[i] = SD.exists(nfcPresetPath(i));
+    File file = SD.open(nfcPresetPath(i), FILE_READ);
+    if (!file || file.isDirectory() || file.size() < 2 || file.size() > 121) { file.close(); continue; }
+    const size_t length = file.size();
+    char bytes[122]{};
+    const bool read = file.readBytes(bytes, length) == length;
+    file.close();
+    bool printable = true;
+    for (size_t j = 1; j < length; ++j) if (bytes[j] < 32 || bytes[j] > 126) printable = false;
+    const bool url = bytes[0] == 'U';
+    if (!read || !printable || (bytes[0] != 'T' && !url) || cap::ndefRecord(bytes + 1, url).empty()) continue;
+    nfcPresets[i] = bytes + 1;
+    nfcPresetUrls[i] = url;
+  }
+  return true;
+}
+void openScreen(ScreenState next);
+void saveNfcPreset() {
+  auto finish = [&](const String& result) { fieldStatus = result; openScreen(ScreenState::NfcContent); };
+  if (cap::ndefRecord(input.c_str(), nfcContentIsUrl()).empty()) { finish("Enter valid text or http(s) URL"); return; }
+  if (!loadNfcPresets()) { finish("microSD unavailable"); return; }
+  size_t slot = 0;
+  while (slot < nfcPresets.size() && nfcPresetOccupied[slot]) ++slot;
+  if (slot == nfcPresets.size()) { finish("16 slots full; manage files on SD"); return; }
+  const String path = nfcPresetPath(slot), temp = path + ".tmp";
+  if (SD.exists(temp) && !SD.remove(temp)) { finish("Cannot clear incomplete save"); return; }
+  File file = SD.open(temp, FILE_WRITE);
+  if (!file) { finish("Cannot create preset"); return; }
+  const String data = String(nfcContentIsUrl() ? "U" : "T") + input;
+  CheckedFilePrint output(file);
+  bool ok = output.print(data) == data.length() && output.finish();
+  file.close();
+  File verify = SD.open(temp, FILE_READ);
+  char bytes[122]{};
+  ok = ok && verify && verify.size() == data.length() &&
+      verify.readBytes(bytes, data.length()) == data.length() && data == bytes;
+  verify.close();
+  ok = ok && !SD.exists(path) && SD.rename(temp, path);
+  if (!ok) SD.remove(temp);
+  finish(ok ? String("Saved preset ") + String(unsigned(slot + 1)) : "Preset save failed");
 }
 
 String scoutBaselinePath() {
@@ -4036,8 +4381,7 @@ bool appendEncryptedEvidenceLine(File& file, const String& plaintext) {
   frame["ciphertext"] = base64::encode(combined.data(), combined.size());
   String line;
   serializeJson(frame, line);
-  file.println(line);
-  return true;
+  return file.println(line) == line.length() + 2;
 }
 
 // Evidence Collector sink: append-only, never overwrites or deduplicates. Records
@@ -4056,10 +4400,12 @@ bool writeEvidenceRecord(JsonVariantConst evidence, String& errorMessage) {
   }
   String encoded;
   serializeJson(evidence, encoded);
-  const bool encrypted = appendEncryptedEvidenceLine(file, encoded);
+  bool encrypted = appendEncryptedEvidenceLine(file, encoded);
+  file.flush();
+  encrypted &= file.getWriteError() == 0;
   file.close();
   if (!encrypted) {
-    errorMessage = "evidence encryption failed";
+    errorMessage = "evidence encryption/write failed";
     return false;
   }
   const String projectId = evidence["project_id"] | "";
@@ -4087,14 +4433,75 @@ void saveWifiEvidence() {
     draw();
     return;
   }
-  file.println("ssid,bssid,channel,rssi_dbm,security,observer_node");
+  CheckedFilePrint output(file);
+  output.println("ssid,bssid,channel,rssi_dbm,security,observer_node");
   for (const auto& ap : wifiObservations) {
-    file.printf("%s,%s,%ld,%ld,%s,%s\n", csvField(ap.ssid).c_str(),
+    output.printf("%s,%s,%ld,%ld,%s,%s\n", csvField(ap.ssid).c_str(),
                 ap.bssid.c_str(), static_cast<long>(ap.channel),
                 static_cast<long>(ap.rssi), authName(ap.auth), deviceId.c_str());
   }
+  const bool ok = output.finish();
   file.close();
-  fieldStatus = "Saved " + path.substring(path.lastIndexOf('/') + 1);
+  fieldStatus = ok ? "Saved " + path.substring(path.lastIndexOf('/') + 1) : "microSD write failed";
+  draw();
+}
+
+void saveCapEvidence(bool nfc) {
+  bool haveSamples = false;
+  for (unsigned i = 0; i < 4; ++i) haveSamples |= cap::band(i).samples != 0;
+  if (nfc ? cap::tags().empty() : !haveSamples) {
+    fieldStatus = "Nothing to save; scan first";
+    draw();
+    return;
+  }
+  File file;
+  String path;
+  if (!openEvidenceCsv(nfc ? "nfc" : "subghz", file, path)) {
+    fieldStatus = "microSD export failed";
+    draw();
+    return;
+  }
+  CheckedFilePrint output(file);
+  bool ok;
+  if (nfc) {
+    ok = output.println("identifier,type_hint,protocol,detail,observer_node") > 0;
+    for (const auto& tag : cap::tags())
+      ok &= output.printf("%s,%s,%s,%s,%s\n", csvField(tag.uid).c_str(),
+          csvField(tag.type).c_str(), tag.protocol.c_str(), csvField(tag.detail).c_str(), deviceId.c_str()) > 0;
+  } else {
+    ok = output.println("frequency_mhz,last_rssi_dbm,peak_rssi_dbm,samples,observer_node,threshold_dbm,window_samples,above_threshold_percent") > 0;
+    for (unsigned i = 0; i < 4; ++i) {
+      const auto& band = cap::band(i);
+      if (band.samples) ok &= output.printf("%.2f,%.1f,%.1f,%lu,%s,%d,%u,%u\n", band.mhz,
+          band.rssi, band.peak, static_cast<unsigned long>(band.samples), deviceId.c_str(),
+          band.threshold, unsigned(band.history.size()), band.history.activityPercent(band.threshold)) > 0;
+    }
+  }
+  ok &= output.finish();
+  file.close();
+  fieldStatus = ok ? "Saved " + path.substring(path.lastIndexOf('/') + 1) : "microSD write failed";
+  draw();
+}
+
+void saveRadioTrace() {
+  const auto& band = cap::band(cap::selectedBand());
+  if (!band.history.size()) { fieldStatus = "No RF samples to export"; draw(); return; }
+  File file;
+  String path;
+  if (!openEvidenceCsv("subghz-trace", file, path)) {
+    fieldStatus = "microSD export failed";
+    draw();
+    return;
+  }
+  CheckedFilePrint output(file);
+  bool ok = output.println("frequency_mhz,uptime_ms,rssi_dbm,observer_node,threshold_dbm,above_threshold") > 0;
+  for (size_t i = 0; i < band.history.size(); ++i)
+    ok &= output.printf("%.2f,%lu,%.1f,%s,%d,%u\n", band.mhz,
+        static_cast<unsigned long>(band.history.sampledAt(i)), band.history.at(i), deviceId.c_str(),
+        band.threshold, unsigned(band.history.at(i) >= band.threshold)) > 0;
+  ok &= output.finish();
+  file.close();
+  fieldStatus = ok ? "Saved RF trace" : "microSD write failed";
   draw();
 }
 
@@ -4111,17 +4518,19 @@ void saveBleEvidence() {
     draw();
     return;
   }
-  file.println("name,address,address_type,advertisement_type,rssi_dbm,connectable,service_count,services,payload_bytes,manufacturer,observer_node");
+  CheckedFilePrint output(file);
+  output.println("name,address,address_type,advertisement_type,rssi_dbm,connectable,service_count,services,payload_bytes,manufacturer,observer_node");
   for (const auto& device : bleObservations) {
-    file.printf("%s,%s,%u,%u,%d,%s,%u,%s,%u,%s,%s\n", csvField(device.name).c_str(),
+    output.printf("%s,%s,%u,%u,%d,%s,%u,%s,%u,%s,%s\n", csvField(device.name).c_str(),
                 device.address.c_str(), device.addressType, device.advertisementType, device.rssi,
                 device.connectable ? "true" : "false",
                 device.serviceCount, csvField(device.services).c_str(),
                 static_cast<unsigned>(device.payloadLength),
                 csvField(device.manufacturer).c_str(), deviceId.c_str());
   }
+  const bool ok = output.finish();
   file.close();
-  fieldStatus = "Saved " + path.substring(path.lastIndexOf('/') + 1);
+  fieldStatus = ok ? "Saved " + path.substring(path.lastIndexOf('/') + 1) : "microSD write failed";
   draw();
 }
 
@@ -4138,27 +4547,45 @@ void saveScoutEvidence() {
     draw();
     return;
   }
-  file.println("ip,responsive,observer_node,vantage");
-  const String observer = scoutRemoteNodeId.isEmpty() ? deviceId : scoutRemoteNodeId;
+  CheckedFilePrint output(file);
+  output.println("ip,responsive,observer_node,vantage");
   for (const String& host : discoveredHosts) {
-    file.printf("%s,true,%s,%s\n", host.c_str(), observer.c_str(),
-                scoutExecutor.c_str());
+    bool attributed = false;
+    if (std::find(localScoutHosts.begin(), localScoutHosts.end(), host) != localScoutHosts.end()) {
+      output.printf("%s,true,%s,local\n", host.c_str(), deviceId.c_str());
+      attributed = true;
+    }
+    for (const auto& job : remoteScoutJobs) {
+      if (std::find(job.hosts.begin(), job.hosts.end(), host) != job.hosts.end()) {
+        output.printf("%s,true,%s,remote\n", host.c_str(), job.nodeId.c_str());
+        attributed = true;
+      }
+    }
+    // Retained results from an earlier recurring pass may no longer have a
+    // provider in the current pass. Do not guess and misattribute them.
+    if (!attributed) output.printf("%s,true,,unknown\n", host.c_str());
   }
+  const bool ok = output.finish();
   file.close();
-  scoutStatus = "Saved " + path.substring(path.lastIndexOf('/') + 1);
+  scoutStatus = ok ? "Saved " + path.substring(path.lastIndexOf('/') + 1) : "microSD write failed";
   draw();
 }
 
-void scanWifi() {
-  fieldStatus = "Scanning...";
-  draw();
-  wifiObservations.clear();
-  const int count = WiFi.scanNetworks(false, true);
-  if (count < 0) {
-    fieldStatus = "Wi-Fi scan failed";
-  } else {
-    wifiObservations.reserve(count);
-    for (int index = 0; index < count; ++index) {
+bool observationScreen() {
+  return screen == ScreenState::WifiResults || screen == ScreenState::WifiChannels ||
+      screen == ScreenState::BleResults;
+}
+
+void finishWifiScan(int count) {
+  wifiScanning = false;
+  if (count >= 0) {
+    wifiObservations.clear();
+    // Sort scan indices first so the bounded result list keeps strongest APs.
+    std::vector<int> indices;
+    for (int i = 0; i < count; ++i) indices.push_back(i);
+    std::sort(indices.begin(), indices.end(), [](int a, int b) { return WiFi.RSSI(a) > WiFi.RSSI(b); });
+    for (size_t i = 0; i < indices.size() && i < 128; ++i) {
+      const int index = indices[i];
       WifiObservation observation;
       observation.ssid = WiFi.SSID(index).isEmpty() ? "<hidden>" : WiFi.SSID(index);
       observation.bssid = WiFi.BSSIDstr(index);
@@ -4167,43 +4594,55 @@ void scanWifi() {
       observation.auth = WiFi.encryptionType(index);
       wifiObservations.push_back(observation);
     }
-    fieldStatus = String(wifiObservations.size()) + " access points";
-  }
+    fieldStatus = String(wifiObservations.size()) + (count > 128 ? " strongest APs (128 limit)" : " access points");
+    if (screen == ScreenState::WifiResults) selection = 0;
+  } else fieldStatus = "Wi-Fi scan stopped/failed";
   WiFi.scanDelete();
-  selection = 0;
+  if (wifiScanWasOff) WiFi.mode(WIFI_OFF);
+  if (observationScreen()) draw();
+}
+
+void scanWifi() {
+  if (wifiScanning) {
+    esp_wifi_scan_stop();
+    finishWifiScan(-1);
+    return;
+  }
+  if (bleScanning) { fieldStatus = "Wait for BLE scan to finish"; draw(); return; }
+  if (screen == ScreenState::WifiDetail) screen = ScreenState::WifiResults;
+  wifiScanWasOff = WiFi.getMode() == WIFI_OFF;
+  if (wifiScanWasOff) WiFi.mode(WIFI_STA);
+  WiFi.scanDelete();
+  // Passive async scan leaves keyboard, fleet requests and display responsive.
+  const int result = WiFi.scanNetworks(true, true, true);
+  wifiScanStartedMs = millis();
+  wifiScanning = result == WIFI_SCAN_RUNNING;
+  fieldStatus = "Scanning Wi-Fi... Q to cancel";
+  if (!wifiScanning) finishWifiScan(result);
   draw();
 }
 
 void restoreWifiAfterBle() {
+  if (!restoreAfterBle || wifiSsid.isEmpty()) {
+    WiFi.mode(WIFI_OFF);
+    wifiRestorePending = false;
+    return;
+  }
   WiFi.mode(WIFI_STA);
   WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
   wifiRestorePending = true;
 }
 
-void scanBle() {
-  fieldStatus = "Scanning for 5 seconds...";
-  bleObservations.clear();
-  draw();
-
-  WiFi.scanDelete();
-  WiFi.disconnect(false, false);
-  WiFi.mode(WIFI_OFF);
-  delay(150);
-
-  NimBLEDevice::init("");
+void finishBleScan(bool cancelled) {
   NimBLEScan* scanner = NimBLEDevice::getScan();
-  if (scanner == nullptr) {
-    fieldStatus = "BLE scanner unavailable";
-    NimBLEDevice::deinit(true);
-    restoreWifiAfterBle();
+  if (cancelled && !scanner->stop()) {
+    fieldStatus = "BLE stop failed; waiting for scan";
     draw();
     return;
   }
-  scanner->clearResults();
-  scanner->setActiveScan(true);
-  scanner->setInterval(100);
-  scanner->setWindow(80);
-  NimBLEScanResults results = scanner->getResults(5000, false);
+  // Called only after scanning ends; callbacks no longer mutate the results.
+  NimBLEScanResults results = scanner->getResults();
+  bleObservations.clear();
   for (int index = 0; index < results.getCount(); ++index) {
     const NimBLEAdvertisedDevice* advertised = results.getDevice(index);
     if (advertised == nullptr) continue;
@@ -4239,11 +4678,58 @@ void scanBle() {
             });
   scanner->clearResults();
   NimBLEDevice::deinit(true);
-  fieldStatus = bleObservations.empty() ? "No advertisements found" :
-      String(bleObservations.size()) + " BLE devices";
+  bleScanning = false;
+  fieldStatus = String(bleObservations.size()) +
+      (cancelled ? " BLE devices (cancelled)" : " BLE devices (max 64)");
   restoreWifiAfterBle();
-  selection = 0;
+  if (screen == ScreenState::BleResults) selection = 0;
+  if (observationScreen()) draw();
+}
+
+void scanBle() {
+  if (bleScanning) { finishBleScan(true); return; }
+  if (wifiScanning || localHostScan.active() || remoteHostScan.active() || portScan.active()) {
+    fieldStatus = "Finish network scans before BLE";
+    draw();
+    return;
+  }
+  if (screen == ScreenState::BleDetail) screen = ScreenState::BleResults;
+  restoreAfterBle = WiFi.getMode() != WIFI_OFF && !wifiSsid.isEmpty();
+  WiFi.disconnect(false, false);
+  WiFi.mode(WIFI_OFF);
+  NimBLEDevice::init("");
+  NimBLEScan* scanner = NimBLEDevice::getScan();
+  if (scanner == nullptr) {
+    fieldStatus = "BLE scanner unavailable";
+    NimBLEDevice::deinit(true);
+    restoreWifiAfterBle();
+    draw();
+    return;
+  }
+  scanner->clearResults();
+  scanner->setMaxResults(64);
+  scanner->setActiveScan(false);
+  scanner->setInterval(100);
+  scanner->setWindow(80);
+  bleScanning = scanner->start(5000, false);
+  if (!bleScanning) {
+    NimBLEDevice::deinit(true);
+    restoreWifiAfterBle();
+  }
+  fieldStatus = bleScanning ? "Scanning BLE... Q to cancel" : "BLE scan failed to start";
   draw();
+}
+
+void updateObservationScans() {
+  if (wifiScanning) {
+    const int count = WiFi.scanComplete();
+    if (count != WIFI_SCAN_RUNNING) finishWifiScan(count);
+    else if (millis() - wifiScanStartedMs > 15000) {
+      esp_wifi_scan_stop();
+      finishWifiScan(-1);
+    }
+  }
+  if (bleScanning && !NimBLEDevice::getScan()->isScanning()) finishBleScan(false);
 }
 
 void loadEvidencePreview() {
@@ -4404,6 +4890,29 @@ void handleContextInput(const Keyboard_Class::KeysState& keys) {
     const size_t action = selection;
     closeContextMenu();
     if (origin == ScreenState::Scout && action == 7) saveScoutEvidence();
+    else if (origin == ScreenState::NfcResults || origin == ScreenState::SubGhz) {
+      if (action == 5 && origin == ScreenState::NfcResults) {
+        cap::readNdefContent(nfcReadText, nfcReadUrl, nfcReadUid);
+        nfcReadRow = 0;
+        openScreen(ScreenState::NfcViewer);
+      } else if (action == 4 && origin == ScreenState::NfcResults) {
+        cap::stop();
+        openScreen(ScreenState::NfcTools);
+      } else if (action == 1) saveCapEvidence(origin == ScreenState::NfcResults);
+      else if (action == 2) {
+        if (origin == ScreenState::NfcResults) cap::cycleNfcFilter(true);
+        else saveRadioTrace();
+      } else if (action == 3) {
+        if (origin == ScreenState::NfcResults) { cap::clearTags(); selection = 0; }
+        else cap::clearRadioHistory();
+        fieldStatus = "History cleared";
+      } else if (origin == ScreenState::NfcResults) {
+        if (cap::scanningNfc()) cap::stop(); else cap::scanNfc();
+      }
+      else if (cap::receiving()) cap::stop();
+      else cap::startRadio(cap::selectedBand());
+      draw();
+    }
     else if (origin == ScreenState::PortResults) startSelectedPortScan();
     else if (origin == ScreenState::WifiResults || origin == ScreenState::WifiDetail) {
       if (action == 0) scanWifi(); else saveWifiEvidence();
@@ -4440,11 +4949,43 @@ void handleContextInput(const Keyboard_Class::KeysState& keys) {
 }
 
 void goBack() {
+  if (screen == ScreenState::NfcPresets) { openScreen(ScreenState::NfcContent); return; }
+  if (screen == ScreenState::NfcViewer) {
+    cap::stop(); returnToMenu(ScreenState::NfcResults, 0); return;
+  }
+  if (screen == ScreenState::NfcTools) {
+    cap::stop();
+    returnToMenu(ScreenState::NfcResults, 0);
+    return;
+  }
+  if (screen == ScreenState::NfcWriteConfirm) {
+    cap::stop();
+    fieldStatus = "Write cancelled; edit or retry";
+    openScreen(ScreenState::NfcContent);
+    return;
+  }
+  if (screen == ScreenState::NfcContent || screen == ScreenState::NfcEmulation) {
+    if (screen == ScreenState::NfcContent) nfcPayload = input;
+    cap::stop();
+    input = "";
+    returnToMenu(ScreenState::NfcTools, nfcAction);
+    return;
+  }
+  if ((screen == ScreenState::WifiResults || screen == ScreenState::WifiChannels) && wifiScanning) {
+    esp_wifi_scan_stop();
+    finishWifiScan(-1);
+  }
+  if (screen == ScreenState::BleResults && bleScanning) finishBleScan(true);
   if (screen == ScreenState::WifiDetail) returnToScreen(ScreenState::WifiResults);
   else if (screen == ScreenState::BleDetail) returnToScreen(ScreenState::BleResults);
   else if (screen == ScreenState::WifiResults) returnToMenu(ScreenState::Observe, 0);
   else if (screen == ScreenState::WifiChannels) returnToMenu(ScreenState::Observe, 1);
   else if (screen == ScreenState::BleResults) returnToMenu(ScreenState::Observe, 2);
+  else if (screen == ScreenState::NfcResults || screen == ScreenState::SubGhz) {
+    const bool nfc = screen == ScreenState::NfcResults;
+    cap::stop();
+    returnToMenu(ScreenState::Observe, nfc ? 3 : 4);
+  }
   else if (screen == ScreenState::EvidencePreview) returnToScreen(ScreenState::EvidenceDetail);
   else if (screen == ScreenState::EvidenceDetail) returnToScreen(ScreenState::Evidence);
   else if (screen == ScreenState::ProjectDetail) returnToScreen(ScreenState::Projects);
@@ -4488,6 +5029,66 @@ void goBack() {
 void handleApplicationInput(const Keyboard_Class::KeysState& keys) {
   if (screen == ScreenState::ContextMenu) {
     handleContextInput(keys);
+    return;
+  }
+  if (screen == ScreenState::NfcViewer) {
+    if (backPressed(keys)) goBack();
+    else if (keys.enter) {
+      cap::readNdefContent(nfcReadText, nfcReadUrl, nfcReadUid);
+      nfcReadRow = 0;
+    } else if ((keys.up || pressedLetter(keys, ';')) && nfcReadRow) --nfcReadRow;
+    else if ((keys.down || pressedLetter(keys, '.')) && (nfcReadRow + 5) * 37 < nfcReadText.length()) ++nfcReadRow;
+    draw(); return;
+  }
+  if (screen == ScreenState::NfcPresets) {
+    moveSelection(keys, 17);
+    if (backPressed(keys)) goBack();
+    else if (keys.enter) {
+      if (!selection) saveNfcPreset();
+      else if (!nfcPresets[selection - 1].isEmpty()) {
+        input = nfcPresets[selection - 1];
+        nfcAction = (nfcAction / 2) * 2 + unsigned(nfcPresetUrls[selection - 1]);
+        fieldStatus = "Preset loaded; review then Enter";
+        openScreen(ScreenState::NfcContent);
+      } else {
+        fieldStatus = nfcPresetOccupied[selection - 1] ? "Invalid preset; check file on SD" : "Empty slot; use Save current content";
+        openScreen(ScreenState::NfcContent);
+      }
+    }
+    draw(); return;
+  }
+  if (screen == ScreenState::NfcTools) {
+    moveSelection(keys, 6);
+    if (backPressed(keys)) goBack();
+    else if (keys.enter) {
+      nfcAction = selection;
+      input = nfcPayload;
+      fieldStatus = "";
+      openScreen(ScreenState::NfcContent);
+    } else draw();
+    return;
+  }
+  if (screen == ScreenState::NfcWriteConfirm) {
+    if (backPressed(keys)) goBack();
+    else if (keys.enter) {
+      fieldStatus = "Writing; keep tag still...";
+      header("NFC / WRITING");
+      uiCanvas.setCursor(8, 48);
+      uiCanvas.print(fieldStatus);
+      uiCanvas.pushSprite(0, 0);
+      cap::writeNdef(nfcPayload, nfcContentIsUrl());
+      fieldStatus = "";
+      openScreen(ScreenState::NfcResults);
+    }
+    return;
+  }
+  if (screen == ScreenState::NfcEmulation) {
+    if (backPressed(keys) || keys.enter) goBack();
+    return;
+  }
+  if (screen == ScreenState::Connecting) {
+    if (backPressed(keys)) workOffline();
+    else if (pressedLetter(keys, 'w')) beginProvisioning();
     return;
   }
   if (keys.tab) {
@@ -4577,7 +5178,7 @@ void handleApplicationInput(const Keyboard_Class::KeysState& keys) {
     moveSelection(keys, openPorts.size());
     if (backPressed(keys)) goBack();
   } else if (screen == ScreenState::Observe) {
-    moveSelection(keys, 3);
+    moveSelection(keys, 5);
     if (backPressed(keys)) goBack();
     else if (keys.enter && selection == 0) {
       openScreen(ScreenState::WifiResults);
@@ -4590,11 +5191,43 @@ void handleApplicationInput(const Keyboard_Class::KeysState& keys) {
       openScreen(ScreenState::BleResults);
       scanBle();
       return;
+    } else if (keys.enter && selection == 3) {
+      fieldStatus = "";
+      cap::scanNfc();
+      openScreen(ScreenState::NfcResults);
+      return;
+    } else if (keys.enter && selection == 4) {
+      fieldStatus = "";
+      cap::startRadio(cap::selectedBand());
+      openScreen(ScreenState::SubGhz);
+      return;
+    }
+  } else if (screen == ScreenState::NfcResults) {
+    moveSelection(keys, cap::tags().size());
+    if (backPressed(keys)) goBack();
+    else if (leftPressed(keys) || rightPressed(keys)) cap::cycleNfcFilter(!leftPressed(keys));
+    else if (keys.enter) {
+      if (cap::scanningNfc()) cap::stop(); else cap::scanNfc();
+    }
+  } else if (screen == ScreenState::SubGhz) {
+    if (backPressed(keys)) goBack();
+    else if (keys.up || pressedLetter(keys, ';') || pressedLetter(keys, 'w')) {
+      cap::adjustRadioThreshold(true);
+      fieldStatus = "";
+    } else if (keys.down || pressedLetter(keys, '.') || pressedLetter(keys, 's')) {
+      cap::adjustRadioThreshold(false);
+      fieldStatus = "";
+    }
+    else if (leftPressed(keys) || rightPressed(keys))
+      cap::startRadio((cap::selectedBand() + (leftPressed(keys) ? 3 : 1)) % 4);
+    else if (keys.enter) {
+      if (cap::receiving()) cap::stop();
+      else cap::startRadio(cap::selectedBand());
     }
   } else if (screen == ScreenState::WifiResults) {
     moveSelection(keys, wifiObservations.size());
     if (backPressed(keys)) goBack();
-    else if (keys.enter && !wifiObservations.empty()) {
+    else if (keys.enter && !wifiScanning && !wifiObservations.empty()) {
       screen = ScreenState::WifiDetail;
       draw();
       return;
@@ -4606,7 +5239,7 @@ void handleApplicationInput(const Keyboard_Class::KeysState& keys) {
   } else if (screen == ScreenState::BleResults) {
     moveSelection(keys, bleObservations.size());
     if (backPressed(keys)) goBack();
-    else if (keys.enter && !bleObservations.empty()) {
+    else if (keys.enter && !bleScanning && !bleObservations.empty()) {
       screen = ScreenState::BleDetail;
       draw();
       return;
@@ -4698,8 +5331,8 @@ void handleApplicationInput(const Keyboard_Class::KeysState& keys) {
     else if (leftPressed(keys) || rightPressed(keys)) {
       const bool forward = rightPressed(keys);
       if (selection == 0) {
-        int value = static_cast<int>(uiTheme) + (forward ? 1 : 2);
-        uiTheme = static_cast<UiTheme>(value % 3);
+        int value = static_cast<int>(uiTheme) + (forward ? 1 : kThemeCount - 1);
+        uiTheme = static_cast<UiTheme>(value % kThemeCount);
         preferences.putUChar("theme", static_cast<uint8_t>(uiTheme));
       } else if (selection == 1) {
         navigationStyle = navigationStyle == NavigationStyle::Cards ?
@@ -4823,12 +5456,13 @@ void handleProvisionInput(const Keyboard_Class::KeysState& keys) {
       wifiSsid = preferences.getString("ssid", "");
       wifiPassword = preferences.getString("password", "");
       startConnecting();
-    }
+    } else workOffline();
     return;
   }
   if (keys.backspace && !input.isEmpty()) input.remove(input.length() - 1);
   for (const char value : keys.word) {
-    if (value >= 32 && value <= 126 && input.length() < 63) input += value;
+    if (value >= 32 && value <= 126 &&
+        input.length() < (screen == ScreenState::ProvisionSsid ? 32U : 63U)) input += value;
   }
   if (keys.enter && (screen == ScreenState::ProvisionPassword || !input.isEmpty())) {
     if (screen == ScreenState::ProvisionSsid) {
@@ -4867,6 +5501,40 @@ void handleEvidenceKeyInput(const Keyboard_Class::KeysState& keys) {
     notice = provisioningExecutionKey ? "Execution key saved" : "Evidence key saved";
     returnToMenu(ScreenState::SettingsTrust, provisioningExecutionKey ? 1 : 2);
     return;
+  }
+  draw();
+}
+
+void handleNfcContentInput(const Keyboard_Class::KeysState& keys) {
+  if (keys.tab) {
+    if (loadNfcPresets()) openScreen(ScreenState::NfcPresets);
+    else { fieldStatus = "microSD unavailable"; draw(); }
+    return;
+  }
+  if (keys.esc) { goBack(); return; }
+  const String before = input;
+  if (keys.backspace && !input.isEmpty()) input.remove(input.length() - 1);
+  for (const char c : keys.word) {
+    if (c >= 32 && c <= 126 && input.length() < 120) input += c;
+  }
+  if (input != before) fieldStatus = "";
+  if (keys.enter && input.isEmpty()) fieldStatus = "Enter content before continuing";
+  if (keys.enter && !input.isEmpty()) {
+    nfcPayload = input;
+    if (nfcAction < 2) {
+      if (cap::prepareNdefWrite(nfcPayload, nfcContentIsUrl())) {
+        openScreen(ScreenState::NfcWriteConfirm);
+        return;
+      }
+    } else if (wifiScanning || bleScanning || localHostScan.active() || remoteHostScan.active() || portScan.active()) {
+      fieldStatus = "Finish running scans first";
+      draw();
+      return;
+    } else if (cap::startEmulation(nfcPayload, nfcContentIsUrl(), nfcAction >= 4)) {
+      openScreen(ScreenState::NfcEmulation);
+      return;
+    }
+    fieldStatus = cap::status();
   }
   draw();
 }
@@ -4924,7 +5592,7 @@ void setup() {
   displayBrightness = preferences.getUChar("brightness", 160);
   if (displayBrightness < 64 || displayBrightness > 224) displayBrightness = 160;
   const uint8_t savedTheme = preferences.getUChar("theme", 0);
-  uiTheme = savedTheme <= 2 ? static_cast<UiTheme>(savedTheme) : UiTheme::Field;
+  uiTheme = savedTheme < kThemeCount ? static_cast<UiTheme>(savedTheme) : UiTheme::Field;
   const uint8_t savedNavigation = preferences.getUChar("nav_style", 0);
   navigationStyle = savedNavigation <= 1 ? static_cast<NavigationStyle>(savedNavigation) :
       NavigationStyle::Cards;
@@ -4994,6 +5662,19 @@ void setup() {
 
 void loop() {
   M5Cardputer.update();
+  // NFC target replies have tight deadlines. Keep emulation exclusive on the
+  // UI task; don't interleave HTTP waits, SD writes, scans or idle animations.
+  if (cap::emulating()) {
+    if (cap::update()) draw();
+    if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
+      lastInputMs = millis();
+      handleApplicationInput(M5Cardputer.Keyboard.keysState());
+    }
+    delay(1);
+    return;
+  }
+  updateObservationScans();
+  if (cap::update() && (screen == ScreenState::SubGhz || screen == ScreenState::NfcResults)) draw();
   updateGrove();
   if (serverReady) server.handleClient();
   // A successful fleet.ota.apply upload sets this rather than calling esp_restart()
@@ -5071,11 +5752,11 @@ void loop() {
       distributeScoutEvidence(localScoutHosts, deviceId);
       detectAndRecordChanges(localScoutHosts, deviceId);
       localScoutNextRunMs = millis() + static_cast<unsigned long>(scoutIntervalMinutes) * 60000UL;
-    } else if (millis() >= localScoutNextRunMs) {
+    } else if (!bleScanning && reconclave::uptimeDue(millis(), localScoutNextRunMs) &&
+               localHostScan.startRange(localScoutFirstHost,
+                   localScoutLastHost - localScoutFirstHost + 1)) {
       localScoutHosts.clear();
       localScoutNextRunMs = 0;
-      localHostScan.startRange(localScoutFirstHost,
-                               localScoutLastHost - localScoutFirstHost + 1);
       localChanged = true;
     }
   }
@@ -5144,10 +5825,10 @@ void loop() {
   }
   if (remoteNodeJobRecurring && !remoteNodeJobCancelled && remoteNodeJobNextRunMs != 0 &&
       static_cast<int32_t>(millis() - remoteNodeJobNextRunMs) >= 0 && evidenceStorageAvailable()) {
-    remoteNodeScanHosts.clear();
-    remoteNodeJobNextRunMs = 0;
     if (remoteHostScan.startRange(remoteNodeFirstHost,
                                   remoteNodeLastHost - remoteNodeFirstHost + 1)) {
+      remoteNodeScanHosts.clear();
+      remoteNodeJobNextRunMs = 0;
       remoteNodeJobWasRunning = true;
     }
   }
@@ -5192,13 +5873,17 @@ void loop() {
       handleProvisionInput(keys);
     } else if (screen == ScreenState::ProvisionEvidenceKey) {
       handleEvidenceKeyInput(keys);
+    } else if (screen == ScreenState::NfcContent) {
+      handleNfcContentInput(keys);
     } else if (screen == ScreenState::ProvisionProject) {
       handleProjectInput(keys);
     } else handleApplicationInput(keys);
   }
   const bool canIdle = screen != ScreenState::ProvisionSsid &&
       screen != ScreenState::ProvisionPassword && screen != ScreenState::Connecting &&
-      screen != ScreenState::ProvisionEvidenceKey && screen != ScreenState::ProvisionProject;
+      screen != ScreenState::ProvisionEvidenceKey && screen != ScreenState::ProvisionProject &&
+      screen != ScreenState::NfcContent && screen != ScreenState::NfcWriteConfirm &&
+      screen != ScreenState::NfcPresets && screen != ScreenState::NfcViewer;
   if (!idleActive && canIdle && screenTimeoutSeconds > 0 &&
       millis() - lastInputMs >= static_cast<unsigned long>(screenTimeoutSeconds) * 1000UL) {
     idleActive = true;

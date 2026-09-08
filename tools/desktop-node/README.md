@@ -11,7 +11,7 @@ Build the React interface once, then start the local application:
 
 ```bash
 cd tools/desktop-node/web
-npm install
+npm ci
 npm run build
 cd ..
 ../../.venv-desktop-node/bin/python desktop_app.py --mode both
@@ -21,13 +21,17 @@ Open <http://127.0.0.1:8767>. The live roster and command API are deliberately
 loopback-only. The Reconclave announcement and message endpoints remain
 available to other nodes on the LAN.
 
-Trusted capability requests can be enabled without placing secrets in shell
-history by using environment variables:
+Trusted capability requests accept environment variables. Do not type secret
+values directly into commands: shell history can retain inline assignments.
+For an interactive Bash session, read them without echo:
 
 ```bash
-RECONCLAVE_EXECUTION_KEY="..." RECONCLAVE_EVIDENCE_KEY="..." \
-  ../../.venv-desktop-node/bin/python desktop_app.py --mode both \
+read -r -s -p 'Execution key: ' RECONCLAVE_EXECUTION_KEY; printf '\n'
+read -r -s -p 'Evidence key: ' RECONCLAVE_EVIDENCE_KEY; printf '\n'
+export RECONCLAVE_EXECUTION_KEY RECONCLAVE_EVIDENCE_KEY
+../../.venv-desktop-node/bin/python desktop_app.py --mode both \
   --enable-network-scan --evidence-dir ./evidence
+unset RECONCLAVE_EXECUTION_KEY RECONCLAVE_EVIDENCE_KEY
 ```
 
 The UI directly invokes `system.info`, `desktop.resources`, and
@@ -68,11 +72,10 @@ publishing (`device_type`, version, artifact SHA-256, HMAC-signed locally),
 and staged batch rollout with per-target verification, a failure-threshold
 rollback trigger, and an explicit rollback action reverting already-updated
 targets to whichever release preceded the current rollout for that
-`device_type`. No shipped firmware currently implements the `fleet.ota.apply`
-side of this yet, so every rollout against a real device today reports
-`ineligible` rather than `verified`/`failed` — the orchestration, signing, and
-rollback logic are real and tested even though the loop isn't closed with
-device-side OTA application yet.
+`device_type`. Cardputer and P4 source implement `fleet.ota.apply`; interoperability
+and recovery must be validated on the target deployment. This coordinator's
+HMAC release records are separate from the detached Ed25519 publisher signatures
+in [release tooling](../../docs/releasing.md), which devices do not yet enforce.
 
 Workspace metadata is written
 atomically to the ignored `.reconclave-data/workspace.json` file with owner-only

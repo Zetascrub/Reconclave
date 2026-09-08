@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <IPAddress.h>
 #include <vector>
+#include <atomic>
 
 struct LocalHostResult { IPAddress ip; };
 
@@ -30,9 +31,9 @@ class LocalHostScanService {
   uint32_t ownIp_{0};
   uint32_t total_{0};
   uint32_t current_{0};
-  void* handle_{nullptr};
+  std::atomic<void*> handle_{nullptr};
   unsigned long startedMs_{0};
-  volatile bool done_{false};
-  volatile bool found_{false};
+  std::atomic<bool> done_{false};
+  std::atomic<bool> found_{false};
   std::vector<LocalHostResult> pending_;
 };

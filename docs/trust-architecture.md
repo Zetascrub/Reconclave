@@ -17,13 +17,14 @@ and replay resistance. It does not encrypt HTTP traffic.
 
 ## Provisioning and flashing
 
+Replace the synthetic example IDs below with your real device identities.
 Generate or reproduce the ignored build inputs from the repository root:
 
 ```sh
 python3 tools/provision_fleet.py \
-  --desktop-id rc-desktop-107c6123f60f \
-  --p4-id rc-p4-30eda0eab970 \
-  --cardputer-id rc-adv-288485756a70
+  --desktop-id rc-desktop-example \
+  --p4-id rc-p4-example \
+  --cardputer-id rc-adv-example
 ```
 
 The command creates `.reconclave-provisioning/fleet.json` with mode `0600` and

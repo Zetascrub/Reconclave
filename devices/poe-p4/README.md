@@ -40,6 +40,18 @@ network command trust source for a provisioned build.
 
 ## Build
 
+First generate the ignored trust headers from the repository root, using your
+actual fleet identities (the following are synthetic examples):
+
+```sh
+python3 tools/provision_fleet.py --desktop-id rc-desktop-example \
+  --p4-id rc-p4-example --cardputer-id rc-adv-example
+```
+
+See [fleet trust](../../docs/trust-architecture.md). Keep the store and generated
+headers private. Built images contain deployment keys and are not public release
+artifacts; see [release signing](../../docs/releasing.md).
+
 Activate ESP-IDF 5.4.2, then run:
 
 ```sh

@@ -22,7 +22,7 @@ fi
 
 if [ ! -d "$WEB_DIR/node_modules" ]; then
     echo "==> Installing web dependencies"
-    (cd "$WEB_DIR" && npm install)
+    (cd "$WEB_DIR" && npm ci)
 fi
 
 # Rebuild the web UI only when it's missing or source is newer than the last build,
