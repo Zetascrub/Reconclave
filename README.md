@@ -38,8 +38,8 @@ The desktop is the permanent hub; additional devices extend what the fleet can d
 | | Role | Explore |
 | :-- | :-- | :-- |
 | **Desktop coordinator** | Web interface, projects, workflows, fleet management and evidence custody. | [Desktop guide](tools/desktop-node/README.md) |
-| **Cardputer ADV** | Portable console with network discovery, Wi-Fi/BLE observation, NFC and sub-GHz tools. | [Cardputer guide](devices/cardputer-adv/README.md) |
-| **Unit PoE-P4** | Ethernet-attached execution node for network discovery, connectivity checks and automation. | [PoE-P4 guide](devices/poe-p4/README.md) |
+| **Cardputer ADV** | Portable console with network discovery, Wi-Fi/BLE observation, NFC and sub-GHz tools. | [Cardputer guide](devices/cardputer-adv/README.md) · [Hardware details & purchase](https://thepihut.com/products/m5stack-cardputer-adv) |
+| **Unit PoE-P4** | Ethernet-attached execution node for network discovery, connectivity checks and automation. | [PoE-P4 guide](devices/poe-p4/README.md) · [Hardware details & purchase](https://thepihut.com/products/unit-poe-with-esp32-p4) |
 | **K230 · planned** | Future vision and edge-AI node; not required for the current fleet. | [K230 notes](devices/k230/README.md) |
 
 ```mermaid
