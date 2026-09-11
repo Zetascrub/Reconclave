@@ -466,6 +466,163 @@ photo, which does one deliberate, bounded, synchronous capture per tap
 with no loop, is unaffected and is the recommended way to use the camera
 until this is revisited.
 
+## Driver parity check against the stock firmware backup
+
+To check whether the custom firmware rebuild was missing any drivers, the
+full stock SD card backup (`/mnt/Storage/k230-sdcard-backup-*.img.gz`,
+~15.6GB uncompressed) was decompressed and its two partitions extracted
+with `dd` (boot: sectors 61440-225279; rootfs: sectors 262144-30468750,
+from the stock image's own partition table), then mounted read-only with
+`fuse2fs` (no root/loop device needed - useful for future backup
+inspection without `sudo`, which isn't available in this environment).
+`debugfs -R "rdump ..."` was used to pull specific files/directories out
+regardless of Unix permissions (e.g. `/root/app/...`, otherwise
+unreadable as a non-root mount).
+
+Findings:
+
+- **Kernel modules**: exactly identical - `find -name '*.ko'` under
+  `/lib/modules` produced the same 288 files on both, byte-for-byte
+  matching names. Nothing is missing from the custom rebuild.
+- **DTB**: `k230-canmv-rm69a10.dtb` is byte-identical (same md5) between
+  stock and current. Hardware description hasn't changed; any gaps are
+  about firmware/config, not devicetree.
+- **BT/Wi-Fi firmware blobs**: identical file sets under
+  `/lib/firmware/aic8800*` (config `.txt` and the actual `.bin`
+  blobs - the first pass of this check used `find -iname '*aic*'`,
+  which only matches basenames and missed every `.bin` file since
+  they're named e.g. `fmacfw.bin`, not `aic*.bin`; re-run without that
+  filter to get the real picture).
+- **The devicetree has no BT/GNSS/modem/keyboard-controller/LoRa nodes at
+  all** - grepping every `compatible = "..."` string in the decompiled
+  DTB turns up only real SoC/board peripherals (sensors, ISP, MIPI, USB
+  OTG, etc.). AIC8800 (Wi-Fi/BT) and the TCA8418 keyboard aren't DT
+  devices on this board (USB/SDIO enumeration and GPIO-bit-banged I2C
+  respectively, as already documented elsewhere in this file) - matches
+  what's implemented.
+- **BT specifically**: `aic_btusb` loads, firmware blobs are present and
+  identical to stock, but the chip's Bluetooth-over-USB endpoint never
+  appears on `/sys/bus/usb/devices` at all (only the RTL8152 Ethernet
+  bridge and root hubs do) - `hci0` never gets created because nothing
+  ever binds to it, not because of a firmware/config difference. Wi-Fi
+  works fine on the same chip via a *different* bus (SDIO,
+  `/sys/bus/sdio/devices/mmc0:0001:1`, `wlan0` present and scannable).
+  Given every relevant file is identical to stock, this looks like a
+  hardware/power-sequencing quirk present in the original firmware too,
+  not a regression from the custom rebuild - not independently confirmed
+  by booting genuine stock firmware on this same unit, though.
+- The vendor's own software references an **nRF9151** modem
+  (`[nrf9151] IO2 iomux ...` in `k230_phone_ui`'s own startup log, see
+  below) - `src/gnss_receiver.cpp`'s Nordic-style AT command set wasn't
+  speculative after all, though it's still unconfirmed against this
+  board's actual `/dev/ttyS3`.
+
+## Reviving k230_phone_ui from the backup, and the Settings screen
+
+The vendor demo app (`k230_phone_ui`, single ~6MB binary, no separate
+per-app executables - "apps" are internal screens/pages within it) was
+extracted from the stock rootfs backup (same `debugfs rdump` approach as
+above, path `/root/app/k230_phone_ui/`) and actually **run directly on
+the current custom firmware** - not just statically analysed. Every one
+of its 18 shared library dependencies (`readelf -d`, checked against
+`find` on the live device) already exists on the custom image, so it
+just worked: `HOME=/root ./k230_phone_ui` from its own directory, no
+LD_LIBRARY_PATH juggling needed. This is a generally useful technique for
+future UI/behaviour questions about the stock app - cheaper and more
+reliable than reverse-engineering strings from the binary.
+
+Its Settings app's structure (confirmed via on-device photos, navigated
+live) is grouped sections, each a bold title + grey subtitle, containing
+rows with an icon, bold title, grey description, and a chevron (or an
+inline toggle/slider for a couple of rows):
+
+- **Connections** (Network, Bluetooth and modem): Wi-Fi, Ethernet,
+  Bluetooth, Cellular, USB Modem
+- **Display & input** (Screen, language and keyboard): Display, Language,
+  Date & time, Keyboard settings, Edge back (toggle)
+- **Sound & hardware** (Audio, sensors and power): Audio, Sensors
+  (AHT20), Charger (BQ25896), Battery
+- **System & about** (Device information and diagnostics): System,
+  About phone
+
+`devices/k230/ui_app.cpp`'s new `buildSettingsScreen()` follows this same
+visual pattern (`addSettingsSection()`/`addSettingsRow()`) but doesn't
+duplicate the home tiles that are already full top-level tools (Recon,
+Wireless, Evidence, ...) - it covers what didn't otherwise have a
+discoverable home: **Connections** (links to Network/Wireless/Location),
+**Display & hardware** (Brightness, moved here from DEVICES - which is
+now diagnostics-only, matching phone_ui's own System/Display split),
+**Trust & security** (execution-key status, new - previously only
+visible by reading `/run/reconclave/node-status` directly or via the
+NODE screen's raw text dump), and **System & about** (links to Device
+info/Node & jobs).
+
+Process hygiene when reviving/testing `k230_phone_ui` on real hardware:
+stop `S99reconclave-ui` and kill any stray `reconclave-k230-ui`/`ui-test`
+processes *by PID* first - `pkill -f` matched against `./k230_phone_ui`
+has been unreliable in this session when the process was launched with a
+relative path (argv[0] didn't match the full-path pattern), leaving a
+stray process that then fights a newly-launched one for the DRM device
+(`drmModeAtomicCommit failed: Permission denied` is the symptom - two
+clients contending for DRM master). Verify with `ps w | grep <name>`
+before assuming a kill worked.
+
+## A real LVGL alignment bug found while adding the SETTINGS tile
+
+Adding a 10th home tile (see below) meant changing the tile grid from 3x3
+to first 3x4, then 5x2 (5 columns matches `k230_phone_ui`'s own home
+screen layout exactly, confirmed via its touch-trace log:
+`HOME_LAYOUT ... cols=5 tile=156x118`, captured while reviving it above -
+divides 10 tiles evenly, unlike 3x4's orphaned single tile in an
+otherwise-empty last row). That made tiles taller (~224px vs ~144px),
+which is what actually exposed a **real, previously-invisible bug**: each
+tile's subtitle text (`LV_ALIGN_BOTTOM_LEFT`, via `createTile()` in
+`src/ui_shell.cpp`) rendered bunched up near the top of the tile, right
+under the title, instead of near the actual bottom.
+
+Root-caused with `lv_obj_get_y()`/`lv_obj_get_content_height()` probes
+(not guessed) to two compounding issues:
+
+1. `lv_obj_align()` (the plain, non-`_to` function used almost
+   everywhere in this codebase) does **not** compute a position
+   immediately in this LVGL build - reading its own source
+   (`lv_obj_pos.c`) shows it just sets a style "align" property plus a
+   raw offset, for the layout system to resolve later. `lv_obj_align_to()`
+   is a genuinely different function that computes the position
+   immediately (confirmed by reading its body: it calls
+   `lv_obj_get_content_height(base)` etc. directly and calls
+   `lv_obj_set_pos()` with the final numbers) - switched the subtitle to
+   this.
+2. That immediate computation depends on `lv_obj_get_content_height()` of
+   the tile, which was returning **78 against an actual 224px-tall
+   tile** - because `createTile()`'s tile object never had its padding
+   explicitly zeroed (`lv_obj_set_style_pad_all(tile, 0, 0)`), unlike
+   *every other* container in this file, so it was silently inheriting a
+   large default theme padding. `LV_ALIGN_TOP_LEFT` (the title) doesn't
+   depend on content height at all, which is exactly why it looked fine
+   and masked this for a long time - anything anchored BOTTOM/RIGHT/
+   CENTER on a container that skips explicitly zeroing padding is worth
+   treating as suspect elsewhere in this codebase too, not just here.
+
+Both are now fixed in `createTile()`. Worth knowing for next time: reading
+position back via `lv_obj_get_y()`/`_get_x()` **immediately** after
+`lv_obj_align()`/`align_to()`/`set_pos()` is unreliable even when the
+underlying fix is correct - `lv_obj_set_pos()` stores the target but the
+object's real `coords` (what `get_x`/`get_y` actually report) only
+update on the next layout/render pass, not synchronously. The
+`content_height` reading (a `lv_obj_set_size`-driven property, not a
+deferred position) was trustworthy immediately; the `_y`/`_x` readings
+after realigning were not - don't chase a "still wrong" diagnostic
+number after fixing something that's provably a static/`_size`-based
+property; verify position-related fixes visually instead.
+
+## Home screen: 10 tiles, 5x2
+
+`main()`'s tile grid is `createTileGrid(home, 5, 2)`: NETWORK, WIRELESS,
+RECON, LOCATION, ASSESSMENT, NODE, EVIDENCE, DEVICES, VISION, SETTINGS.
+See the two sections above for why 5x2 (not 3x3/3x4) and what SETTINGS
+covers.
+
 ## Cardputer capability parity
 
 Audited against `devices/cardputer-adv/README.md`'s feature list, confirmed

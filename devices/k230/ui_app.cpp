@@ -100,6 +100,7 @@ lv_obj_t* g_recon_details = nullptr;
 lv_obj_t* g_vision_details = nullptr;
 lv_obj_t* g_vision_status = nullptr;
 lv_obj_t* g_vision_screen = nullptr;
+lv_obj_t* g_settings_trust_status = nullptr;
 lv_obj_t* g_vision_preview = nullptr;
 lv_obj_t* g_vision_preview_hint = nullptr;
 // Created once in buildVisionScreen(), paused/resumed (never deleted) as
@@ -171,6 +172,7 @@ void showHostDetail(const std::string& address, lv_obj_t* return_screen);
 // Detail chain, where "back" means "the screen that opened this one", not
 // always the top-level home grid.
 void addDynamicBackButton(lv_obj_t* screen, lv_obj_t** target, lv_obj_t* fallback);
+std::string trustStatusLine();
 void showLastPhoto(const std::string& path, lv_obj_t* thumbnail_target);
 void openPhotoViewer();
 std::string readFirstLine(const std::string& path);
@@ -885,6 +887,9 @@ void refreshLiveDetails(lv_timer_t*) {
     std::string status = readTextFile("/run/reconclave/node-status");
     if (status.empty()) status = "NODE SERVICE OFFLINE\n\nNo runtime status is available.";
     lv_label_set_text(g_node_details, status.c_str());
+  }
+  if (g_settings_trust_status != nullptr) {
+    lv_label_set_text(g_settings_trust_status, trustStatusLine().c_str());
   }
   refreshReconHostList();
   refreshFindingsList();
@@ -1833,8 +1838,12 @@ lv_obj_t* buildDevicesScreen(lv_obj_t* home) {
   lv_obj_set_style_text_color(refresh_label, lv_color_hex(kColorAccent), 0);
   lv_obj_center(refresh_label);
 
+  // Brightness moved to SETTINGS (Display & hardware section) - this
+  // screen is device diagnostics only now, matching k230_phone_ui's own
+  // separation between its "System"/"About phone" pages and its
+  // "Display" settings page (see README's Settings section).
   lv_obj_t* card = lv_obj_create(screen);
-  lv_obj_set_size(card, 700, contentHeight(screen));
+  lv_obj_set_size(card, contentWidth(screen), contentHeight(screen));
   lv_obj_align(card, LV_ALIGN_TOP_LEFT, kSafeMargin, kContentTop);
   lv_obj_set_style_bg_color(card, lv_color_hex(kColorPanelLight), 0);
   lv_obj_set_style_radius(card, 10, 0);
@@ -1848,24 +1857,134 @@ lv_obj_t* buildDevicesScreen(lv_obj_t* home) {
   lv_obj_set_style_text_font(g_device_details, &lv_font_montserrat_16, 0);
   lv_obj_align(g_device_details, LV_ALIGN_TOP_LEFT, 0, 0);
 
-  lv_obj_t* control = lv_obj_create(screen);
-  lv_obj_set_size(control, 450, contentHeight(screen));
-  lv_obj_align(control, LV_ALIGN_TOP_RIGHT, -kSafeMargin, kContentTop);
-  lv_obj_set_style_bg_color(control, lv_color_hex(kColorPanelLight), 0);
-  lv_obj_set_style_radius(control, 10, 0);
-  lv_obj_set_style_border_width(control, 0, 0);
-  lv_obj_set_style_pad_all(control, 18, 0);
-  lv_obj_clear_flag(control, LV_OBJ_FLAG_SCROLLABLE);
+  return screen;
+}
 
-  lv_obj_t* heading = lv_label_create(control);
-  lv_label_set_text(heading, "DISPLAY BRIGHTNESS");
-  lv_obj_set_style_text_color(heading, lv_color_hex(kColorForeground), 0);
-  lv_obj_set_style_text_font(heading, &lv_font_montserrat_16, 0);
-  lv_obj_align(heading, LV_ALIGN_TOP_LEFT, 0, 0);
+// Settings screen - grouped sections of navigable/inline rows, styled after
+// k230_phone_ui's own Settings app (revived from the stock firmware backup
+// and inspected directly on-device - see README's Settings section): bold
+// section title + grey subtitle, then rows with an icon, title, description
+// and either a chevron (navigates) or an inline control (adjusts in place).
+// Unlike phone_ui's Settings, this doesn't duplicate the home tiles that
+// are already full top-level tools (Recon, Wireless, Evidence, ...) - it
+// covers what didn't otherwise have a home: hardware control (brightness,
+// moved out of DEVICES) and trust/security status, plus short links to the
+// two screens that are genuinely "configuration", not "a tool" (Network,
+// Device info).
+std::string trustStatusLine() {
+  const std::string status = readTextFile("/run/reconclave/node-status");
+  std::istringstream lines(status);
+  std::string line;
+  while (std::getline(lines, line)) {
+    if (line.rfind("TRUST", 0) == 0) {
+      // "TRUST             provisioned" -> "Execution trust: provisioned"
+      const auto value_start = line.find_first_not_of(' ', 5);
+      return "Execution trust: " +
+             (value_start == std::string::npos ? "unknown" : line.substr(value_start));
+    }
+  }
+  return "Execution trust: node service offline";
+}
 
-  lv_obj_t* slider = lv_slider_create(control);
-  lv_obj_set_size(slider, lv_pct(100), 18);
-  lv_obj_align(slider, LV_ALIGN_TOP_LEFT, 0, 54);
+void addSettingsSection(lv_obj_t* parent, const char* title, const char* subtitle) {
+  using namespace reconclave::ui;
+  lv_obj_t* wrap = lv_obj_create(parent);
+  lv_obj_set_size(wrap, lv_pct(100), 46);
+  lv_obj_set_style_bg_opa(wrap, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(wrap, 0, 0);
+  lv_obj_set_style_pad_all(wrap, 0, 0);
+  lv_obj_clear_flag(wrap, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t* title_label = lv_label_create(wrap);
+  lv_label_set_text(title_label, title);
+  lv_obj_set_style_text_font(title_label, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(title_label, lv_color_hex(kColorForeground), 0);
+  lv_obj_align(title_label, LV_ALIGN_TOP_LEFT, 0, 8);
+
+  lv_obj_t* subtitle_label = lv_label_create(wrap);
+  lv_label_set_text(subtitle_label, subtitle);
+  lv_obj_set_style_text_font(subtitle_label, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(subtitle_label, lv_color_hex(kColorSecondary), 0);
+  lv_obj_align(subtitle_label, LV_ALIGN_TOP_LEFT, 0, 30);
+}
+
+// A navigable row (target != nullptr, shows a chevron) or a purely
+// informational one (target == nullptr) - returns the row so a caller can
+// still attach its own content (see the brightness/trust rows below).
+lv_obj_t* addSettingsRow(lv_obj_t* parent, const char* symbol, const char* title,
+                        const char* subtitle, lv_obj_t* target) {
+  using namespace reconclave::ui;
+  lv_obj_t* row = lv_obj_create(parent);
+  lv_obj_set_size(row, lv_pct(100), 66);
+  lv_obj_set_style_bg_color(row, lv_color_hex(kColorPanelLight), 0);
+  lv_obj_set_style_bg_color(row, lv_color_hex(0x21485a), LV_STATE_PRESSED);
+  lv_obj_set_style_border_width(row, 0, 0);
+  lv_obj_set_style_radius(row, 10, 0);
+  lv_obj_set_style_pad_all(row, 14, 0);
+  lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+  if (target != nullptr) {
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(row, [](lv_event_t* event) {
+      lv_screen_load(static_cast<lv_obj_t*>(lv_event_get_user_data(event)));
+    }, LV_EVENT_CLICKED, target);
+  }
+
+  lv_obj_t* icon = lv_label_create(row);
+  lv_label_set_text(icon, symbol);
+  lv_obj_set_style_text_font(icon, &lv_font_montserrat_24, 0);
+  lv_obj_set_style_text_color(icon, lv_color_hex(kColorAccent), 0);
+  lv_obj_align(icon, LV_ALIGN_LEFT_MID, 0, 0);
+
+  lv_obj_t* title_label = lv_label_create(row);
+  lv_label_set_text(title_label, title);
+  lv_obj_set_style_text_font(title_label, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(title_label, lv_color_hex(kColorForeground), 0);
+  lv_obj_align(title_label, LV_ALIGN_TOP_LEFT, 44, -6);
+
+  lv_obj_t* subtitle_label = lv_label_create(row);
+  lv_label_set_text(subtitle_label, subtitle);
+  lv_obj_set_style_text_font(subtitle_label, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(subtitle_label, lv_color_hex(kColorSecondary), 0);
+  lv_obj_align(subtitle_label, LV_ALIGN_BOTTOM_LEFT, 44, 6);
+
+  if (target != nullptr) {
+    lv_obj_t* chevron = lv_label_create(row);
+    lv_label_set_text(chevron, LV_SYMBOL_RIGHT);
+    lv_obj_set_style_text_color(chevron, lv_color_hex(kColorSecondary), 0);
+    lv_obj_align(chevron, LV_ALIGN_RIGHT_MID, 0, 0);
+  }
+  return row;
+}
+
+lv_obj_t* buildSettingsScreen(lv_obj_t* home, lv_obj_t* network_screen, lv_obj_t* wireless_screen,
+                              lv_obj_t* devices_screen, lv_obj_t* node_screen,
+                              lv_obj_t* location_screen) {
+  using namespace reconclave::ui;
+  lv_obj_t* screen = createScreen();
+  addStatusBar(screen, "SETTINGS", true);
+  addBackButton(screen, home);
+
+  lv_obj_t* list = lv_obj_create(screen);
+  lv_obj_set_size(list, contentWidth(screen), contentHeight(screen));
+  lv_obj_align(list, LV_ALIGN_TOP_MID, 0, kContentTop);
+  lv_obj_set_style_bg_opa(list, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(list, 0, 0);
+  lv_obj_set_style_pad_all(list, 0, 0);
+  lv_obj_set_style_pad_row(list, 10, 0);
+  lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+
+  addSettingsSection(list, "Connections", "Network, wireless and location");
+  addSettingsRow(list, LV_SYMBOL_GPS, "Network", "Interface, route and connectivity", network_screen);
+  addSettingsRow(list, LV_SYMBOL_WIFI, "Wireless", "Scan APs and analyse channels", wireless_screen);
+  addSettingsRow(list, LV_SYMBOL_GPS, "Location", "GNSS fix for evidence geotagging", location_screen);
+
+  addSettingsSection(list, "Display & hardware", "Backlight");
+  lv_obj_t* brightness_row = addSettingsRow(list, LV_SYMBOL_SETTINGS, "Brightness",
+                                            "Drag to adjust the panel backlight", nullptr);
+  lv_obj_set_height(brightness_row, 84);
+  lv_obj_t* slider = lv_slider_create(brightness_row);
+  lv_obj_set_size(slider, lv_pct(100), 14);
+  lv_obj_align(slider, LV_ALIGN_BOTTOM_LEFT, 0, 0);
   lv_slider_set_range(slider, 5, 100);
   int percent = 75;
   if (findBacklight()) {
@@ -1883,13 +2002,20 @@ lv_obj_t* buildDevicesScreen(lv_obj_t* home) {
     if (output) output << raw << "\n";
   }, LV_EVENT_VALUE_CHANGED, nullptr);
 
-  lv_obj_t* hint = lv_label_create(control);
-  lv_label_set_text(hint, "Drag to adjust the panel backlight.\nChanges apply immediately.");
-  lv_obj_set_width(hint, lv_pct(100));
-  lv_label_set_long_mode(hint, LV_LABEL_LONG_MODE_WRAP);
-  lv_obj_set_style_text_color(hint, lv_color_hex(kColorSecondary), 0);
-  lv_obj_set_style_text_font(hint, &lv_font_montserrat_14, 0);
-  lv_obj_align(hint, LV_ALIGN_TOP_LEFT, 0, 96);
+  addSettingsSection(list, "Trust & security", "Signed remote capabilities");
+  lv_obj_t* trust_row = addSettingsRow(list, LV_SYMBOL_WARNING, "Execution trust",
+                                       "Set on-device via SSH: reconclave-trust provision", nullptr);
+  g_settings_trust_status = lv_label_create(trust_row);
+  lv_label_set_text(g_settings_trust_status, trustStatusLine().c_str());
+  lv_obj_set_style_text_font(g_settings_trust_status, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(g_settings_trust_status, lv_color_hex(kColorAccent), 0);
+  lv_obj_align(g_settings_trust_status, LV_ALIGN_RIGHT_MID, 0, 0);
+
+  addSettingsSection(list, "System & about", "Device information and jobs");
+  addSettingsRow(list, LV_SYMBOL_SETTINGS, "Device info", "Firmware, kernel, storage and SSH",
+                 devices_screen);
+  addSettingsRow(list, LV_SYMBOL_LOOP, "Node & jobs", "Trust status, coordination and jobs",
+                 node_screen);
 
   return screen;
 }
@@ -1942,11 +2068,14 @@ int main() {
   lv_obj_t* home = createScreen();
   addStatusBar(home, "RECONCLAVE", true);
 
-  // 3 columns x 2 rows, matching the §18 mockup's layout exactly (NETWORK
-  // WIRELESS / RECON VISION / EVIDENCE DEVICES reads column-major in the
-  // mockup; laid out row-major here since that's how createTileGrid
-  // addresses cells, with the same six capabilities).
-  lv_obj_t* grid = createTileGrid(home, 3, 3);
+  // 5 columns x 2 rows - divides our 10 tiles evenly (3x4 left an
+  // orphaned single tile in a mostly-empty last row - visibly wrong on a
+  // real screen, not just in theory). 5 columns also matches
+  // k230_phone_ui's own home screen layout exactly (confirmed via its
+  // own touch-trace log: "HOME_LAYOUT ... cols=5 tile=156x118", captured
+  // while reviving it from the stock firmware backup - see README's
+  // Settings section), so this isn't an arbitrary choice either.
+  lv_obj_t* grid = createTileGrid(home, 5, 2);
 
   lv_obj_t* network_screen = buildNetworkScreen(home);
   lv_obj_t* wireless_screen = buildWirelessScreen(home);
@@ -1964,6 +2093,8 @@ int main() {
   lv_obj_t* node_screen = buildNodeScreen(home);
   lv_obj_t* evidence_screen = buildEvidenceScreen(home);
   lv_obj_t* devices_screen = buildDevicesScreen(home);
+  lv_obj_t* settings_screen = buildSettingsScreen(home, network_screen, wireless_screen,
+                                                  devices_screen, node_screen, location_screen);
 
   struct TileSpec {
     const char* label;
@@ -1982,8 +2113,9 @@ int main() {
       {"ASSESSMENT", TileState::Live, assessment_screen, LV_SYMBOL_EDIT, "Set project, scope and operator"},
       {"NODE", TileState::Live, node_screen, LV_SYMBOL_LOOP, "Jobs, trust and coordination"},
       {"EVIDENCE", TileState::Live, evidence_screen, LV_SYMBOL_DIRECTORY, "Export and verify manifest"},
-      {"DEVICES", TileState::Live, devices_screen, LV_SYMBOL_SETTINGS, "Health, storage and brightness"},
-      {"VISION", TileState::Live, vision_screen, LV_SYMBOL_IMAGE, "Camera diagnostics; capture pending"},
+      {"DEVICES", TileState::Live, devices_screen, LV_SYMBOL_SETTINGS, "Firmware, kernel and storage"},
+      {"VISION", TileState::Live, vision_screen, LV_SYMBOL_IMAGE, "Camera capture; preview parked"},
+      {"SETTINGS", TileState::Live, settings_screen, LV_SYMBOL_SETTINGS, "Brightness, trust and connections"},
   };
   for (const auto& spec : tiles) {
     lv_obj_t* tile = createTile(grid, spec.label, spec.state, spec.symbol, spec.subtitle);

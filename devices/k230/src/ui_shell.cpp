@@ -1,6 +1,7 @@
 #include "ui_shell.h"
 
 #include <cstddef>
+#include <cstdio>
 #include <vector>
 
 #include "../assets/zeta_k230_logo.h"
@@ -157,6 +158,14 @@ lv_obj_t* createTile(lv_obj_t* grid, const char* label_text, TileState state,
 
   lv_obj_t* tile = lv_obj_create(grid);
   lv_obj_set_size(tile, tile_w, tile_h);
+  // Root cause of a real bug (see README's Home screen section): without
+  // this, the tile inherits a large default theme padding that every
+  // *other* container in this file explicitly zeroes - lv_obj_get_content_height()
+  // (what LV_ALIGN_BOTTOM_LEFT/etc. actually compute against) came back
+  // 78px against an 224px-tall tile, so the subtitle landed nowhere near
+  // the bottom. TOP_LEFT (the title, above) doesn't depend on content
+  // height, which is why it looked fine and masked this for a long time.
+  lv_obj_set_style_pad_all(tile, 0, 0);
   lv_obj_set_style_radius(tile, 12, 0);
   lv_obj_set_style_border_width(tile, state == TileState::Live ? 1 : 0, 0);
   lv_obj_set_style_border_color(tile, lv_color_hex(kColorAccent), 0);
@@ -195,7 +204,16 @@ lv_obj_t* createTile(lv_obj_t* grid, const char* label_text, TileState state,
     lv_label_set_long_mode(detail, LV_LABEL_LONG_MODE_WRAP);
     lv_obj_set_style_text_color(detail, lv_color_hex(kColorSecondary), 0);
     lv_obj_set_style_text_font(detail, &lv_font_montserrat_14, 0);
-    lv_obj_align(detail, LV_ALIGN_BOTTOM_LEFT, 14, -14);
+    // lv_obj_align() doesn't compute a position immediately - it just sets
+    // a style property + raw offset for the layout system to resolve
+    // later, and that resolution was landing BOTTOM_LEFT right under the
+    // title instead of near the tile's actual bottom (confirmed via
+    // lv_obj_get_y() while debugging - see README's Home screen section).
+    // lv_obj_align_to() (confirmed correct by reading lv_obj_pos.c
+    // directly: it computes off lv_obj_get_content_height(base) right
+    // away) doesn't have that problem.
+    lv_obj_update_layout(tile);  // resolve tile's own content-box/padding before using it as a base
+    lv_obj_align_to(detail, tile, LV_ALIGN_BOTTOM_LEFT, 14, -14);
   }
 
   if (state != TileState::Live) {
