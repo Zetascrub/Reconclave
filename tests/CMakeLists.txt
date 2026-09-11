@@ -42,3 +42,22 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(reconclave_ndef_content_tests PRIVATE -Wall -Wextra -Wpedantic -Werror)
 endif()
 add_test(NAME reconclave_ndef_content_tests COMMAND reconclave_ndef_content_tests)
+
+add_executable(reconclave_k230_recon_tests
+  k230_recon_tests.cpp
+  ../devices/k230/src/network_inventory.cpp
+  ../devices/k230/src/wifi_scanner.cpp
+  ../devices/k230/src/gnss_receiver.cpp)
+target_sources(reconclave_k230_recon_tests PRIVATE ../devices/k230/src/network_tools.cpp)
+target_sources(reconclave_k230_recon_tests PRIVATE ../devices/k230/src/trust_crypto.cpp ../devices/k230/src/json.cpp)
+target_sources(reconclave_k230_recon_tests PRIVATE ../devices/k230/src/trust_policy.cpp)
+target_sources(reconclave_k230_recon_tests PRIVATE ../devices/k230/src/discovery_job.cpp)
+target_sources(reconclave_k230_recon_tests PRIVATE ../devices/k230/src/evidence_store.cpp)
+target_sources(reconclave_k230_recon_tests PRIVATE ../devices/k230/src/host_knowledge.cpp)
+target_link_libraries(reconclave_k230_recon_tests PRIVATE pthread)
+target_include_directories(reconclave_k230_recon_tests PRIVATE ../devices/k230/src)
+target_compile_features(reconclave_k230_recon_tests PRIVATE cxx_std_17)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(reconclave_k230_recon_tests PRIVATE -Wall -Wextra -Wpedantic -Werror)
+endif()
+add_test(NAME reconclave_k230_recon_tests COMMAND reconclave_k230_recon_tests)

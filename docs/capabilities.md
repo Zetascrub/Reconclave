@@ -16,10 +16,15 @@ new capability contract.
 | Capability | Initial provider | Permission | v0.1 status |
 |---|---|---|---|
 | `system.info` | All nodes | Read-only, non-sensitive | Contract defined |
-| `net.discovery.scan` | Cardputer, PoE-P4, desktop | Assessment + network scope | Reserved |
-| `net.tcp.connect` | Cardputer, PoE-P4 | Assessment + host/port scope | Reserved |
+| `system.ssh.status` | K230 | Read-only administration status | Implemented on K230 |
+| `net.discovery.scan` | Cardputer, PoE-P4, desktop, K230 | Assessment + network scope | Implemented on K230 |
+| `net.tcp.connect` | Cardputer, PoE-P4, K230 | Assessment + host/port scope | Implemented on K230 |
+| `net.service.identify` | K230 | Assessment + host/port scope | Implemented on K230 |
 | `net.connectivity.check` | PoE-P4 | Read-only network health | Implemented |
-| `net.arp.snapshot` | PoE-P4 | Read-only neighbour cache | Implemented |
+| `net.arp.snapshot` | PoE-P4, K230 | Read-only neighbour cache | Implemented |
+| `net.hosts.snapshot` | K230 | Trusted assessment history | Implemented on K230 |
+| `assessment.findings.snapshot` | K230 | Trusted evidence-derived findings | Implemented on K230 |
+| `storage.evidence.manifest` | K230 | Trusted local evidence inventory | Implemented on K230 |
 | `radio.ble.scan` | Cardputer | Assessment | Reserved |
 | `radio.lora.send` | Cardputer | Explicit transmit | Reserved |
 | `location.gps.read` | Cardputer | Sensitive location | Reserved |

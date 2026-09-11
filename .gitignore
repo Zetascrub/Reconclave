@@ -1,11 +1,15 @@
 build/
 **/build/
+/build-k230/
+/build-native-node/
+/build-native-tools/
 **/.pio/
 **/managed_components/
 **/sdkconfig
 **/sdkconfig.old
 /.cache/
 /.venv*/
+/.toolchains/
 __pycache__/
 *.pyc
 **/node_modules/
