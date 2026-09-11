@@ -77,9 +77,124 @@ Verification against the real unit:
   logging is needed for a later milestone, add a repeating heartbeat line
   in `loop()` so a listener has something to catch regardless of timing.
 
+## Milestones 2+3: USB HID keyboard + ST7735 display (done, verified on hardware)
+
+Both landed together since they shared a debugging session. `src/main.cpp`
+now also enumerates as a composite USB HID keyboard and shows a boot logo
+on the ST7735.
+
+### USB HID keyboard, physical-button-triggered only
+
+Uses Arduino-ESP32's `USBHIDKeyboard` (from the `USB`/`USBHIDKeyboard`
+libraries bundled with `framework-arduinoespressif32`, confirmed present
+and `CONFIG_TINYUSB_HID_ENABLED=1` in this framework version's sdkconfig
+before relying on it). The only trigger is the device's own physical
+button — there's no network stack yet, so there is no remote/autonomous
+path to a keystroke at all right now. That's deliberately conservative,
+not the final design: once this device gains network connectivity, actual
+remote-triggered HID injection must be gated by the same signed-scope/
+trust model `devices/k230`'s `trust_policy.cpp` already implements
+(verified scope + evidence logging), never a bare "message arrives, keys
+get typed" path. The test payload is deliberately inert too — no Enter,
+no modifier keys, plain text — so it can't execute a focused shell command
+or trigger a shortcut, only visibly type a marker string.
+
+Verified on hardware: `lsusb -v` shows a genuine composite device
+(`bInterfaceClass 3` Human Interface Device + Communications/CDC Data),
+and pressing the button three times in a row typed
+`reconclave-t-dongle-s3 hid-test-ok #1/#2/#3` into a focused text field,
+counter incrementing correctly each time.
+
+One cosmetic gotcha hit along the way: `USB.productName()`/
+`manufacturerName()` calls in `setup()` silently no-op under
+`ARDUINO_USB_CDC_ON_BOOT=1`, because that flag makes the core call
+`USB.begin()` automatically *before* `setup()` runs (so `Serial` works
+immediately) — by the time our code could call those setters, `_started`
+is already true and they're guarded no-ops. Fixed by setting
+`USB_MANUFACTURER`/`USB_PRODUCT` as compile-time build flags instead,
+since those become the `ESPUSB` constructor's default values before any
+runtime code executes.
+
+Also note: `USBHIDKeyboard` sends US-layout HID keycodes regardless of the
+host's actual keyboard layout — confirmed on a UK-layout host, where the
+`#` in the test string rendered as `£` (the UK-layout character at that
+same physical key position). This is expected, not a bug — the only
+"real" fix would be hardcoding a target layout assumption, which is the
+wrong instinct for a general-purpose HID tool.
+
+### ST7735 display
+
+Uses Bodmer/TFT_eSPI, configured via build flags (not a `User_Setup.h`
+file) copied verbatim from the library's own bundled
+`User_Setups/Setup209_LilyGo_T_Dongle_S3.h` — this exact hardware already
+has an official, tested config upstream, so there was no need to derive
+pin/panel-variant settings from scratch. The 887x1774 source logo
+(`/mnt/Storage/Coding/Misc/Mascot/logo-80-160.png`, aspect ratio already
+matching the 80x160 panel exactly) was converted to a `PROGMEM` RGB565 C
+array (`src/logo.h`) via:
+```
+convert logo-80-160.png -resize 80x160! -depth 8 RGB:logo.raw
+```
+followed by a small Python script packing each 3-byte RGB pixel into a
+16-bit `0bRRRRRGGGGGGBBBBB` value (see git history for the exact script).
+
+Two real bugs were found and fixed empirically, in order:
+
+1. **Hang on `tft.init()`'s first SPI transaction.** Confirmed via a
+   host-independent diagnostic: since the hang also somehow prevented USB
+   CDC from coming up (no serial log reachable during the hang), the RGB
+   LED was pressed into service as a poor-man's log instead — distinct
+   colors set immediately before each risky call, so whichever color the
+   LED froze on identified exactly which call hung (froze on the color set
+   right before `tft.init()`). Root-caused by reading TFT_eSPI's own
+   ESP32-S3 driver source (`Processors/TFT_eSPI_ESP32_S3.h/.c`, fetched
+   locally by PlatformIO's `lib_deps`, not guessed from memory): the
+   library's SPI-busy-check macro polls a *raw hardware register pointer*
+   computed for a specific SPI host (`FSPI`/SPI2 by default), and something
+   about that host's state on this board/core combination left the busy
+   bit stuck. Fixed with the `-DUSE_HSPI_PORT` build flag, forcing the
+   library onto the alternate host (`HSPI`/SPI3) instead — a documented,
+   commonly-cited workaround for TFT_eSPI-on-ESP32-S3 hangs. This was
+   tested empirically (add the flag, reflash, observe) rather than fully
+   root-caused at the register level, since that would need live JTAG
+   debugging this session didn't have set up.
+2. **Wrong colors (cyan rendered as yellow).** `pushImage()` expects
+   big-endian pixel words by default; the generated array is plain
+   little-endian `uint16_t` (native ESP32 byte order). The fix is
+   `tft.setSwapBytes(true)` before `pushImage()` — NOT touching the pixel
+   data. (A wrong first attempt pre-swapped the R/B channels in the source
+   data instead, which combined with the *real* underlying byte-order bug
+   to produce a different wrong color, purple — a useful confirmation that
+   the bug was byte-order, not channel-order, once the math was checked.)
+
+### The upload workflow's real quirk: no auto-reset circuit
+
+Every single reflash in this session needed the same manual two-step
+dance, and this is a permanent fact about this hardware, not a one-off
+glitch: the T-Dongle S3 is a bare USB-A-plug dongle with no auto-reset
+transistor pair (the RTS/DTR-to-EN/BOOT circuit normal dev boards have).
+`esptool`'s software auto-reset-into-bootloader trick is unreliable here
+(fails with "No serial data received" more often than not once the app
+has been running for a while — some subsequent USB CDC session against
+the running app is enough to leave the state where it stops working). The
+reliable procedure every time:
+
+1. **To flash**: hold the button, unplug+replug the dongle while holding
+   it, keep holding ~2 more seconds, release. This forces GPIO0 low during
+   the chip's own power-on reset, entering the ROM bootloader
+   deterministically (`esptool`'s own connect handshake needs this to
+   succeed at all).
+2. **After a successful upload**: `esptool`'s post-upload "hard reset via
+   RTS pin" step frequently doesn't actually leave bootloader mode either
+   (confirmed via `lsusb -d 303a:` showing PID `0x1001` "Espressif USB
+   JTAG/serial debug unit" — the ROM's own identity, not the app's). A
+   second, *plain* unplug/replug (no button this time) is needed to force
+   a clean power-on boot into the newly-flashed app.
+
 ## Next steps (not started)
 
-Milestone 2+: USB HID descriptor scaffolding (enumerate as a keyboard, no
-injection logic yet), then wiring actual keystroke-injection capability
-behind Reconclave's signed-scope trust model — advertised, logged, never
-autonomous.
+Wiring actual keystroke-injection capability behind Reconclave's
+signed-scope trust model once this device has a network stack —
+advertised, logged, never autonomous. Also worth adding: a repeating
+serial heartbeat already exists in `loop()` for future live-serial
+debugging sessions.
