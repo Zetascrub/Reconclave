@@ -391,6 +391,81 @@ already applied is at `.toolchains/u-boot-build/` locally (gitignored) -
 regenerate via the recipe above rather than trusting that directory to
 still exist in a future session.
 
+## Vision / camera preview — parked, on-screen thumbnail unresolved
+
+The GC2093 camera itself works and is confirmed end-to-end: the ISP capture
+pipeline (`/dev/video2`, the `vvcam-isp`/`vvcam-mipi` driver stack) produces
+real frames, and `ffmpeg` (present on-device, `--enable-libv4l2`) captures
+and JPEG-encodes a still in about a second. `devices/k230/src/camera_capture.cpp`
+does this via a bounded `execlp("ffmpeg", ...)` subprocess. The VISION
+screen's **Capture photo** button uses this directly and works correctly -
+it saves a real, valid JPEG into the evidence store every time.
+
+What doesn't work yet: showing that image *on the device's own screen*.
+Two separate bugs were found and fixed on the way, and a third,
+unresolved issue remains:
+
+1. **Sizing bug (fixed)**: the preview thumbnail's "fit to box" scale was
+   computed from the `lv_image` object's own (pre-load) size, which is
+   meaningless before an image is loaded. Fixed by sizing against the
+   image's *parent* panel instead (see `setImageContain()`/`showLastPhoto()`).
+2. **JPEG format bug (fixed, real root cause of the literal black
+   screen)**: ffmpeg's auto-negotiated pixel format for this sensor's
+   native 4:2:2 output encodes a JPEG with Cb/Cr sampling factor `0x12`.
+   That's valid JPEG, but LVGL's on-device decoder is TJpgDec - a
+   deliberately minimal embedded decoder (confirmed via the vendored
+   `tjpgd.c` source: `lib/tjpgd/tjpgd.c`'s `jd_prepare()`) that only
+   accepts Cb/Cr sampling factor `0x11` and returns `JDR_FMT3` ("not
+   supported JPEG standard") for anything else - silently, with no
+   visible error, just a black image. Fixed by forcing
+   `-pix_fmt yuvj420p` on the ffmpeg command, which encodes standard
+   4:2:0 (`0x22`/`0x11`/`0x11`) that TJpgDec accepts. Confirmed via a
+   temporary `lv_image_decoder_get_info()` probe logging `JDR_FMT3` (as
+   an LVGL `[Warn] ... jd_prepare error: 8 lv_tjpgd.c:114` line) before
+   the fix, and a clean decode (`result=1`, correct 1920x1080 dimensions)
+   after it.
+3. **Still black, cause unresolved**: even with both fixes and correct
+   decode results confirmed by direct probing, the thumbnail still didn't
+   visibly render on the physical screen. Not yet root-caused - candidate
+   explanations not yet checked: an LVGL image-cache/redraw-invalidation
+   issue specific to swapping a file-backed image's source repeatedly, a
+   z-order/opacity issue in how the preview panel's placeholder hint label
+   and the image widget stack, or something specific to this on-device
+   LVGL build's TJpgDec/draw-buffer integration that a decode-success
+   result doesn't capture. A serial console (see the Boot splash section
+   above - same underlying need) or building a tiny standalone
+   LVGL+TJpgDec test program (bypassing this app entirely) would be the
+   next real steps, not further guessing via redeploy cycles.
+
+**Separately, a serious operational finding**: while iterating on a
+~1.2s-interval automatic live-preview loop (calling `captureStill()`
+directly from an LVGL timer on the main UI thread), the device's network
+stack went fully unreachable (ICMP included, not just SSH) and required a
+physical power cycle to recover - not just an unresponsive app, an
+apparent full board hang. `vvcam_isp` is an out-of-tree, kernel-tainting
+module (see its own probe log line), and the leading hypothesis was that
+rapid repeated open/close of the camera device was destabilizing it. A
+follow-up controlled test - 60 consecutive `ffmpeg` capture cycles over
+SSH alone (no GUI process running), roughly matching the app's own
+cadence - completed cleanly with zero failures, and a further ~4-minute
+soak test with the GUI's capture work moved onto a background thread
+(`previewWorkerLoop()`/`checkPreviewWorker()` in `ui_app.cpp`, replacing
+the blocking-timer design) also showed no reachability drops. So the hang
+was likely specific to blocking the single UI thread for the majority of
+every cycle (starving `lv_timer_handler()`, which also dispatches touch
+input and - per the DRM driver - display refresh) rather than the camera
+driver itself being unable to tolerate cycling; that's not proven,
+though, only the least-bad explanation the recreations available so far.
+
+Given both the unresolved black-screen bug and that operational history,
+the automatic live-preview loop is **not wired to auto-start** and its
+**Preview button is disabled** in the current build - parked rather than
+deleted (`startPreviewWorker`/`checkPreviewWorker`/`previewWorkerLoop`
+are still present and correct as far as they've been tested). Capture
+photo, which does one deliberate, bounded, synchronous capture per tap
+with no loop, is unaffected and is the recommended way to use the camera
+until this is revisited.
+
 ## Cardputer capability parity
 
 Audited against `devices/cardputer-adv/README.md`'s feature list, confirmed

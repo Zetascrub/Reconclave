@@ -54,11 +54,14 @@ void lv_linux_drm_set_rotation(lv_display_t* disp, int rotation);
 #include <cstdlib>
 #include <ctime>
 #include <algorithm>
+#include <atomic>
 #include <fstream>
 #include <iomanip>
 #include <iterator>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "src/ui_shell.h"
@@ -68,6 +71,7 @@ void lv_linux_drm_set_rotation(lv_display_t* disp, int rotation);
 #include "src/evidence_store.h"
 #include "src/host_knowledge.h"
 #include "src/json.h"
+#include "src/camera_capture.h"
 
 namespace {
 
@@ -77,6 +81,11 @@ constexpr char kEvidenceDir[] = "/root/reconclave/evidence";
 constexpr char kSessionPath[] = "/root/reconclave/session.conf";
 constexpr char kHostKnowledgePath[] = "/root/reconclave/hosts.json";
 constexpr char kLocalCommandPath[] = "/run/reconclave/local-command";
+// The GC2093 sensor's actual ISP capture output - confirmed via
+// `v4l2-ctl --list-formats-ext` reporting "camera: ok" and a real (not
+// black/garbage) test capture, as opposed to /dev/video0 (a memory-to-memory
+// codec node, not a camera) or /dev/video1 (same ISP pipeline, unverified).
+constexpr char kCameraDevice[] = "/dev/video2";
 
 volatile sig_atomic_t g_running = 1;
 void handleSignal(int) { g_running = 0; }
@@ -89,6 +98,28 @@ lv_obj_t* g_evidence_summary = nullptr;
 lv_obj_t* g_network_details = nullptr;
 lv_obj_t* g_recon_details = nullptr;
 lv_obj_t* g_vision_details = nullptr;
+lv_obj_t* g_vision_status = nullptr;
+lv_obj_t* g_vision_screen = nullptr;
+lv_obj_t* g_vision_preview = nullptr;
+lv_obj_t* g_vision_preview_hint = nullptr;
+// Created once in buildVisionScreen(), paused/resumed (never deleted) as
+// VISION is entered/left - see the screen's LV_EVENT_SCREEN_LOADED/
+// LV_EVENT_SCREEN_UNLOADED handlers.
+lv_timer_t* g_vision_preview_timer = nullptr;
+lv_obj_t* g_photo_viewer_screen = nullptr;
+lv_obj_t* g_photo_viewer_image = nullptr;
+lv_obj_t* g_photo_viewer_caption = nullptr;
+// Whatever was most recently captured (either a throwaway viewfinder frame
+// or a saved evidence photo) - the VISION screen's preview thumbnail and
+// the full-screen viewer both just show this, so "preview" and "capture"
+// share one code path instead of tracking two separate images.
+std::string g_last_photo_path;
+constexpr char kPreviewPath[] = "/tmp/vision-preview.jpg";
+// Fixed capture resolution (see camera_capture.cpp's -video_size), used to
+// compute a "contain" scale for the viewer/thumbnail without needing to
+// query the decoder for image dimensions first.
+constexpr int kCaptureWidth = 1920;
+constexpr int kCaptureHeight = 1080;
 lv_obj_t* g_device_details = nullptr;
 lv_obj_t* g_gnss_details = nullptr;
 reconclave::GnssReceiver g_gnss;
@@ -140,6 +171,8 @@ void showHostDetail(const std::string& address, lv_obj_t* return_screen);
 // Detail chain, where "back" means "the screen that opened this one", not
 // always the top-level home grid.
 void addDynamicBackButton(lv_obj_t* screen, lv_obj_t** target, lv_obj_t* fallback);
+void showLastPhoto(const std::string& path, lv_obj_t* thumbnail_target);
+void openPhotoViewer();
 std::string readFirstLine(const std::string& path);
 std::string readDeviceInfo();
 int arpNeighbourCount();
@@ -592,6 +625,163 @@ void exportWifiEvidence() {
 
   std::string status = "Saved " + std::to_string(g_last_wifi_scan.size()) + " networks to " + path;
   lv_label_set_text(g_evidence_status, status.c_str());
+  refreshEvidenceSummary();
+}
+
+// Scales `image` (already pointed at "A:"+path via lv_image_set_src) so a
+// fixed kCaptureWidth x kCaptureHeight source fits inside box_w x box_h
+// without distortion - LVGL doesn't auto-fit file-backed images to their
+// parent, and the capture resolution is fixed (see camera_capture.cpp), so
+// this is cheaper than querying the decoder for dimensions first.
+void setImageContain(lv_obj_t* image, const std::string& path, lv_coord_t box_w, lv_coord_t box_h) {
+  const std::string src = "A:" + path;
+  lv_image_set_src(image, src.c_str());
+  const int scale_w = static_cast<int>(256.0 * box_w / kCaptureWidth);
+  const int scale_h = static_cast<int>(256.0 * box_h / kCaptureHeight);
+  lv_image_set_scale(image, std::max(16, std::min(scale_w, scale_h)));
+}
+
+void showLastPhoto(const std::string& path, lv_obj_t* thumbnail_target) {
+  g_last_photo_path = path;
+  if (thumbnail_target != nullptr) {
+    // Size against the image's *parent* (the fixed-size panel it sits in),
+    // not the lv_image object itself - an lv_image with no source loaded
+    // yet reports a 0x0 (or content-driven, effectively meaningless) size,
+    // which made setImageContain() compute a near-zero scale and rendered
+    // nothing on the first call (see openPhotoViewer(), which already did
+    // this correctly).
+    lv_obj_t* box = lv_obj_get_parent(thumbnail_target);
+    setImageContain(thumbnail_target, path, lv_obj_get_width(box), lv_obj_get_height(box));
+  }
+}
+
+void openPhotoViewer() {
+  if (g_photo_viewer_screen == nullptr || g_last_photo_path.empty()) return;
+  // Scale to the actual black frame the image sits in (its parent), not
+  // the whole screen's content area - the caption row below it needs its
+  // own space, see buildPhotoViewerScreen().
+  lv_obj_t* frame = lv_obj_get_parent(g_photo_viewer_image);
+  setImageContain(g_photo_viewer_image, g_last_photo_path, lv_obj_get_width(frame),
+                  lv_obj_get_height(frame));
+  lv_obj_center(g_photo_viewer_image);
+  lv_label_set_text(g_photo_viewer_caption, g_last_photo_path.c_str());
+  lv_screen_load(g_photo_viewer_screen);
+}
+
+// Live preview runs on its own thread rather than blocking the LVGL/UI
+// thread for each ~1s camera capture: an earlier version called
+// captureStill() directly from a ~1.2s LVGL timer, which meant the single
+// UI thread spent the large majority of every cycle blocked inside a
+// subprocess wait - lv_timer_handler() (which also dispatches touch input)
+// simply wasn't running most of the time, so the whole app felt frozen,
+// not just choppy. The worker below does the actual capture I/O; the
+// LVGL-side timer (checkPreviewWorker, still on the UI thread) only ever
+// does a cheap atomic read and, when a new frame is ready, the same
+// non-blocking lv_image_set_src() work any other screen refresh does.
+//
+// The worker never touches an lv_obj_t directly (LVGL isn't thread-safe
+// for concurrent object access) - it only publishes a path and bumps a
+// generation counter under g_preview_mutex; only the UI-thread timer
+// applies that to the actual widgets.
+std::atomic<bool> g_preview_worker_running{false};
+std::atomic<std::uint64_t> g_preview_generation{0};
+std::mutex g_preview_mutex;
+bool g_preview_last_ok = false;
+std::string g_preview_last_error;
+std::thread g_preview_thread;
+std::uint64_t g_preview_applied_generation = 0;  // UI-thread only, no lock needed.
+
+void previewWorkerLoop() {
+  while (g_preview_worker_running.load(std::memory_order_relaxed)) {
+    const auto capture = reconclave::captureStill(kCameraDevice, kPreviewPath, 3000);
+    {
+      std::lock_guard<std::mutex> lock(g_preview_mutex);
+      g_preview_last_ok = capture.ok;
+      g_preview_last_error = capture.error;
+    }
+    g_preview_generation.fetch_add(1, std::memory_order_release);
+    // A short gap between captures rather than looping flat-out - the
+    // encode+write should be fully flushed before the next open, and this
+    // keeps ffmpeg from being re-invoked literally back-to-back.
+    for (int waited = 0; waited < 3 && g_preview_worker_running.load(std::memory_order_relaxed);
+        ++waited) {
+      usleep(100000);
+    }
+  }
+}
+
+void startPreviewWorker() {
+  if (g_preview_worker_running.exchange(true)) return;  // already running
+  g_preview_thread = std::thread(previewWorkerLoop);
+}
+
+void stopPreviewWorker() {
+  if (!g_preview_worker_running.exchange(false)) return;  // wasn't running
+  if (g_preview_thread.joinable()) g_preview_thread.join();
+}
+
+// Cheap, non-blocking: runs every ~150ms on the UI thread while VISION is
+// loaded (see buildVisionScreen), but does real work only on the ~once-a-
+// second tick where the worker has actually produced a new frame.
+void checkPreviewWorker(lv_timer_t*) {
+  const auto generation = g_preview_generation.load(std::memory_order_acquire);
+  if (generation == g_preview_applied_generation) return;  // nothing new yet
+  g_preview_applied_generation = generation;
+
+  bool ok = false;
+  std::string error;
+  {
+    std::lock_guard<std::mutex> lock(g_preview_mutex);
+    ok = g_preview_last_ok;
+    error = g_preview_last_error;
+  }
+  if (!ok) {
+    if (g_vision_status != nullptr) {
+      lv_label_set_text(g_vision_status, ("Capture failed: " + error).c_str());
+    }
+    return;
+  }
+  showLastPhoto(kPreviewPath, g_vision_preview);
+  if (g_vision_preview_hint != nullptr) lv_obj_add_flag(g_vision_preview_hint, LV_OBJ_FLAG_HIDDEN);
+  if (g_vision_status != nullptr) {
+    lv_label_set_text(g_vision_status,
+        "Capturing frames in the background (thumbnail rendering is a known issue - see the"
+        " warning above). Capture photo still saves correctly.");
+  }
+}
+
+// Capture photo: a single, deliberate, synchronous shot straight into the
+// evidence store. Unlike the live preview this is a one-off user action
+// (like a real camera's shutter button), so a ~1s block here is expected
+// shutter latency, not a background loop fighting the UI thread for time.
+void captureEvidencePhoto() {
+  if (g_vision_status == nullptr) return;
+  stopPreviewWorker();  // don't contend with the worker for the camera device
+  if (!pathExists(kCameraDevice)) {
+    lv_label_set_text(g_vision_status, "Camera device not present");
+    return;
+  }
+  if ((mkdir("/root/reconclave", 0755) != 0 && errno != EEXIST) ||
+      (mkdir(kEvidenceDir, 0755) != 0 && errno != EEXIST)) {
+    lv_label_set_text(g_vision_status, "Could not create evidence directory");
+    return;
+  }
+  std::time_t now = std::time(nullptr);
+  char timestamp[32];
+  std::strftime(timestamp, sizeof(timestamp), "%Y%m%d-%H%M%S", std::localtime(&now));
+  const std::string path = std::string(kEvidenceDir) + "/photo-" + timestamp + ".jpg";
+
+  lv_label_set_text(g_vision_status, "Capturing...");
+  lv_refr_now(nullptr);
+  const auto capture = reconclave::captureStill(kCameraDevice, path, 6000);
+  if (!capture.ok) {
+    lv_label_set_text(g_vision_status, ("Capture failed: " + capture.error).c_str());
+    return;
+  }
+  showLastPhoto(path, g_vision_preview);
+  if (g_vision_preview_hint != nullptr) lv_obj_add_flag(g_vision_preview_hint, LV_OBJ_FLAG_HIDDEN);
+  const std::string status = "Saved " + formatBytes(capture.size_bytes) + " to " + path;
+  lv_label_set_text(g_vision_status, status.c_str());
   refreshEvidenceSummary();
 }
 
@@ -1185,8 +1375,51 @@ lv_obj_t* buildVisionScreen(lv_obj_t* home) {
   addStatusBar(screen, "VISION", true);
   addBackButton(screen, home);
 
+  const bool camera_ready = pathExists(kCameraDevice);
+
+  lv_obj_t* capture_button = lv_button_create(screen);
+  lv_obj_set_size(capture_button, 170, kBackButtonHeight);
+  lv_obj_align(capture_button, LV_ALIGN_TOP_RIGHT, -kSafeMargin, kSafeMargin + kStatusBarHeight + 8);
+  lv_obj_set_style_bg_color(capture_button, lv_color_hex(kColorAmber), 0);
+  lv_obj_set_style_bg_color(capture_button, lv_color_hex(kColorUnavailable), LV_STATE_DISABLED);
+  lv_obj_set_style_radius(capture_button, 8, 0);
+  lv_obj_set_style_shadow_width(capture_button, 0, 0);
+  if (!camera_ready) lv_obj_add_state(capture_button, LV_STATE_DISABLED);
+  lv_obj_add_event_cb(capture_button, [](lv_event_t*) { captureEvidencePhoto(); },
+                      LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* capture_label = lv_label_create(capture_button);
+  lv_label_set_text(capture_label, LV_SYMBOL_IMAGE " Capture photo");
+  lv_obj_set_style_text_color(capture_label, lv_color_hex(kColorPanel), 0);
+  lv_obj_center(capture_label);
+
+  lv_obj_t* preview_button = lv_button_create(screen);
+  lv_obj_set_size(preview_button, 130, kBackButtonHeight);
+  lv_obj_align(preview_button, LV_ALIGN_TOP_RIGHT, -kSafeMargin - 170 - 10,
+               kSafeMargin + kStatusBarHeight + 8);
+  lv_obj_set_style_bg_color(preview_button, lv_color_hex(kColorPanelLight), 0);
+  lv_obj_set_style_border_color(preview_button, lv_color_hex(kColorAccent), 0);
+  lv_obj_set_style_border_width(preview_button, 1, 0);
+  lv_obj_set_style_radius(preview_button, 8, 0);
+  lv_obj_set_style_shadow_width(preview_button, 0, 0);
+  // Parked: the live preview's on-screen thumbnail is a known-broken issue
+  // (see g_vision_details above) - disabled rather than wired to a
+  // background loop nothing will render, until that's revisited.
+  lv_obj_add_state(preview_button, LV_STATE_DISABLED);
+  lv_obj_t* preview_label = lv_label_create(preview_button);
+  lv_label_set_text(preview_label, LV_SYMBOL_REFRESH " Preview");
+  lv_obj_set_style_text_color(preview_label, lv_color_hex(kColorAccent), 0);
+  lv_obj_center(preview_label);
+
+  // Left: diagnostics text. Right: a viewfinder/thumbnail - Preview fills
+  // it with a throwaway frame before committing to a shot, Capture photo
+  // fills it with the just-saved evidence image; tapping it either way
+  // opens the full-screen viewer.
+  constexpr lv_coord_t kPreviewWidth = 360;
+  constexpr lv_coord_t kGap = 16;
+  const lv_coord_t info_width = contentWidth(screen) - kPreviewWidth - kGap;
+
   lv_obj_t* card = lv_obj_create(screen);
-  lv_obj_set_size(card, contentWidth(screen), 250);
+  lv_obj_set_size(card, info_width, 210);
   lv_obj_align(card, LV_ALIGN_TOP_LEFT, kSafeMargin, kContentTop);
   lv_obj_set_style_bg_color(card, lv_color_hex(kColorPanelLight), 0);
   lv_obj_set_style_border_color(card, lv_color_hex(kColorAmber), 0);
@@ -1196,21 +1429,111 @@ lv_obj_t* buildVisionScreen(lv_obj_t* home) {
   lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
   g_vision_details = lv_label_create(card);
-  int video_nodes = 0;
-  for (int i = 0; i < 16; ++i) {
-    if (access(("/dev/video" + std::to_string(i)).c_str(), F_OK) == 0) ++video_nodes;
-  }
   std::ostringstream text;
-  text << (video_nodes > 0 ? LV_SYMBOL_OK " CAMERA PIPELINE READY" : LV_SYMBOL_WARNING " CAMERA OFFLINE")
-       << "\n\nVideo devices    " << video_nodes
-       << "\nK230 NPU          available in BSP"
-       << "\n\nPreview, OCR and object detection require the protected capture pipeline.";
+  text << (camera_ready ? LV_SYMBOL_OK " CAMERA READY (GC2093)" : LV_SYMBOL_WARNING " CAMERA OFFLINE")
+       << "\n\n" LV_SYMBOL_WARNING " Known issue: the on-screen preview thumbnail doesn't render yet"
+          " (parked - see README's Vision section). Capture photo still saves a real JPEG into the"
+          " evidence store (Evidence screen manifests and hashes it like any other file) - the"
+          " capture itself works, only the on-screen preview is affected.\n"
+          "K230 NPU available in BSP - OCR/QR decoding not built yet.";
   lv_label_set_text(g_vision_details, text.str().c_str());
   lv_obj_set_width(g_vision_details, lv_pct(100));
   lv_label_set_long_mode(g_vision_details, LV_LABEL_LONG_MODE_WRAP);
   lv_obj_set_style_text_color(g_vision_details, lv_color_hex(kColorForeground), 0);
   lv_obj_set_style_text_font(g_vision_details, &lv_font_montserrat_16, 0);
   lv_obj_align(g_vision_details, LV_ALIGN_TOP_LEFT, 0, 0);
+
+  lv_obj_t* preview_panel = lv_obj_create(screen);
+  lv_obj_set_size(preview_panel, kPreviewWidth, 210);
+  lv_obj_align(preview_panel, LV_ALIGN_TOP_RIGHT, -kSafeMargin, kContentTop);
+  lv_obj_set_style_bg_color(preview_panel, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_border_color(preview_panel, lv_color_hex(kColorAccent), 0);
+  lv_obj_set_style_border_width(preview_panel, 1, 0);
+  lv_obj_set_style_radius(preview_panel, 12, 0);
+  lv_obj_clear_flag(preview_panel, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(preview_panel, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(preview_panel, [](lv_event_t*) { openPhotoViewer(); }, LV_EVENT_CLICKED, nullptr);
+
+  g_vision_preview = lv_image_create(preview_panel);
+  lv_obj_center(g_vision_preview);
+  g_vision_preview_hint = lv_label_create(preview_panel);
+  lv_label_set_text(g_vision_preview_hint, "No frame yet - tap Preview to start the live feed");
+  lv_obj_set_style_text_color(g_vision_preview_hint, lv_color_hex(kColorSecondary), 0);
+  lv_obj_set_style_text_font(g_vision_preview_hint, &lv_font_montserrat_14, 0);
+  lv_obj_center(g_vision_preview_hint);
+  // g_vision_preview starts with no source, so it renders as nothing -
+  // the hint label behind it is what's actually visible until the first
+  // capture; setImageContain()/lv_image_set_src() draws over it after.
+
+  g_vision_status = lv_label_create(screen);
+  const std::string initial_status = camera_ready
+      ? "Tap Preview to start a live feed, or Capture photo to save a shot to evidence."
+      : "No camera device found at " + std::string(kCameraDevice);
+  lv_label_set_text(g_vision_status, initial_status.c_str());
+  lv_obj_set_width(g_vision_status, contentWidth(screen));
+  lv_label_set_long_mode(g_vision_status, LV_LABEL_LONG_MODE_WRAP);
+  lv_obj_set_style_text_color(g_vision_status, lv_color_hex(kColorSecondary), 0);
+  lv_obj_set_style_text_font(g_vision_status, &lv_font_montserrat_14, 0);
+  lv_obj_align(g_vision_status, LV_ALIGN_TOP_LEFT, kSafeMargin, kContentTop + 210 + 12);
+
+  // The actual capture work happens on a background thread (see
+  // previewWorkerLoop) - this timer just polls for a new frame cheaply on
+  // the UI thread, and only runs while VISION is actually the loaded
+  // screen (LOADED/UNLOADED fire on lv_screen_load(), so this naturally
+  // stops polling when the operator navigates away or opens the
+  // full-screen viewer, and resumes on return).
+  //
+  // Not auto-started on screen load for now: the on-screen thumbnail is a
+  // known-broken/parked issue (see the warning in g_vision_details above),
+  // so there's no point continuously exercising the camera/ISP driver in
+  // the background for a feature that doesn't render anything - especially
+  // right after this same repeated-cycling pattern was the leading
+  // suspect in an earlier full-device hang (see README's Vision section).
+  // Capture photo (captureEvidencePhoto(), a single deliberate shot) is
+  // unaffected and still fully works.
+  if (camera_ready) {
+    g_vision_preview_timer = lv_timer_create(checkPreviewWorker, 150, nullptr);
+    lv_timer_pause(g_vision_preview_timer);
+    lv_obj_add_event_cb(screen, [](lv_event_t*) {
+      if (g_vision_preview_timer != nullptr) lv_timer_pause(g_vision_preview_timer);
+      stopPreviewWorker();
+    }, LV_EVENT_SCREEN_UNLOADED, nullptr);
+  }
+
+  g_vision_screen = screen;
+  return screen;
+}
+
+lv_obj_t* buildPhotoViewerScreen(lv_obj_t* home) {
+  using namespace reconclave::ui;
+  lv_obj_t* screen = createScreen();
+  addStatusBar(screen, "PHOTO", true);
+  // Only ever opened from VISION's preview panel.
+  addDynamicBackButton(screen, &g_vision_screen, home);
+
+  constexpr lv_coord_t kCaptionHeight = 24;
+  constexpr lv_coord_t kGap = 6;
+  const lv_coord_t frame_height = contentHeight(screen) - kCaptionHeight - kGap;
+
+  lv_obj_t* frame = lv_obj_create(screen);
+  lv_obj_set_size(frame, contentWidth(screen), frame_height);
+  lv_obj_align(frame, LV_ALIGN_TOP_MID, 0, kContentTop);
+  lv_obj_set_style_bg_color(frame, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_border_width(frame, 0, 0);
+  lv_obj_set_style_radius(frame, 10, 0);
+  lv_obj_clear_flag(frame, LV_OBJ_FLAG_SCROLLABLE);
+
+  g_photo_viewer_image = lv_image_create(frame);
+
+  g_photo_viewer_caption = lv_label_create(screen);
+  lv_label_set_text(g_photo_viewer_caption, "");
+  lv_obj_set_width(g_photo_viewer_caption, contentWidth(screen));
+  lv_label_set_long_mode(g_photo_viewer_caption, LV_LABEL_LONG_MODE_DOTS);
+  lv_obj_set_style_text_color(g_photo_viewer_caption, lv_color_hex(kColorSecondary), 0);
+  lv_obj_set_style_text_font(g_photo_viewer_caption, &lv_font_montserrat_14, 0);
+  lv_obj_align(g_photo_viewer_caption, LV_ALIGN_TOP_LEFT, kSafeMargin, kContentTop + frame_height + kGap);
+
+  g_photo_viewer_screen = screen;
   return screen;
 }
 
@@ -1635,6 +1958,7 @@ int main() {
   buildFindingsScreen(home);
   lv_obj_t* recon_screen = buildReconScreen(home);
   lv_obj_t* vision_screen = buildVisionScreen(home);
+  buildPhotoViewerScreen(home);  // sets g_photo_viewer_screen; opened only from VISION's preview.
   lv_obj_t* location_screen = buildLocationScreen(home);
   lv_obj_t* assessment_screen = buildAssessmentScreen(home);
   lv_obj_t* node_screen = buildNodeScreen(home);
@@ -1684,5 +2008,10 @@ int main() {
     lv_timer_handler();
     usleep(5000);
   }
+  // g_preview_thread is a global, joined here rather than left for its
+  // destructor - a still-joinable std::thread at static-destruction time
+  // calls std::terminate(), and SIGINT/SIGTERM (handleSignal) can land
+  // while the worker is running regardless of which screen was active.
+  stopPreviewWorker();
   return 0;
 }

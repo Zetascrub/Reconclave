@@ -93,6 +93,7 @@ if(EXISTS "${K230_DEVICE_SYSROOT}/lib/liblvgl.so")
     src/trust_crypto.cpp
     src/evidence_store.cpp
     src/host_knowledge.cpp
+    src/camera_capture.cpp
     assets/zeta_k230_logo.c
   )
   target_include_directories(reconclave_k230_ui PRIVATE
@@ -103,7 +104,14 @@ if(EXISTS "${K230_DEVICE_SYSROOT}/lib/liblvgl.so")
   )
   target_link_directories(reconclave_k230_ui PRIVATE "${K230_DEVICE_SYSROOT}/lib")
   target_compile_definitions(reconclave_k230_ui PRIVATE LV_CONF_INCLUDE_SIMPLE=1)
-  target_link_libraries(reconclave_k230_ui PRIVATE lvgl lvgl_linux drm)
+  # pthread: the VISION screen's live preview runs its own capture loop on
+  # a std::thread rather than blocking the LVGL/UI thread for each ~1s
+  # camera capture (that blocking approach was tried first and made the
+  # whole UI visibly unresponsive - see devices/k230/README.md). atomic:
+  # this toolchain emits a libatomic call (__atomic_exchange_1) for
+  # std::atomic<bool>::exchange() even with -march=rv64gc's "A" extension
+  # enabled - confirmed by the link failing without this.
+  target_link_libraries(reconclave_k230_ui PRIVATE lvgl lvgl_linux drm pthread atomic)
 else()
   message(STATUS "K230 UI targets skipped: run devices/k230/fetch-device-sysroot.sh first")
 endif()
