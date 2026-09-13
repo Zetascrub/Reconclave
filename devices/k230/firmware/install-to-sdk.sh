@@ -39,7 +39,7 @@ rsync -a --delete \
 	--exclude '.git' --exclude '.toolchains' --exclude 'build*' \
 	--exclude '.venv*' --exclude '.cache' \
 	"$PROJECT_DIR/" "$PACKAGE_DIR/src/"
-rsync -a "$SCRIPT_DIR/rootfs-overlay/" "$ROOTFS_DIR/"
+rsync -a --exclude 'root/.ssh/' "$SCRIPT_DIR/rootfs-overlay/" "$ROOTFS_DIR/"
 chmod 0755 "$ROOTFS_DIR/etc/init.d/S90reconclave-node" \
 	"$ROOTFS_DIR/etc/init.d/S99reconclave-ui" \
 	"$ROOTFS_DIR/etc/init.d/S55reconclave-ssh-client" \
@@ -50,9 +50,25 @@ chmod 0755 "$ROOTFS_DIR/etc/init.d/S90reconclave-node" \
 	"$ROOTFS_DIR/usr/sbin/reconclave-screenshot" \
 	"$ROOTFS_DIR/usr/sbin/reconclave-nmap" \
 	"$ROOTFS_DIR/usr/sbin/reconclave-trust"
+# Root SSH key material is per-deployment and gitignored (public-source policy,
+# tools/check_public_tree.py), so it is not carried by the rsync above. Assemble
+# it here from the operator's local files, failing loudly rather than building a
+# key-only-login image (PasswordAuthentication no) with no authorized key.
+OVERLAY_SSH="$SCRIPT_DIR/rootfs-overlay/root/.ssh"
+if [[ ! -s "$OVERLAY_SSH/authorized_keys" ]]; then
+	echo "Missing $OVERLAY_SSH/authorized_keys" >&2
+	echo "This image uses key-only root login; a build without it would lock you out." >&2
+	echo "Copy devices/k230/firmware/ssh/authorized_keys.example there and add your public key(s)." >&2
+	exit 1
+fi
+install -D -m 0600 "$OVERLAY_SSH/authorized_keys" "$ROOTFS_DIR/root/.ssh/authorized_keys"
+# Client config carries no secret; use the operator's copy if present, else the template.
+if [[ -f "$OVERLAY_SSH/config" ]]; then
+	install -D -m 0600 "$OVERLAY_SSH/config" "$ROOTFS_DIR/root/.ssh/config"
+else
+	install -D -m 0600 "$SCRIPT_DIR/ssh/config" "$ROOTFS_DIR/root/.ssh/config"
+fi
 chmod 0700 "$ROOTFS_DIR/root/.ssh"
-chmod 0600 "$ROOTFS_DIR/root/.ssh/authorized_keys"
-chmod 0600 "$ROOTFS_DIR/root/.ssh/config"
 chmod 0600 "$ROOTFS_DIR/etc/ssh/sshd_config"
 rm -f "$ROOTFS_DIR/etc/init.d/S99zz_k230_phone_ui"
 

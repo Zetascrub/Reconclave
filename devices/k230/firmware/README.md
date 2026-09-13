@@ -75,10 +75,19 @@ complete, the node advertises only its public system and passive ARP
 capabilities; assessment tools remain unavailable by design.
 
 OpenSSH client and server are included. This personal appliance image installs
-the owner's two Ed25519 public keys and replaces the BSP's unsafe empty-root-
+the owner's Ed25519 public key(s) and replaces the BSP's unsafe empty-root-
 password configuration with key-only root administration. Password, empty-
 password, keyboard-interactive, agent-forwarding, TCP-forwarding, X11 and
-tunnel access are disabled. `ssh`, `scp`, `sftp`, `ssh-keygen` and
+tunnel access are disabled.
+
+The root `authorized_keys` is **per-deployment key material and is not committed**
+(public-source policy, `tools/check_public_tree.py`, which rejects any `.ssh/`
+path). Before building, copy `ssh/authorized_keys.example` to
+`rootfs-overlay/root/.ssh/authorized_keys` (gitignored) and add your public
+key(s); `install-to-sdk.sh` assembles it into the image and **fails the build if
+it is missing**, since a key-only-login image with no authorized key would lock
+you out. The generic client `config` ships from `ssh/config` unless a local
+override is present. `ssh`, `scp`, `sftp`, `ssh-keygen` and
 `ssh-keyscan` remain available locally for authorised field workflows.
 The device generates a separate Ed25519 outbound client identity on first boot;
 its public key is returned by `system.ssh.status` so a coordinator can arrange

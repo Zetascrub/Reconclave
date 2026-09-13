@@ -1,3 +1,5 @@
+# Installed to /root/.ssh/config by install-to-sdk.sh. Generic, no secret:
+# outbound SSH is key-only with strict host-key verification.
 Host *
     IdentityFile ~/.ssh/id_ed25519
     IdentitiesOnly yes
