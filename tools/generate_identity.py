@@ -91,11 +91,15 @@ def render_css(data: dict) -> str:
     lines: list[str] = []
     lines.append(f"/* {GENERATED_BANNER} */")
     lines.append("/* Canonical Reconclave palette for web surfaces (desktop UI, device web UIs). */")
+    lines.append("/* Each token is provided as a hex value and an -rgb triple; the triple lets a")
+    lines.append("   consumer build translucent variants, e.g. rgba(var(--rc-accent-rgb), .14). */")
     lines.append(":root {")
     lines.append("  color-scheme: dark;")
     for name, spec in palette.items():
         css_name = name.replace("_", "-")
+        r, g, b = hex_to_rgb(spec["hex"])
         lines.append(f"  --rc-{css_name}: {spec['hex']};  /* {spec['role']} */")
+        lines.append(f"  --rc-{css_name}-rgb: {r},{g},{b};")
     lines.append("}")
     lines.append("")
     return "\n".join(lines)
