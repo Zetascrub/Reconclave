@@ -21,6 +21,7 @@ provisioned: download source, generate your own trust keys, then build locally.
 | Available operations | [Capabilities](capabilities.md) |
 | Fleet identities and private keys | [Trust architecture](trust-architecture.md) |
 | Firmware interface conventions | [UI design](ui-design.md) |
+| Brand identity and scope direction | [Identity & scope review](identity-and-scope-review.md) |
 | Reliability and recovery | [Reliability](reliability.md) |
 
 ## Develop and release

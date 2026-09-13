@@ -120,6 +120,30 @@ truncation.
 
 ## 6. Colour system
 
+**Canonical brand palette (single source of truth):** the actual hex values are
+defined once in [`common/identity/identity.json`](../common/identity/identity.json)
+and generated into `common/identity/include/reconclave/identity.h` (C++, both
+`0xRRGGBB` and `RGB565`) and `common/identity/identity.css` (`--rc-*` custom
+properties). Every surface consumes those rather than hardcoding hexes — C++/LVGL
+and TFT devices via the header, web surfaces (desktop UI and any device web UI)
+via the stylesheet. Do not copy a hex value into a device; reference the token
+and, if it must change, change it in `identity.json` and regenerate.
+
+| Token | Hex | Role |
+| --- | --- | --- |
+| `accent` | `#00cdd7` | Primary accent / cyan: interactive, focus, trusted, brand |
+| `warning` | `#ffaa1c` | Attention / amber: running, unpaired, degraded, caution |
+| `surface` | `#0e222e` | Base surface / panel background |
+| `surface_raised` | `#16303f` | Raised surface: cards, headers, selected rows |
+| `ink` | `#fff2d7` | Primary foreground text (warm off-white) |
+| `ink_muted` | `#c9b896` | Secondary text, labels, muted detail |
+| `disabled` | `#3a4552` | Unavailable / disabled capability or node |
+
+The table below is the **semantic role layer** the on-device theme engine remaps
+from (see the Cardputer `color565` remap): the RGB triples name design roles,
+and each theme renders them to concrete colours. The default (Neon Grid / Field)
+rendering of these roles is the canonical brand palette above.
+
 | Role | RGB | Use |
 | --- | --- | --- |
 | Canvas | `5, 10, 16` | Main background |

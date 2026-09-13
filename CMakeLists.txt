@@ -5,6 +5,7 @@ option(RECONCLAVE_BUILD_TESTS "Build native protocol tests" ON)
 option(RECONCLAVE_BUILD_K230 "Build the K230 native app (requires a riscv64 cross toolchain, see devices/k230/toolchain-riscv64-linux-gnu.cmake)" OFF)
 
 add_subdirectory(common/protocol)
+add_subdirectory(common/identity)
 
 if(RECONCLAVE_BUILD_TESTS)
   enable_testing()
