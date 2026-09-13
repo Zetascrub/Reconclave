@@ -98,10 +98,12 @@ the fleet is four **layers**, not one image:
 
 ## 6. Follow-up work (not yet done)
 
-1. **Migrate each surface onto `common/identity`** — replace the hardcoded hexes
-   in `devices/k230/src/ui_shell.h`, the Cardputer theme, and the T-Dongle
-   `web_ui_page.h` with the generated tokens; add a `generate_identity.py
-   --check` step to CI.
+1. **Migrate each surface onto `common/identity`** — *K230 done* (`ui_shell.h`
+   now aliases the identity tokens). The *Cardputer* is intentionally left as its
+   own richer three-theme remap engine, aligned at the semantic layer and
+   documented in `common/identity/README.md`'s "Consumer status" rather than
+   flattened onto the 7 tokens. Still open: add a `generate_identity.py --check`
+   step to CI so the generated headers can't go stale.
 2. **Extract the T-Dongle-S3 to its own project** — move `devices/t-dongle-s3/`
    out to a standalone repo/project, preserving its history and work. It may
    depend on `common/identity` for shared branding but leaves the fleet

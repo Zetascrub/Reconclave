@@ -41,6 +41,16 @@ this library sits alongside `protocol`.
 
 **Web**: `@import` or link `identity.css` and reference `var(--rc-accent)` etc.
 
+## Consumer status
+
+Where each surface stands relative to this source of truth:
+
+| Surface | Status |
+| :-- | :-- |
+| **K230 touch UI** (`devices/k230/src/ui_shell.h`) | Sources the tokens directly — its `kColor*` names alias `reconclave::identity::kColor*`. No drift possible. |
+| **Desktop / device web UIs** | Reference `identity.css` (`var(--rc-*)`). |
+| **Cardputer ADV theme** (`devices/cardputer-adv/src/main.cpp`) | Intentionally **not** a direct consumer. It runs a richer three-theme `color565` remap engine whose *semantic* role palette matches [`docs/ui-design.md` §6](../../docs/ui-design.md); its default (Field / Neon-Grid) theme renders those roles to values that approximate these tokens — chrome→`surface` and attention→`warning` match exactly, while accent (`#00e1eb` vs `#00cdd7`), `surface_raised`, and `ink_muted` differ by a few units as deliberate theme styling. It also defines roles this set does not (canvas, two borders, selected-surface). Considered aligned at the semantic layer; a future pass could grow this token set to the full role list and have the Cardputer remap source from it. |
+
 ## The palette decision
 
 The canonical palette is the **"product family" set** already used by the
