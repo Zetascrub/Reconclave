@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+
+command=${1:-}
+screen=${2:-}
+if [ "$command" != "screen" ] || [ -z "$screen" ]; then
+    echo "Usage: reconclave-ui screen SCREEN" >&2
+    echo "Screens: home tools network wifi-survey wifi-setup recon findings nmap packet evidence vision location session node device settings" >&2
+    exit 2
+fi
+
+case "$screen" in
+    home|tools|network|wifi-survey|wifi-setup|recon|findings|nmap|packet|evidence|vision|location|session|node|device|settings) ;;
+    *) echo "Unknown screen: $screen" >&2; exit 2 ;;
+esac
+
+directory=/run/reconclave
+mkdir -p "$directory"
+umask 077
+temporary="$directory/.ui-command.$$"
+trap 'rm -f "$temporary"' EXIT INT TERM
+printf 'screen %s\n' "$screen" >"$temporary"
+mv "$temporary" "$directory/ui-command"
+trap - EXIT INT TERM
+echo "Queued screen: $screen"

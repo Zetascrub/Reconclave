@@ -1,0 +1,17 @@
+#!/bin/sh
+
+KEY=/root/.ssh/id_ed25519
+
+case "${1:-}" in
+	start)
+		mkdir -p /root/.ssh
+		chmod 700 /root/.ssh
+		if [ ! -f "$KEY" ]; then
+			ssh-keygen -q -t ed25519 -N '' -C 'reconclave-k230-client' -f "$KEY"
+		fi
+		chmod 600 "$KEY" /root/.ssh/authorized_keys /root/.ssh/config
+		chmod 644 "$KEY.pub"
+		;;
+	stop) ;;
+	*) echo "Usage: $0 {start|stop}" >&2; exit 2 ;;
+esac

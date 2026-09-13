@@ -1,0 +1,49 @@
+#!/bin/sh
+set -eu
+
+KEY_DIR=/root/reconclave/trust
+KEY_FILE=$KEY_DIR/execution.key
+
+status() {
+	if [ -f "$KEY_FILE" ] && [ "$(wc -c < "$KEY_FILE")" -eq 65 ]; then
+		echo "Execution trust: provisioned"
+	else
+		echo "Execution trust: unprovisioned"
+	fi
+}
+
+provision() {
+	[ -t 0 ] || { echo "Provisioning requires an interactive terminal." >&2; exit 2; }
+	temporary=
+	trap 'stty echo 2>/dev/null || true; [ -z "$temporary" ] || rm -f "$temporary"' EXIT HUP INT TERM
+	printf 'Execution passphrase: '
+	stty -echo
+	IFS= read -r first
+	stty echo
+	printf '\nConfirm passphrase: '
+	stty -echo
+	IFS= read -r second
+	stty echo
+	printf '\n'
+	[ -n "$first" ] || { echo "Passphrase cannot be empty." >&2; exit 2; }
+	[ "$first" = "$second" ] || { echo "Passphrases do not match." >&2; exit 2; }
+	umask 077
+	mkdir -p "$KEY_DIR"
+	temporary="$KEY_DIR/.execution.key.$$"
+	printf %s "$first" | sha256sum | awk '{print $1}' > "$temporary"
+	[ "$(wc -c < "$temporary")" -eq 65 ] || { echo "Key derivation failed." >&2; exit 1; }
+	mv "$temporary" "$KEY_FILE"
+	temporary=
+	trap - EXIT HUP INT TERM
+	first=
+	second=
+	chmod 600 "$KEY_FILE"
+	/etc/init.d/S90reconclave-node restart
+	echo "Execution trust provisioned; node restarted with authenticated tools enabled."
+}
+
+case "${1:-status}" in
+	status) status ;;
+	provision) provision ;;
+	*) echo "Usage: reconclave-trust [status|provision]" >&2; exit 2 ;;
+esac
