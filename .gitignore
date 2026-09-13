@@ -20,6 +20,7 @@ __pycache__/
 /.claude/
 devices/poe-p4/main/generated_trust.h
 devices/cardputer-adv/src/generated_trust.h
+devices/t-dongle-s3/src/generated_trust.h
 # K230 appliance root SSH key material is per-deployment, supplied at build time
 # from devices/k230/firmware/ssh/*.example — never committed (public-source policy).
 devices/k230/firmware/rootfs-overlay/root/.ssh/
