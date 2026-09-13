@@ -8,17 +8,22 @@
 
 #include "lvgl/lvgl.h"
 
+#include "reconclave/identity.h"
+
 namespace reconclave::ui {
 
-// Zeta Mascot palette (devices/cardputer-adv's Display & Interface theme),
-// reused here so the K230 and Cardputer read as the same product family.
-constexpr uint32_t kColorPanel = 0x0e222e;
-constexpr uint32_t kColorPanelLight = 0x16303f;
-constexpr uint32_t kColorAccent = 0x00cdd7;
-constexpr uint32_t kColorAmber = 0xffaa1c;
-constexpr uint32_t kColorForeground = 0xfff2d7;
-constexpr uint32_t kColorSecondary = 0xc9b896;
-constexpr uint32_t kColorUnavailable = 0x3a4552;
+// Palette aliased onto the canonical Reconclave identity tokens
+// (common/identity — the single source of truth). The local kColor* names are
+// kept so existing call sites are unchanged; the values now come from one
+// place, so the K230 and the rest of the fleet can no longer drift apart. The
+// values are identical to the previous literals, so this is not a visual change.
+constexpr uint32_t kColorPanel = identity::kColorSurface;
+constexpr uint32_t kColorPanelLight = identity::kColorSurfaceRaised;
+constexpr uint32_t kColorAccent = identity::kColorAccent;
+constexpr uint32_t kColorAmber = identity::kColorWarning;
+constexpr uint32_t kColorForeground = identity::kColorInk;
+constexpr uint32_t kColorSecondary = identity::kColorInkMuted;
+constexpr uint32_t kColorUnavailable = identity::kColorDisabled;
 
 // The RM69A10 panel has physically rounded corners - content placed flush
 // against a corner gets visually clipped. Every screen keeps at least this

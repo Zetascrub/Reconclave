@@ -131,7 +131,7 @@ if(EXISTS "${K230_DEVICE_SYSROOT}/lib/liblvgl.so")
   # this toolchain emits a libatomic call (__atomic_exchange_1) for
   # std::atomic<bool>::exchange() even with -march=rv64gc's "A" extension
   # enabled - confirmed by the link failing without this.
-  target_link_libraries(reconclave_k230_ui PRIVATE lvgl lvgl_linux drm gpiod pthread atomic)
+  target_link_libraries(reconclave_k230_ui PRIVATE reconclave_identity lvgl lvgl_linux drm gpiod pthread atomic)
 else()
   message(STATUS "K230 UI targets skipped: run devices/k230/fetch-device-sysroot.sh first")
 endif()
