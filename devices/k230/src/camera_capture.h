@@ -34,6 +34,6 @@ struct CaptureResult {
 // a failure rather than left to block whichever caller invoked this (the
 // touch UI's own event loop, currently).
 CaptureResult captureStill(const std::string& device, const std::string& output_path,
-                           int timeout_ms = 6000);
+                           int timeout_ms = 6000, bool enhance_preview = false);
 
 }  // namespace reconclave

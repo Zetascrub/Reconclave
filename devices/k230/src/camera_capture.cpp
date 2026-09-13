@@ -10,7 +10,7 @@
 namespace reconclave {
 
 CaptureResult captureStill(const std::string& device, const std::string& output_path,
-                           int timeout_ms) {
+                           int timeout_ms, bool enhance_preview) {
   CaptureResult result;
   result.path = output_path;
   // ffmpeg's own -y overwrites, but remove any stale file first so a
@@ -44,9 +44,16 @@ CaptureResult captureStill(const std::string& device, const std::string& output_
     // what silently produced a black image in the UI before this was
     // narrowed down (via a temporary lv_image_decoder_get_info() probe,
     // see devices/k230/README.md's Vision section) to this one flag.
+    // The camera module is mounted 180 degrees relative to the landscape
+    // display.  Its advertised sensor_hflip/sensor_vflip V4L2 controls reject
+    // writes on the shipping driver, so rotate in ffmpeg instead.  Two flips
+    // preserve the full 1920x1080 frame without interpolation or cropping.
+    const char* filter = enhance_preview
+        ? "hflip,vflip,exposure=1.7:black=0.003,eq=contrast=1.08:saturation=1.08"
+        : "hflip,vflip";
     execlp("ffmpeg", "ffmpeg", "-y", "-f", "v4l2", "-video_size", "1920x1080", "-i",
-           device.c_str(), "-frames:v", "1", "-pix_fmt", "yuvj420p", output_path.c_str(),
-           static_cast<char*>(nullptr));
+           device.c_str(), "-vf", filter, "-frames:v", "1", "-pix_fmt", "yuvj420p",
+           output_path.c_str(), static_cast<char*>(nullptr));
     _exit(127);  // execlp only returns on failure.
   }
 

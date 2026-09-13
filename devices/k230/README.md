@@ -141,7 +141,7 @@ on the device's existing rootfs.
    holds: the capability appears in `GET /reconclave/v1/announce`, and a
    `POST /reconclave/v1/message` invoking it correctly gets
    `rejected/CAPABILITY_UNAVAILABLE`, not a live scan.
-4. **Keyboard and expansion base — hardware identified, UI integration pending.**
+4. **Keyboard and expansion base — live and integrated.**
    LILYGO's current BSP identifies this as the nRF9151 cellular/GNSS/keyboard
    base. The TCA8418 is at I2C4 address `0x34` (SDA GPIO47, SCL GPIO46, IRQ
    GPIO42), alongside the BQ25896 charger and BQ27220 battery gauge. The
@@ -149,8 +149,15 @@ on the device's existing rootfs.
    its enable line. Earlier work against an older image incorrectly treated
    the expansion bus as unavailable and probed `/dev/i2c-0`; that address
    `0x37` is the GC2093 camera, not the keyboard. The current firmware now
-   reports expansion runtime availability, while LVGL key navigation and
-   GNSS NMEA acquisition remain the next integration work.
+   reports expansion runtime availability. The TCA8418 now drives LVGL
+   focus, activation, back navigation and text input; the BQ27220 supplies
+   voltage and fuel-gauge telemetry; and GNSS NMEA acquisition is active.
+   Note that the product-wiki pin illustration labels a separate GPIO32/33
+   I2C path and GPIO46 interrupt for the pictured expansion. On this unit,
+   live probing is decisive: GPIO46/47 returns real TCA8418 key events and
+   BQ27220 telemetry, while GPIO32/33 returns no key events. Keep the BSP's
+   revision-specific I2C4 mapping unless a different board is detected and
+   verified at runtime.
 5. **Display — done (proof).**
    No fbdev; DRM/KMS only (`/dev/dri/card0`). Decided against vendoring/
    building our own LVGL: `k230_phone_ui` already ships a proven, working

@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <termios.h>
 #include <unistd.h>
+#include <poll.h>
 
 #include <cmath>
 #include <cstdlib>
@@ -80,8 +81,86 @@ bool GnssReceiver::sendCommand(const char* command) {
   return write(fd_, wire.data(), wire.size()) == static_cast<ssize_t>(wire.size());
 }
 
+void GnssReceiver::processLine(const std::string& raw) {
+  std::string line = raw;
+  while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+  if (line.empty()) return;
+  last_response_ = line;
+  const char* position_prefix = line.find("#XGNSSPOS:") != std::string::npos
+      ? "#XGNSSPOS:" : line.find("#XGPSPOS:") != std::string::npos ? "#XGPSPOS:" : nullptr;
+  const auto fix_position = position_prefix == nullptr ? std::string::npos : line.find(position_prefix);
+  if (fix_position != std::string::npos) {
+    const auto fields = split(line.substr(fix_position + std::char_traits<char>::length(position_prefix)), ',');
+    if (fields.size() >= 7) {
+      char* end = nullptr;
+      const double latitude = std::strtod(fields[0].c_str(), &end);
+      const bool latitude_valid = end != fields[0].c_str();
+      const double longitude = std::strtod(fields[1].c_str(), &end);
+      const bool longitude_valid = end != fields[1].c_str();
+      if (latitude_valid && longitude_valid) {
+        fix_.valid = true;
+        fix_.latitude = latitude;
+        fix_.longitude = longitude;
+        fix_.altitude_m = std::strtod(fields[2].c_str(), nullptr);
+        fix_.speed_knots = std::strtod(fields[4].c_str(), nullptr) * 1.943844;
+        fix_.utc = fields[6];
+        while (!fix_.utc.empty() && (fix_.utc.front() == ' ' || fix_.utc.front() == '"'))
+          fix_.utc.erase(0, 1);
+        while (!fix_.utc.empty() && fix_.utc.back() == '"') fix_.utc.pop_back();
+        fix_.last_sentence = line;
+        status_ = "GNSS fix acquired";
+      }
+    }
+    return;
+  }
+  constexpr char prefix[] = "#XGNSSNMEA:";
+  const auto position = line.find(prefix);
+  if (position == std::string::npos) return;
+  auto sentence = line.substr(position + sizeof(prefix) - 1);
+  while (!sentence.empty() && sentence.front() == ' ') sentence.erase(0, 1);
+  ++nmea_count_;
+  if (parseNmeaSentence(sentence, fix_))
+    status_ = fix_.valid ? "GNSS fix acquired" : "GNSS active; acquiring fix";
+}
+
+bool GnssReceiver::exchange(const char* command, int timeout_ms, std::string& response) {
+  response.clear();
+  if (!sendCommand(command)) return false;
+  const int slices = timeout_ms / 50 + 1;
+  std::string reply;
+  for (int i = 0; i < slices; ++i) {
+    pollfd descriptor{fd_, POLLIN, 0};
+    if (::poll(&descriptor, 1, 50) <= 0) continue;
+    char chunk[256];
+    const ssize_t count = read(fd_, chunk, sizeof(chunk));
+    if (count <= 0) continue;
+    reply.append(chunk, static_cast<std::size_t>(count));
+    std::size_t newline;
+    while ((newline = reply.find('\n')) != std::string::npos) {
+      std::string line = reply.substr(0, newline);
+      reply.erase(0, newline + 1);
+      while (!line.empty() && line.back() == '\r') line.pop_back();
+      if (line.empty() || line == command) continue;
+      processLine(line);
+      if (!response.empty()) response += " | ";
+      response += line;
+      if (line == "OK") return true;
+      if (line == "ERROR" || line.find("+CME ERROR") != std::string::npos) return false;
+    }
+  }
+  if (!reply.empty()) {
+    processLine(reply);
+    if (!response.empty()) response += " | ";
+    response += reply;
+  }
+  return false;
+}
+
 bool GnssReceiver::start(const std::string& device, std::string& error) {
   stop();
+  last_response_.clear();
+  modem_info_.clear();
+  api_info_.clear();
   fd_ = open(device.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
   if (fd_ < 0) { error = "unable to open modem UART"; return false; }
   termios tty{};
@@ -93,12 +172,78 @@ bool GnssReceiver::start(const std::string& device, std::string& error) {
   tty.c_cflag &= ~(PARENB | CSTOPB | CRTSCTS);
   if (tcsetattr(fd_, TCSANOW, &tty) != 0) { error = "unable to apply modem UART settings"; stop(); return false; }
   tcflush(fd_, TCIOFLUSH);
-  const char* commands[] = {"AT", "AT#XNMEA=1", "AT%XSYSTEMMODE=0,0,1,0", "AT+CFUN=31", "AT#XGNSS=1,0,0,0"};
-  for (const char* command : commands) {
-    if (!sendCommand(command)) { error = "failed to send GNSS startup sequence"; stop(); return false; }
-    usleep(100000);
+  fix_ = GnssFix{};
+  nmea_count_ = 0;
+  std::string response;
+  if (!exchange("AT", 1500, response)) {
+    error = "nRF9151 did not answer AT" + (response.empty() ? std::string() : ": " + response);
+    const std::string diagnosis = error;
+    stop(); status_ = "GNSS error: " + diagnosis; return false;
   }
-  status_ = "GNSS started; waiting for satellite fix";
+  std::string identity;
+  if (exchange("ATI", 2000, identity)) modem_info_ = identity;
+  std::string revision;
+  if (exchange("AT+CGMR", 2000, revision)) {
+    if (!modem_info_.empty()) modem_info_ += " | ";
+    modem_info_ += revision;
+  }
+  std::string modern_test, legacy_test;
+  const bool modern_supported = exchange("AT#XGNSS=?", 2000, modern_test);
+  const bool legacy_supported = exchange("AT#XGPS=?", 2000, legacy_test);
+  api_info_ = "XGNSS=" + modern_test + " | XGPS=" + legacy_test;
+  if (!modern_supported && !legacy_supported) {
+    error = "installed nRF9151 application has no XGNSS/XGPS service";
+    const std::string diagnosis = error;
+    stop(); status_ = "GNSS unavailable: " + diagnosis; return false;
+  }
+  // Recover to offline first, then use the exact smoke-test order required by
+  // LilyGO's K230 Serial LTE Modem build. XNMEA must be configured before
+  // CFUN=31; that custom command is rejected once this firmware is online.
+  exchange("AT#XGNSS=0", 1500, response);
+  exchange("AT#XNMEA=0", 1500, response);
+  const char* rejected_command = nullptr;
+  if (!exchange("AT+CFUN=0", 6000, response))
+    rejected_command = "AT+CFUN=0";
+  const bool nmea_enabled = exchange("AT#XNMEA=1", 3000, response);
+  if (!exchange("AT%XSYSTEMMODE=0,0,1,0", 3000, response))
+    rejected_command = "AT%XSYSTEMMODE=0,0,1,0";
+  else if (!exchange("AT+CFUN=31", 9000, response))
+    rejected_command = "AT+CFUN=31";
+  if (rejected_command != nullptr) {
+    error = std::string("GNSS setup rejected ") + rejected_command + ": " + response;
+    const std::string diagnosis = error;
+    stop(); status_ = "GNSS error: " + diagnosis; return false;
+  }
+  bool legacy_gps = false;
+  if ((!modern_supported || !exchange("AT#XGNSS=1,0,1", 3000, response)) &&
+      (!modern_supported || !exchange("AT#XGNSS=1,0,0,0", 3000, response))) {
+    std::string state;
+    const bool modern_active = exchange("AT#XGNSS?", 2000, state) &&
+        state.find("#XGNSS: 1") != std::string::npos;
+    if (!modern_active) {
+      // Nordic Serial LTE Modem releases through NCS 3.1 called this API XGPS.
+      legacy_gps = legacy_supported && exchange("AT#XGPS=1,0,0,0", 3000, response);
+      if (legacy_supported && !legacy_gps) {
+        // Some nRF9151/SLM combinations advertise the legacy API but reject
+        // its standalone CFUN=31 path. Retry in the documented concurrent
+        // LTE-M + GNSS operating mode before declaring the service unusable.
+        std::string recovery;
+        if (exchange("AT+CFUN=0", 6000, recovery) &&
+            exchange("AT%XSYSTEMMODE=1,0,1,0", 3000, recovery) &&
+            exchange("AT+CFUN=1", 9000, recovery)) {
+          legacy_gps = exchange("AT#XGPS=1,0,0,0", 3000, response);
+        }
+      }
+    }
+    if (!modern_active && !legacy_gps) {
+      error = "GNSS/XGPS start rejected: " + response;
+      const std::string diagnosis = error;
+      stop(); status_ = "GNSS error: " + diagnosis; return false;
+    }
+  }
+  status_ = nmea_enabled ? "GNSS started; waiting for satellite fix" :
+      legacy_gps ? "Legacy GPS active; waiting for position report" :
+      "GNSS active; waiting for position report";
   error.clear();
   return true;
 }
@@ -120,11 +265,7 @@ void GnssReceiver::poll() {
     std::string line = buffer_.substr(0, newline);
     buffer_.erase(0, newline + 1);
     while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
-    constexpr char prefix[] = "#XGNSSNMEA: ";
-    const auto position = line.find(prefix);
-    if (position == std::string::npos) continue;
-    const std::string sentence = line.substr(position + sizeof(prefix) - 1);
-    if (parseNmeaSentence(sentence, fix_)) status_ = fix_.valid ? "GNSS fix acquired" : "GNSS active; acquiring fix";
+    processLine(line);
   }
   if (buffer_.size() > 4096) buffer_.erase(0, buffer_.size() - 4096);
 }

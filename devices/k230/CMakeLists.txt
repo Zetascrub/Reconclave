@@ -6,6 +6,14 @@
 # actual runtime symbol resolution - see devices/k230/README.md's UI section).
 enable_language(C)
 
+# Device-pulled headers/libraries (LVGL, libdrm, libgpiod, ...) not built
+# from source here - see devices/k230/fetch-device-sysroot.sh. Determined
+# early (not just in the UI block below) since reconclave_k230_kbtest also
+# needs libgpiod for the TCA8418's bit-banged I2C bus.
+if(NOT DEFINED K230_DEVICE_SYSROOT)
+  set(K230_DEVICE_SYSROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../.toolchains/device-sysroot")
+endif()
+
 add_executable(reconclave_k230
   main.cpp
   src/json.cpp
@@ -26,14 +34,27 @@ target_link_libraries(reconclave_k230 PRIVATE reconclave_protocol pthread)
 target_include_directories(reconclave_k230 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Standalone hardware-verification tool for the TCA8418 keyboard driver -
-# not part of the Reconclave app/protocol surface, see kbtest.cpp.
-add_executable(reconclave_k230_kbtest
-  kbtest.cpp
-  src/tca8418_keyboard.cpp
-)
-target_include_directories(reconclave_k230_kbtest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_compile_options(reconclave_k230_kbtest PRIVATE -Wall -Wextra -Wpedantic -Werror)
+# not part of the Reconclave app/protocol surface, see kbtest.cpp. Needs
+# libgpiod (bit-banged I2C over two GPIO lines - see tca8418_keyboard.h's
+# file header for why this isn't a kernel i2c-dev bus), so - like the UI
+# targets below - only builds once the device sysroot has actually been
+# fetched.
+if(EXISTS "${K230_DEVICE_SYSROOT}/lib/libgpiod.so")
+  add_executable(reconclave_k230_kbtest
+    kbtest.cpp
+    src/tca8418_keyboard.cpp
+  )
+  target_include_directories(reconclave_k230_kbtest PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    "${K230_DEVICE_SYSROOT}/include"
+  )
+  target_link_directories(reconclave_k230_kbtest PRIVATE "${K230_DEVICE_SYSROOT}/lib")
+  target_link_libraries(reconclave_k230_kbtest PRIVATE gpiod)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(reconclave_k230_kbtest PRIVATE -Wall -Wextra -Wpedantic -Werror)
+  endif()
+else()
+  message(STATUS "reconclave_k230_kbtest skipped: run devices/k230/fetch-device-sysroot.sh first (needs libgpiod)")
 endif()
 
 # Standalone hardware-verification tool for the Wi-Fi scanner - not part of
@@ -52,9 +73,7 @@ endif()
 # devices/k230/fetch-device-sysroot.sh and the README's UI section. Not
 # built unless that sysroot has actually been fetched, since it needs
 # real device-pulled .so files this repo does not (and should not) commit.
-if(NOT DEFINED K230_DEVICE_SYSROOT)
-  set(K230_DEVICE_SYSROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../.toolchains/device-sysroot")
-endif()
+# (K230_DEVICE_SYSROOT itself is set once, near the top of this file.)
 if(EXISTS "${K230_DEVICE_SYSROOT}/lib/liblvgl.so")
   add_executable(reconclave_k230_drm_proof
     drm_proof.cpp
@@ -94,6 +113,7 @@ if(EXISTS "${K230_DEVICE_SYSROOT}/lib/liblvgl.so")
     src/evidence_store.cpp
     src/host_knowledge.cpp
     src/camera_capture.cpp
+    src/tca8418_keyboard.cpp
     assets/zeta_k230_logo.c
   )
   target_include_directories(reconclave_k230_ui PRIVATE
@@ -111,7 +131,7 @@ if(EXISTS "${K230_DEVICE_SYSROOT}/lib/liblvgl.so")
   # this toolchain emits a libatomic call (__atomic_exchange_1) for
   # std::atomic<bool>::exchange() even with -march=rv64gc's "A" extension
   # enabled - confirmed by the link failing without this.
-  target_link_libraries(reconclave_k230_ui PRIVATE lvgl lvgl_linux drm pthread atomic)
+  target_link_libraries(reconclave_k230_ui PRIVATE lvgl lvgl_linux drm gpiod pthread atomic)
 else()
   message(STATUS "K230 UI targets skipped: run devices/k230/fetch-device-sysroot.sh first")
 endif()

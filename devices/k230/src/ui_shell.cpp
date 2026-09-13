@@ -40,6 +40,7 @@ void addBackButton(lv_obj_t* screen, lv_obj_t* home_screen) {
   lv_obj_set_style_border_width(button, 1, 0);
   lv_obj_set_style_radius(button, 8, 0);
   lv_obj_set_style_shadow_width(button, 0, 0);
+  lv_obj_add_flag(button, LV_OBJ_FLAG_USER_1);
   lv_obj_add_event_cb(
       button,
       [](lv_event_t* event) {
