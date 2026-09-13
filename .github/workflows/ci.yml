@@ -14,6 +14,11 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+      - name: Check generated identity headers are in sync
+        # common/identity/{include/reconclave/identity.h,identity.css} are generated
+        # from identity.json by tools/generate_identity.py; fail fast if a change to
+        # identity.json was committed without regenerating them.
+        run: python3 tools/generate_identity.py --check
       - run: cmake -S . -B build
       - run: cmake --build build --parallel
       - run: ctest --test-dir build --output-on-failure
