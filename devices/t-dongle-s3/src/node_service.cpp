@@ -4,6 +4,7 @@
 
 #include "reconclave/protocol.h"  // shared domain library (proves fleet integration)
 #include "framework.h"            // Config
+#include "radio_manager.h"
 #include "status_led.h"
 
 namespace reconclave {
@@ -36,13 +37,20 @@ const NodeService::Registered* NodeService::find(const String& id) const {
   return nullptr;
 }
 
-void NodeService::startServer(StatusLed& led) {
+void NodeService::startServer(StatusLed& led, Config& config, RadioManager& radio) {
   led_ = &led;
+  config_ = &config;
+  radio_ = &radio;
+  // Protocol surface.
   server_.on("/reconclave/v1/announce", HTTP_GET, [this]() { handleAnnounce(); });
   server_.on("/reconclave/v1/message", HTTP_POST, [this]() { handleMessage(); });
+  // Setup/status web UI (no payload arming).
+  server_.on("/", HTTP_GET, [this]() { handleRoot(); });
+  server_.on("/admin/status", HTTP_GET, [this]() { handleAdminStatus(); });
+  server_.on("/admin/wifi", HTTP_POST, [this]() { handleAdminWifi(); });
   server_.onNotFound([this]() { server_.send(404, "application/json", "{\"error\":\"not found\"}"); });
   server_.begin();
-  Serial.println("node: HTTP server up on /reconclave/v1/{announce,message}");
+  Serial.println("node: HTTP server up (/, /admin/*, /reconclave/v1/*)");
 }
 
 void NodeService::handleAnnounce() {
@@ -179,6 +187,76 @@ void NodeService::handleMessage() {
   String out;
   serializeJson(resp, out);
   server_.send(200, "application/json", out);
+}
+
+namespace {
+// Setup/status page. Brand palette (common/identity), deliberately setup-only:
+// there is no payload control here — a fleet node's actions come from the
+// coordinator under a signed scope, never a local button.
+const char kSetupPage[] = R"HTML(<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Reconclave node</title>
+<style>:root{--cyan:#00cdd7;--navy:#0e222e;--raised:#16303f;--ink:#fff2d7;--muted:#c9b896;--warn:#ffaa1c}
+*{box-sizing:border-box}body{margin:0;background:#081820;color:var(--ink);font:14px system-ui,sans-serif;padding:18px}
+h1{font-size:16px;letter-spacing:.12em;color:var(--cyan);margin:0 0 4px}.sub{color:var(--muted);font-size:11px;margin-bottom:16px}
+.card{background:var(--navy);border:1px solid var(--raised);border-radius:8px;padding:14px;margin-bottom:12px}
+.row{display:flex;justify-content:space-between;gap:8px;padding:4px 0;border-bottom:1px solid var(--raised);font-size:12px}
+.row:last-child{border:0}.row b{color:var(--muted);font-weight:500}label{display:block;font-size:11px;color:var(--muted);margin:8px 0 3px}
+input{width:100%;background:#081820;border:1px solid var(--raised);color:var(--ink);border-radius:6px;padding:9px}
+button{margin-top:12px;width:100%;background:var(--cyan);color:#04141b;border:0;border-radius:6px;padding:11px;font-weight:600;cursor:pointer}
+.note{color:var(--warn);font-size:11px;margin-top:10px;line-height:1.4}.ok{color:var(--cyan)}</style></head>
+<body><h1>RECONCLAVE NODE</h1><div class="sub" id="did">…</div>
+<div class="card"><div class="row"><b>Wi-Fi</b><span id="link">…</span></div>
+<div class="row"><b>STA IP</b><span id="staip">…</span></div><div class="row"><b>Setup AP</b><span id="ap">…</span></div>
+<div class="row"><b>AP IP</b><span id="apip">…</span></div><div class="row"><b>Capabilities</b><span id="caps">…</span></div></div>
+<div class="card"><b style="color:var(--cyan);font-size:12px">Wi-Fi setup</b>
+<label>SSID</label><input id="s"><label>Password</label><input id="p" type="password">
+<button onclick="save()">Save &amp; reboot to join</button>
+<div class="note">This is a setup/status console only. Payloads run on this node only when the coordinator invokes them under a verified signed scope — there is deliberately no local run/arm control here.</div></div>
+<script>async function r(){let d=await(await fetch('/admin/status')).json();did.textContent=d.device_id;
+link.textContent=d.sta_link?'up':'down';link.className=d.sta_link?'ok':'';staip.textContent=d.sta_ip;
+ap.textContent=d.ap_ssid;apip.textContent=d.ap_ip;caps.textContent=(d.capabilities||[]).join(', ')}
+async function save(){await fetch('/admin/wifi',{method:'POST',headers:{'Content-Type':'application/json'},
+body:JSON.stringify({ssid:s.value,pass:p.value})});alert('Saved. The node is rebooting to join.')}r()</script>
+</body></html>)HTML";
+}  // namespace
+
+void NodeService::handleRoot() {
+  server_.send_P(200, "text/html; charset=utf-8", kSetupPage);
+}
+
+void NodeService::handleAdminStatus() {
+  JsonDocument doc;
+  doc["device_id"] = device_id_;
+  doc["sta_link"] = radio_ != nullptr && radio_->staConnected();
+  doc["sta_ip"] = radio_ != nullptr ? radio_->staIp().toString() : String("0.0.0.0");
+  doc["ap_ssid"] = radio_ != nullptr ? radio_->apSsid() : String("");
+  doc["ap_ip"] = radio_ != nullptr ? radio_->apIp().toString() : String("0.0.0.0");
+  JsonArray caps = doc["capabilities"].to<JsonArray>();
+  for (const auto& c : capabilities_) caps.add(c.id);
+  String out;
+  serializeJson(doc, out);
+  server_.send(200, "application/json", out);
+}
+
+void NodeService::handleAdminWifi() {
+  const String body = server_.arg("plain");
+  JsonDocument doc;
+  if (body.length() == 0 || deserializeJson(doc, body)) {
+    server_.send(400, "application/json", "{\"error\":\"invalid JSON\"}");
+    return;
+  }
+  const String ssid = doc["ssid"] | "";
+  const String pass = doc["pass"] | "";
+  if (ssid.length() == 0 || config_ == nullptr) {
+    server_.send(400, "application/json", "{\"error\":\"ssid required\"}");
+    return;
+  }
+  config_->setString("wifi_ssid", ssid);
+  config_->setString("wifi_pass", pass);
+  server_.send(200, "application/json", "{\"ok\":true,\"rebooting\":true}");
+  Serial.printf("admin: wifi set to \"%s\" via web UI - rebooting to join\n", ssid.c_str());
+  delay(300);
+  ESP.restart();
 }
 
 void NodeService::handleClient() { server_.handleClient(); }

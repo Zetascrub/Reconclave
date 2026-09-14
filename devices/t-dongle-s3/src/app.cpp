@@ -29,7 +29,7 @@ void App::begin() {
   const String pass = config_.getString("wifi_pass", "");
   radio_.connect(ssid, pass, node_.deviceId(), 80);
 
-  node_.startServer(led_);
+  node_.startServer(led_, config_, radio_);
 
   for (Module* m : modules_) {
     Serial.printf("module: begin %s\n", m->capabilityId());
@@ -68,7 +68,7 @@ void App::pollSerialCommands() {
       ESP.restart();
     } else if (line == "status") {
       Serial.printf("status: id=%s link=%s ip=%s\n", node_.deviceId().c_str(),
-                    radio_.connected() ? "up" : "down", radio_.ip().toString().c_str());
+                    radio_.staConnected() ? "up" : "down", radio_.staIp().toString().c_str());
     } else if (line.length() > 0) {
       Serial.println("commands: wifi <ssid> <pass> | status");
     }
@@ -82,13 +82,13 @@ void App::loop() {
   node_.handleClient();
   for (Module* m : modules_) m->loop(services_);
 
-  led_.setLinked(radio_.connected());
+  led_.setLinked(radio_.staConnected());
   led_.tick(now);
 
   static unsigned long next_heartbeat = 0;
   if (now >= next_heartbeat) {
     Serial.printf("heartbeat: id=%s link=%s ip=%s\n", node_.deviceId().c_str(),
-                  radio_.connected() ? "up" : "down", radio_.ip().toString().c_str());
+                  radio_.staConnected() ? "up" : "down", radio_.staIp().toString().c_str());
     next_heartbeat = now + kHeartbeatIntervalMs;
   }
 }

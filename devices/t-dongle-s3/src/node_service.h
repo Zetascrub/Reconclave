@@ -46,7 +46,11 @@ class NodeService {
   // Compute the MAC-derived device id and a fresh boot nonce (no network yet).
   void beginIdentity(Config& config);
   // Wire the HTTP routes and start the server (call once the network is up).
-  void startServer(StatusLed& led);
+  // Serves the reconclave/1 protocol endpoints AND a setup/status-only web UI
+  // (WiFi config, status/announce view) reachable via the management AP or STA.
+  // The web UI deliberately exposes no payload arming — actions on a fleet node
+  // come only from the coordinator under a signed scope.
+  void startServer(StatusLed& led, Config& config, RadioManager& radio);
 
   void registerCapability(const String& id, const String& permission, CapabilityHandler handler);
   void handleClient();
@@ -63,11 +67,16 @@ class NodeService {
 
   void handleAnnounce();
   void handleMessage();
+  void handleRoot();          // setup/status web UI (HTML)
+  void handleAdminStatus();   // status JSON for the web UI
+  void handleAdminWifi();     // POST {ssid,pass}: store to NVS + reboot
   const Registered* find(const String& id) const;
 
   Trust trust_;
   WebServer server_{80};
   StatusLed* led_ = nullptr;
+  Config* config_ = nullptr;
+  RadioManager* radio_ = nullptr;
   String device_id_;
   uint64_t sequence_ = 0;
   std::vector<Registered> capabilities_;
