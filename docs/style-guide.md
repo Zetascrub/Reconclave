@@ -70,7 +70,7 @@ quantise a generated value for its colour depth, but the semantic token remains
 the source.
 
 Mascot master artwork currently lives outside this repository at
-`/mnt/Storage/Coding/Misc/Mascot`. Any edited or newly generated mascot master
+the maintainer's private mascot workspace. Any edited or newly generated mascot master
 must be saved there first. Device-sized exports may then be checked into the
 relevant device asset directory with their source and licence recorded.
 

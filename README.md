@@ -1,9 +1,16 @@
 <div align="center">
 
+<img src="assets/zeta.png" alt="Zeta, the Reconclave mascot" width="150">
+
 # Reconclave
 
-**The shared protocol, trust model, and design system for a cooperating family
-of standalone security-assessment devices.**
+### One protocol. Independent tools. A cooperating field kit.
+
+**Shared protocol, trust model, and design system for the Reconclave family.**
+
+[![Status](https://img.shields.io/badge/status-development_preview-ffaa1c?style=flat-square)](#project-status)
+[![Code licence](https://img.shields.io/badge/code-MIT-00cdd7?style=flat-square)](LICENSE)
+[![Protocol](https://img.shields.io/badge/protocol-reconclave%2F1-0e222e?style=flat-square)](docs/protocol.md)
 
 [Protocol](docs/protocol.md) · [Architecture](docs/architecture.md) ·
 [Style guide](docs/style-guide.md) · [Trust](docs/trust-architecture.md)
@@ -31,6 +38,12 @@ its own hardware cadence.
 
 Zeta is the shared mascot; Reconclave is the product family and protocol.
 Device names describe their purpose without preventing them from working alone.
+
+## Project status
+
+Reconclave is a development preview. Interfaces and protocol details may change
+until the first stable release; each device repository records its own hardware
+validation and limitations.
 
 ## What remains canonical here
 
