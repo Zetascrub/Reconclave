@@ -21,6 +21,12 @@ class App {
   void loop();
 
  private:
+  // Reads newline-terminated serial commands. Supported:
+  //   wifi <ssid> <pass>   store credentials in NVS and reboot to join
+  //   status               print id / link / ip
+  void pollSerialCommands();
+  String serial_line_;
+
   UsbManager usb_;
   RadioManager radio_;
   NodeService node_;

@@ -60,7 +60,9 @@ nonces are tracked for replay resistance.
 - [ ] Extend `tools/provision_fleet.py` with a `--tdongle-id` flag to generate a
   real `src/generated_trust.h` (currently an all-zero example for compilation;
   gitignored like the other device trust headers). A CI build job depends on this.
-- [ ] Wi-Fi credential setup flow (today: NVS keys `wifi_ssid`/`wifi_pass`).
+- [ ] Wi-Fi credential setup flow. Today: send `wifi <ssid> <pass>` over the
+  USB serial console (stores to NVS and reboots to join); `status` prints
+  id/link/ip. A proper provisioning flow is still to come.
 
 ## Build
 
