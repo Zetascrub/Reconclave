@@ -12,9 +12,16 @@ namespace reconclave {
 
 class RadioManager {
  public:
+  // Bring up the WiFi netif (STA) even with no credentials, so the TCP/IP
+  // stack exists before anything reads the MAC or starts a server. Must be
+  // called before NodeService::beginIdentity()/startServer(); skipping it (as
+  // an early return once did) left the stack uninitialised and crashed at boot.
+  void init();
+
   // Connects to `ssid`/`pass` (bounded wait) and, on success, advertises
-  // `_reconclave._tcp` on `port` with instance name `device_id`.
-  bool begin(const String& ssid, const String& pass, const String& device_id, uint16_t port);
+  // `_reconclave._tcp` on `port` with instance name `device_id`. With empty
+  // credentials it stays offline (netif still up) rather than failing the boot.
+  bool connect(const String& ssid, const String& pass, const String& device_id, uint16_t port);
 
   bool connected() const;
   IPAddress ip() const;

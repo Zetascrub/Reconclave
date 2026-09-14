@@ -5,13 +5,19 @@
 
 namespace reconclave {
 
-bool RadioManager::begin(const String& ssid, const String& pass, const String& device_id,
-                         uint16_t port) {
+void RadioManager::init() {
+  // Initialise the STA netif / TCP-IP stack up front, unconditionally. Reading
+  // the MAC and starting the HTTP server both need this; without it the boot
+  // crashes when no credentials are set.
+  WiFi.mode(WIFI_STA);
+}
+
+bool RadioManager::connect(const String& ssid, const String& pass, const String& device_id,
+                           uint16_t port) {
   if (ssid.length() == 0) {
-    Serial.println("radio: no wifi_ssid provisioned (NVS) - node offline until set");
+    Serial.println("radio: no wifi_ssid set - node offline (serial: wifi <ssid> <pass>)");
     return false;
   }
-  WiFi.mode(WIFI_STA);
   WiFi.begin(ssid.c_str(), pass.c_str());
   const unsigned long deadline = millis() + 15000;
   while (WiFi.status() != WL_CONNECTED && millis() < deadline) {

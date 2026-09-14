@@ -22,11 +22,12 @@ void App::begin() {
   input_.begin(pins::kButton);
   usb_.start();
 
+  radio_.init();  // WiFi netif up first — MAC read and server bind depend on it
   node_.beginIdentity(config_);
 
   const String ssid = config_.getString("wifi_ssid", "");
   const String pass = config_.getString("wifi_pass", "");
-  radio_.begin(ssid, pass, node_.deviceId(), 80);
+  radio_.connect(ssid, pass, node_.deviceId(), 80);
 
   node_.startServer(led_);
 
