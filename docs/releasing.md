@@ -1,8 +1,16 @@
 # Releases, signing and private deployment keys
 
 The initial public release is a **source-only development preview**. Do not
-publish binaries produced by a provisioned local build. No workflow automatically
-publishes releases or changes repository visibility.
+publish binaries produced by a provisioned local build. No workflow in this
+repository automatically publishes releases or changes repository visibility.
+
+The standalone device repos (FieldDeck, ZetaDongle, Relay, Reconclave Command)
+automate a narrower, separate thing on a version tag push: FieldDeck, ZetaDongle
+and Relay publish an **unprovisioned example firmware build** (see "Public
+example firmware" below); Reconclave Command publishes a convenience source +
+pre-built web bundle. Neither is the maintainer's Ed25519-signed formal source
+release described later in this document, and none of it touches a provisioned
+deployment key.
 
 ## Three different kinds of trust
 
@@ -83,13 +91,48 @@ trusted public key. Verification never flashes or executes the artifact.
 Build with the intended deployment's ignored trust headers. Use the same
 sign/verify commands with `--target cardputer-adv` or `--target poe-p4`, and
 `--kind private-deployment-firmware`. Keep the image and manifest private. No
-public generic binary mode exists yet: that requires runtime per-device
-provisioning without shared embedded secrets and hardware validation.
+public *live-functional* generic binary mode exists yet: that would require
+runtime per-device provisioning without shared embedded secrets and hardware
+validation. What does exist, and is intentionally different, is the
+dummy-trust example firmware described next — it is public and generic
+precisely because it is not live-functional against a real fleet.
 
 Private validation builds made before committing may use `--dirty-source`; this
 state is covered by the signature and shown by verification. Public source
 releases reject that flag. Such a manifest identifies a development worktree,
 not a reproducible release of the stated base commit.
+
+## Public example firmware (dummy-trust CI builds)
+
+FieldDeck, ZetaDongle and Relay each keep a disposable, all-zero trust header
+under `config/generated_trust.ci.h` — "never provision hardware with this
+file" — used to compile-check the firmware in CI without any real fleet key
+present. Since 2026-09, pushing a version tag (`vX.Y.Z`) to one of those
+standalone repos also builds firmware against that same disposable header and
+publishes it as a public GitHub Release, labelled an **unprovisioned example
+build**.
+
+This is deliberately not the same thing "no workflow automatically publishes
+releases" (above) warns against, because the artifact contains no deployment
+secret: HMAC and storage keys are all-zero, peer IDs are `ci-*` placeholders.
+It cannot authenticate against a real coordinator or peer, and any data it
+would encrypt uses a publicly-known key. It exists purely so someone can flash
+a device, confirm it boots and runs the base app, and then provision it for
+real with `tools/provision_fleet.py` before pointing it at a live fleet — the
+release notes on each of these say so explicitly.
+
+This mode is unsigned (no Ed25519 manifest) and unrelated to the maintainer
+signing key above; it runs entirely inside each device repo's own
+`release.yml` with the repo-scoped `GITHUB_TOKEN`, no private key involved.
+Reconclave Command's tag-triggered release is a separate, unsigned convenience
+package (source + pre-built web UI) for the same reason it carries no trust
+header at all: its keys are supplied at runtime via the environment, never
+baked into a build.
+
+A **provisioned** build — real per-device keys copied in from
+`tools/provision_fleet.py` — must never be built or published by one of these
+workflows. Nothing about this section changes that: private firmware signing
+above remains the only path for a build meant to actually join a fleet.
 
 ## Secure Boot is a separate device migration
 
