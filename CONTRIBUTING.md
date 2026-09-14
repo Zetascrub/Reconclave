@@ -20,19 +20,15 @@ of weakening the repository-wide checks.
 ## Checks
 
 ```sh
-python3 -m venv .venv
-.venv/bin/pip install -r tools/desktop-node/requirements.txt
 .venv/bin/python -m unittest discover -s tools -p 'test_*.py'
 python3 tools/check_public_tree.py
-(cd tools/desktop-node && ../../.venv/bin/python -m unittest discover -p 'test_*.py')
 cmake -S . -B build
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure
-(cd tools/desktop-node/web && npm ci && npm run build)
 ```
 
-Follow each device guide for compilation with private, locally generated trust.
-CI generates disposable keys; no production keys belong in CI or its artifacts.
+Follow each linked device repository for its build and validation checks. No
+production keys belong in CI or its artifacts.
 List physical checks separately from mock/native tests. Do not claim hardware
 coverage from a successful compilation.
 

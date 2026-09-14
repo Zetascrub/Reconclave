@@ -1,8 +1,0 @@
-config BR2_PACKAGE_RECONCLAVE_K230
-	bool "reconclave-k230"
-	depends on BR2_riscv
-	select BR2_PACKAGE_LVGL
-	select BR2_PACKAGE_LIBDRM
-	help
-	  Reconclave appliance UI and protocol node for the LILYGO
-	  T-Display K230 with keyboard base.

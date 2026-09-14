@@ -1,7 +1,9 @@
 # Reconclave identity — single source of truth
 
-This directory is the authoritative definition of Reconclave's brand identity:
-the **palette**, the **product strings**, and the **device roster**. It exists
+This directory is the authoritative machine-readable definition of Reconclave's
+brand identity: the **palette**, the **product strings**, and the **device
+roster**. The human-facing rules live in
+[`docs/style-guide.md`](../../docs/style-guide.md). This directory exists
 so those facts live in exactly one place and cannot drift across the fleet the
 way they did before it existed (two different brand cyans and two oranges were
 shipping simultaneously).
@@ -49,7 +51,13 @@ Where each surface stands relative to this source of truth:
 | :-- | :-- |
 | **K230 touch UI** (`devices/k230/src/ui_shell.h`) | Sources the tokens directly — its `kColor*` names alias `reconclave::identity::kColor*`. No drift possible. |
 | **Desktop / device web UIs** | Reference `identity.css` (`var(--rc-*)`). |
-| **Cardputer ADV theme** (`devices/cardputer-adv/src/main.cpp`) | Intentionally **not** a direct consumer. It runs a richer three-theme `color565` remap engine whose *semantic* role palette matches [`docs/ui-design.md` §6](../../docs/ui-design.md); its default (Field / Neon-Grid) theme renders those roles to values that approximate these tokens — chrome→`surface` and attention→`warning` match exactly, while accent (`#00e1eb` vs `#00cdd7`), `surface_raised`, and `ink_muted` differ by a few units as deliberate theme styling. It also defines roles this set does not (canvas, two borders, selected-surface). Considered aligned at the semantic layer; a future pass could grow this token set to the full role list and have the Cardputer remap source from it. |
+| **Cardputer ADV theme** (`devices/cardputer-adv/src/main.cpp`) | Partially aligned. Its four-theme `color565` remap engine uses the same semantic model, but it does not yet consume the generated tokens and currently falls back to Field / Neon Grid on a clean settings store. The per-device review must make Zeta the factory default, preserve user selection, and map the expanded canonical roles directly. |
+
+## Brand naming
+
+Reconclave is the product family; Zeta is the project-independent mascot; and
+Zetascrub is creator/account credit only. User-facing product UI must not use
+Zetascrub as a product, device, theme, or feature name.
 
 ## The palette decision
 

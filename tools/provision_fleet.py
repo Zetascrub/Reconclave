@@ -17,8 +17,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 STORE = ROOT / ".reconclave-provisioning" / "fleet.json"
-P4_HEADER = ROOT / "devices/poe-p4/main/generated_trust.h"
-CARD_HEADER = ROOT / "devices/cardputer-adv/src/generated_trust.h"
+# Device projects are sibling repositories after the monorepo extraction.
+P4_HEADER = ROOT.parent / "Relay" / "main" / "generated_trust.h"
+CARD_HEADER = ROOT.parent / "FieldDeck" / "src" / "generated_trust.h"
 
 
 def private_write(path: Path, text: str) -> None:

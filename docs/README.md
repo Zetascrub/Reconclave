@@ -7,10 +7,11 @@ provisioned: download source, generate your own trust keys, then build locally.
 
 | Component | Guide |
 |---|---|
-| Desktop coordinator | [Setup and workflows](../tools/desktop-node/README.md) |
-| Cardputer ADV | [Build, flash and field tools](../devices/cardputer-adv/README.md) |
-| Unit PoE-P4 | [Build, flash and Ethernet node](../devices/poe-p4/README.md) |
-| K230 | [Planned hardware](../devices/k230/README.md) |
+| Reconclave Command | [Desktop coordinator](https://github.com/Zetascrub/Reconclave-Command) |
+| FieldDeck | [Cardputer ADV field console](https://github.com/Zetascrub/FieldDeck) |
+| Relay | [PoE-P4 wired node](https://github.com/Zetascrub/Relay) |
+| Sightline | [K230 vision node](https://github.com/Zetascrub/Sightline) |
+| ZetaDongle | [T-Dongle-S3 USB node](https://github.com/Zetascrub/ZetaDongle) |
 
 ## Understand the system
 
@@ -20,7 +21,8 @@ provisioned: download source, generate your own trust keys, then build locally.
 | Requests and messages | [Protocol](protocol.md) |
 | Available operations | [Capabilities](capabilities.md) |
 | Fleet identities and private keys | [Trust architecture](trust-architecture.md) |
-| Firmware interface conventions | [UI design](ui-design.md) |
+| Cross-device identity and visual system | [Product style guide](style-guide.md) |
+| Embedded interface conventions | [Embedded UI design](ui-design.md) |
 | Brand identity and scope direction | [Identity & scope review](identity-and-scope-review.md) |
 | Reliability and recovery | [Reliability](reliability.md) |
 

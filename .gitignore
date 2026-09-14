@@ -1,5 +1,6 @@
 build/
 **/build/
+/build*/
 /build-k230/
 /build-native-node/
 /build-native-tools/

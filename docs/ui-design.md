@@ -1,7 +1,12 @@
-# Reconclave interface style guide
+# Reconclave embedded interface guide
 
 Status: living standard
 Applies to: Cardputer ADV, K230, and future embedded coordinators/nodes
+
+This guide supplies embedded interaction and layout detail under the canonical
+cross-device [`Reconclave product style guide`](style-guide.md). Where the two
+overlap, the product style guide defines identity, theme semantics, mascot use,
+and cross-device consistency; this document defines constrained-display behavior.
 
 Reconclave should feel like a professional cyberdeck: expressive, dark,
 legible, deliberate, and useful under poor lighting. Its visual language may
@@ -131,18 +136,23 @@ and, if it must change, change it in `identity.json` and regenerate.
 
 | Token | Hex | Role |
 | --- | --- | --- |
+| `canvas` | `#050a10` | Deepest application and display background |
 | `accent` | `#00cdd7` | Primary accent / cyan: interactive, focus, trusted, brand |
 | `warning` | `#ffaa1c` | Attention / amber: running, unpaired, degraded, caution |
+| `danger` | `#ff4f87` | Failure, destructive action, or blocked unsafe state |
 | `surface` | `#0e222e` | Base surface / panel background |
 | `surface_raised` | `#16303f` | Raised surface: cards, headers, selected rows |
+| `surface_selected` | `#164248` | Selected or focused surface |
+| `border` | `#237670` | Active outline, divider, and progress track |
 | `ink` | `#fff2d7` | Primary foreground text (warm off-white) |
 | `ink_muted` | `#c9b896` | Secondary text, labels, muted detail |
 | `disabled` | `#3a4552` | Unavailable / disabled capability or node |
 
 The table below is the **semantic role layer** the on-device theme engine remaps
 from (see the Cardputer `color565` remap): the RGB triples name design roles,
-and each theme renders them to concrete colours. The default (Neon Grid / Field)
-rendering of these roles is the canonical brand palette above.
+and each theme renders them to concrete colours. Zeta is the required clean-flash
+default and renders these roles as the canonical brand palette above. Existing
+devices that do not yet do so are migration targets for their device review.
 
 | Role | RGB | Use |
 | --- | --- | --- |
@@ -168,6 +178,7 @@ title card, and audio pitch family while preserving semantic meaning:
 
 | Theme | Personality | Motion and chrome |
 | --- | --- | --- |
+| Zeta | Canonical cyan, cream, and amber mascot-led deck | factory default; restrained working views and richer atmosphere moments |
 | Neon Grid | Cyan/teal trusted-network deck | topology cuts, clean traces, precise motion |
 | Night City | Violet, electric blue, and hot-magenta operator console | asymmetric rails, energetic sweeps, sharp cuts |
 | Amber CRT | Warm phosphor field terminal | inset frames, subtle scan texture, measured motion |

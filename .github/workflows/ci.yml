@@ -26,49 +26,8 @@ jobs:
         run: python3 -m json.tool protocol/schemas/envelope.schema.json >/dev/null && for f in protocol/schemas/*.json protocol/test-vectors/*.json; do python3 -m json.tool "$f" >/dev/null; done
       - name: Validate complete protocol vectors
         run: python3 tools/protocol-debugger/validate_vectors.py protocol/test-vectors/*.json
-      - name: Install desktop node test dependencies
-        run: pip install -r tools/desktop-node/requirements.txt
       - name: Test provisioning and release signatures
         run: python3 -m unittest discover -s tools -p "test_*.py"
-      - name: Test desktop node protocol handling
-        # Must run with tools/desktop-node as the working directory: its modules import
-        # each other by bare name (e.g. reconclave_node.py does `from tool_runner import
-        # ToolRunner`), which only resolves when that directory is on sys.path. Running
-        # the discovered suite here also covers every test_*.py module, not just the
-        # two this step used to name explicitly (that list predates most of them).
-        run: cd tools/desktop-node && python3 -m unittest discover -p "test_*.py"
-
-  desktop-web:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: tools/desktop-node/web
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: tools/desktop-node/web/package-lock.json
-      - run: npm ci
-      - run: npm run build
-
-  cardputer-firmware:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          persist-credentials: false
-      - name: Generate a throwaway trust header for CI compilation only
-        # generated_trust.h is per-deployment secret material (tools/provision_fleet.py),
-        # deliberately gitignored and never committed -- this build only needs the
-        # #include to resolve, not real keys, so a fresh set of CI-only device ids is
-        # generated and discarded every run.
-        run: python3 tools/provision_fleet.py --desktop-id ci-desktop --p4-id ci-p4 --cardputer-id ci-cardputer
-      - run: pip install platformio
-      - run: pio run --project-dir devices/cardputer-adv
 
   secrets:
     runs-on: ubuntu-latest
